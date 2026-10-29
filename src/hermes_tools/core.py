@@ -1,23 +1,37 @@
 """
-core.py — Shared UI constants, atomic JSON locking, and path utilities for hermes-tools.
+core.py — Shared UI constants, atomic JSON locking, project config, and path utilities for hermes-tools.
 """
 
 from __future__ import annotations
 
-import fcntl
+import getpass
 import itertools
 import json
 import os
 import re
+import socket
 import stat
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 
 from questionary import Style
 from rich.console import Console
 
-console = Console()
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+console = Console(legacy_windows=False)
 
 PROMPT_STYLE = Style(
     [
@@ -54,14 +68,38 @@ def style_status(raw_status: str) -> str:
     return f"[{color}]{raw_status}[/{color}]"
 
 
+def get_username() -> str:
+    for var in ("USER", "LOGNAME", "USERNAME"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def get_hostname() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def write_text_lf(path: Path, content: str) -> None:
+    """Writes UTF-8 text with strict POSIX LF ('\\n') line endings."""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+
+
 # ---------------------------------------------------------------------------
-# Atomic JSON & File Locking (NFS / CephFS Safe)
+# Atomic JSON & File Locking (NFS / CephFS Safe + Local Dev Compatible)
 # ---------------------------------------------------------------------------
 def atomic_write_json(target_path: Path, data: Dict[str, Any], tmp_dir: Path) -> None:
     """Writes JSON to a same-filesystem temp file and atomically replaces target_path."""
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f".{target_path.name}.tmp.{os.getpid()}"
-    tmp_path.write_text(json.dumps(data, indent=2) + "\n")
+    write_text_lf(tmp_path, json.dumps(data, indent=2) + "\n")
     os.replace(tmp_path, target_path)
 
 
@@ -73,15 +111,21 @@ def locked_mutate_run_json(
     """Updates run.json under an exclusive flock without unlinking the lock inode."""
     repro_dir.mkdir(parents=True, exist_ok=True)
     lock_path = repro_dir / ".run_json.lock"
-    with open(lock_path, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    with open(lock_path, "a", encoding="utf-8") as lf:
+        if fcntl is not None:
+            fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            data = json.loads(run_json_path.read_text()) if run_json_path.exists() else {}
+            data = (
+                json.loads(run_json_path.read_text(encoding="utf-8"))
+                if run_json_path.exists()
+                else {}
+            )
             mutator_fn(data)
             atomic_write_json(run_json_path, data, repro_dir)
             return data
         finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def load_run_json(run_dir: Path) -> Dict[str, Any]:
@@ -89,9 +133,45 @@ def load_run_json(run_dir: Path) -> Dict[str, Any]:
     if not rj.is_file():
         return {"run_id": run_dir.name, "status": "UNKNOWN"}
     try:
-        return json.loads(rj.read_text())
+        return json.loads(rj.read_text(encoding="utf-8"))
     except Exception:
         return {"run_id": run_dir.name, "status": "CORRUPTED"}
+
+
+# ---------------------------------------------------------------------------
+# Project Configuration (`[tool.hermes]` in pyproject.toml or `.hermes.toml`)
+# ---------------------------------------------------------------------------
+def load_project_config(cwd: Path) -> Dict[str, Any]:
+    """
+    Loads optional project-level defaults from `.hermes.toml` or `pyproject.toml`
+    under `[tool.hermes]`.
+    Supported keys: arch, cpus, mem, gpus, project, venv, no_venv, node, exclude, tag, scratch.
+    """
+    curr = cwd.resolve()
+    for _ in range(4):
+        hermes_toml = curr / ".hermes.toml"
+        if hermes_toml.is_file():
+            try:
+                raw = tomllib.loads(hermes_toml.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    return dict(raw.get("hermes", raw))
+            except Exception:
+                pass
+
+        pyproject = curr / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+                cfg = raw.get("tool", {}).get("hermes")
+                if isinstance(cfg, dict):
+                    return dict(cfg)
+            except Exception:
+                pass
+
+        if (curr / ".git").exists() or curr.parent == curr:
+            break
+        curr = curr.parent
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -120,16 +200,33 @@ def list_run_dirs(runs_root: Path) -> List[Path]:
     return dirs
 
 
+def resolve_latest_symlink(runs_root: Path) -> Optional[Path]:
+    latest = runs_root / "latest"
+    try:
+        if latest.is_symlink():
+            target = (runs_root / os.readlink(latest)).resolve()
+            if target.is_dir():
+                return target
+    except OSError:
+        pass
+    return None
+
+
 def update_latest_symlink(runs_root: Path, target_run_dir: Optional[Path] = None) -> None:
     """Atomically updates or repairs `runs/latest` symlink."""
+    if not runs_root.is_dir():
+        return
     latest = runs_root / "latest"
     if target_run_dir is None:
         dirs = list_run_dirs(runs_root)
         if not dirs:
-            if latest.is_symlink() or latest.exists():
-                latest.unlink(missing_ok=True)
+            try:
+                if latest.is_symlink() or latest.exists():
+                    latest.unlink(missing_ok=True)
+            except OSError:
+                pass
             return
-        if latest.is_symlink() and (runs_root / os.readlink(latest)).exists():
+        if resolve_latest_symlink(runs_root) is not None:
             return
         target_run_dir = dirs[0]
 
@@ -139,7 +236,10 @@ def update_latest_symlink(runs_root: Path, target_run_dir: Optional[Path] = None
         tmp_link.symlink_to(target_run_dir.name)
         os.replace(tmp_link, latest)
     except OSError:
-        tmp_link.unlink(missing_ok=True)
+        try:
+            tmp_link.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +252,19 @@ def parse_memory_to_mb(mem_str: str) -> int:
         raise ValueError("Empty memory specification.")
 
     multipliers = (
+        ("TIB", 1024 * 1024),
         ("TB", 1024 * 1024),
         ("T", 1024 * 1024),
+        ("GIB", 1024),
         ("GB", 1024),
         ("G", 1024),
+        ("MIB", 1),
         ("MB", 1),
         ("M", 1),
     )
     for suffix, mult in multipliers:
         if s.endswith(suffix):
-            val_mb = int(float(s[: -len(suffix)]) * mult)
+            val_mb = int(float(s[: -len(suffix)].strip()) * mult)
             break
     else:
         val_mb = int(float(s))
@@ -247,14 +350,26 @@ def _expand_single_brace_expr(expr: str) -> List[str]:
         inner = m.group(1).strip()
         range_match = re.match(r"^(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?$", inner)
         if range_match:
-            start, end = int(range_match.group(1)), int(range_match.group(2))
+            s_start, s_end = range_match.group(1), range_match.group(2)
+            start, end = int(s_start), int(s_end)
             raw_step = int(range_match.group(3) or 1)
             step = max(1, abs(raw_step))
-            if start <= end:
-                options_per_match.append([str(i) for i in range(start, end + 1, step)])
+            # Support zero-padded ranges like {00..09} or {01..12}
+            pad_width = 0
+            for tok in (s_start, s_end):
+                digits = tok.lstrip("-")
+                if len(digits) > 1 and digits.startswith("0"):
+                    pad_width = max(pad_width, len(tok))
+            nums = (
+                range(start, end + 1, step)
+                if start <= end
+                else range(start, end - 1, -step)
+            )
+            if pad_width > 0:
+                options_per_match.append([f"{i:0{pad_width}d}" for i in nums])
             else:
-                options_per_match.append([str(i) for i in range(start, end - 1, -step)])
-        elif "," in inner:
+                options_per_match.append([str(i) for i in nums])
+        elif "," in inner and ":" not in inner:
             options_per_match.append([x.strip() for x in inner.split(",")])
         else:
             options_per_match.append([m.group(0)])
@@ -269,7 +384,7 @@ def _expand_single_brace_expr(expr: str) -> List[str]:
 
 
 def expand_arg_sweeps(expr: str) -> List[str]:
-    """Expands brace expressions ('{0..4}', '{a,b}') and/or ';' separators into a sweep list."""
+    """Expands brace expressions ('{0..4}', '{00..04}', '{a,b}') and/or ';' separators into a sweep list."""
     if not expr.strip():
         return [""]
     segments = [part.strip() for part in expr.split(";") if part.strip()]
@@ -279,13 +394,17 @@ def expand_arg_sweeps(expr: str) -> List[str]:
     return out or [""]
 
 
+def _is_valid_venv_dir(p: Path) -> bool:
+    return (p / "bin" / "activate").is_file() or (p / "Scripts" / "activate").is_file()
+
+
 def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Optional[Path]:
     """Auto-discovers the active or local project venv, ignoring the CLI tool's own venv."""
     tool_venv = Path(sys.executable).resolve().parent.parent
 
     if explicit_venv:
         p = Path(explicit_venv).expanduser().resolve()
-        if (p / "bin" / "activate").is_file():
+        if _is_valid_venv_dir(p):
             return p
         console.print(f"[bold red]✘ Explicit venv not valid:[/bold red] {p}")
         sys.exit(1)
@@ -293,7 +412,7 @@ def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Opt
     env_var = os.environ.get("VIRTUAL_ENV")
     if env_var:
         p = Path(env_var).resolve()
-        if p != tool_venv and (p / "bin" / "activate").is_file():
+        if p != tool_venv and _is_valid_venv_dir(p):
             return p
 
     curr = cwd.resolve()
@@ -303,7 +422,7 @@ def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Opt
             if (
                 venv_candidate.is_dir()
                 and venv_candidate.resolve() != tool_venv
-                and (venv_candidate / "bin" / "activate").is_file()
+                and _is_valid_venv_dir(venv_candidate)
             ):
                 return venv_candidate.resolve()
         if (curr / ".git").exists() or curr.parent == curr:

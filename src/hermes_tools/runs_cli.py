@@ -6,17 +6,20 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import difflib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import questionary
 from rich import box
+from rich.live import Live
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -36,9 +39,11 @@ from hermes_tools.core import (
     list_run_dirs,
     load_run_json,
     locked_mutate_run_json,
+    resolve_latest_symlink,
     style_status,
     summarize_metrics,
     update_latest_symlink,
+    write_text_lf,
 )
 from hermes_tools.snapshot import create_code_snapshot, freeze_python_env, get_git_info
 
@@ -54,10 +59,8 @@ def resolve_run_dir(
     if query:
         q = query.strip()
         if q == "latest":
-            latest = runs_root / "latest"
-            if latest.is_symlink() and latest.resolve().is_dir():
-                return latest.resolve()
-            return dirs[0]
+            latest_target = resolve_latest_symlink(runs_root)
+            return latest_target if latest_target is not None else dirs[0]
 
         if q.isdigit():
             idx = int(q)
@@ -108,17 +111,12 @@ def resolve_run_dir(
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: `runs ls`
+# Subcommand: `runs ls` & `runs watch`
 # ---------------------------------------------------------------------------
-def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
+def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
     dirs = list_run_dirs(runs_root)
-    if not dirs:
-        console.print(f"[dim]No runs found in {runs_root}[/dim]")
-        return
-
     live_clusters = query_live_condor_clusters()
-    latest_link = runs_root / "latest"
-    latest_target = latest_link.resolve() if latest_link.is_symlink() else None
+    latest_target = resolve_latest_symlink(runs_root)
 
     table = Table(
         title=f"[bold cyan]📊 Hermes 2 Runs ({runs_root})[/bold cyan]",
@@ -136,20 +134,26 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
     table.add_column("Peak RAM", justify="right")
 
     shown = 0
+    limit = getattr(args, "limit", 25)
+    status_filter = getattr(args, "status", None)
+    tag_filter = getattr(args, "tag", None)
+
     for idx, d in enumerate(dirs, start=1):
         data = reconcile_run(d, load_run_json(d), live_clusters)
         display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
 
-        if args.status and args.status.upper() not in display_status.upper():
+        if status_filter and status_filter.upper() not in display_status.upper():
             continue
-        if args.tag and args.tag.lower() not in d.name.lower():
+        if tag_filter and tag_filter.lower() not in d.name.lower():
             continue
 
         req = data.get("resources_requested", {})
         arch = str(req.get("architecture", "—"))
         sweep_cnt = int(req.get("sweep_count", 1) or 1)
         cids = get_all_cluster_ids(data)
-        cid_str = str(cids[-1]) + (f" (+{len(cids)-1})" if len(cids) > 1 else "") if cids else "—"
+        cid_str = (
+            str(cids[-1]) + (f" (+{len(cids) - 1})" if len(cids) > 1 else "") if cids else "—"
+        )
 
         if sweep_cnt > 1:
             execs = data.get("executions", [])
@@ -178,10 +182,33 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
             ram_str,
         )
         shown += 1
-        if args.limit and shown >= args.limit:
+        if limit and shown >= limit:
             break
 
-    console.print(table)
+    return table
+
+
+def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
+    dirs = list_run_dirs(runs_root)
+    if not dirs:
+        console.print(f"[dim]No runs found in {runs_root}[/dim]")
+        return
+
+    if getattr(args, "watch", False):
+        interval = max(1, int(getattr(args, "interval", 2) or 2))
+        try:
+            with Live(
+                _build_ls_table(args, runs_root),
+                console=console,
+                refresh_per_second=1,
+            ) as live:
+                while True:
+                    time.sleep(interval)
+                    live.update(_build_ls_table(args, runs_root))
+        except KeyboardInterrupt:
+            return
+    else:
+        console.print(_build_ls_table(args, runs_root))
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +321,7 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     err_files = sorted(run_dir.glob("*.err"))
     for ef in err_files:
         try:
-            content = ef.read_text(errors="replace").strip()
+            content = ef.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue
         if content:
@@ -311,6 +338,24 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs logs`
 # ---------------------------------------------------------------------------
+def _follow_file_python(log_file: Path, initial_lines: int) -> None:
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+            for line in lines[-initial_lines:]:
+                sys.stdout.write(line)
+            sys.stdout.flush()
+            while True:
+                line = f.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.25)
+    except KeyboardInterrupt:
+        return
+
+
 def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(runs_root, args.run)
     data = load_run_json(run_dir)
@@ -325,7 +370,6 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
             proc = args.proc
             if proc is None:
                 if args.err:
-                    # Smart auto-selection: pick the first failing process or first non-empty .err
                     failed_execs = [
                         int(x.get("process_id", 0))
                         for x in (data.get("executions") or [])
@@ -354,14 +398,22 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
 
     if args.follow:
         console.print(f"[dim cyan]Following {log_file} (Ctrl+C to exit)...[/dim cyan]")
-        os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(log_file)])
+        if os.name == "posix" and shutil.which("tail"):
+            os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(log_file)])
+        else:
+            _follow_file_python(log_file, args.lines)
     else:
-        lines = log_file.read_text(errors="replace").splitlines()
+        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
         snippet = "\n".join(lines[-args.lines :])
+        rel_title = (
+            log_file.relative_to(runs_root.parent)
+            if log_file.is_relative_to(runs_root.parent)
+            else log_file
+        )
         console.print(
             Panel(
                 snippet,
-                title=f"[bold cyan]{log_file.relative_to(runs_root.parent)}[/bold cyan]",
+                title=f"[bold cyan]{rel_title}[/bold cyan]",
                 border_style="cyan",
             )
         )
@@ -371,7 +423,9 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
 # Subcommand: `runs stop`
 # ---------------------------------------------------------------------------
 def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
-    run_dir = resolve_run_dir(runs_root, args.run, prompt_title="Select run to stop (condor_rm):")
+    run_dir = resolve_run_dir(
+        runs_root, args.run, prompt_title="Select run to stop (condor_rm):"
+    )
     repro_dir = run_dir / "repro"
     rj_path = run_dir / "run.json"
     data = load_run_json(run_dir)
@@ -393,7 +447,13 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             return
 
     for cid in target_cids:
-        res = subprocess.run(["condor_rm", str(cid)], capture_output=True, text=True)
+        res = subprocess.run(
+            ["condor_rm", str(cid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if res.returncode == 0:
             console.print(f"[bold green]✔ {res.stdout.strip()}[/bold green]")
         else:
@@ -429,7 +489,7 @@ def refresh_code_snapshot(run_dir: Path, data: Dict[str, Any]) -> None:
     patch_file = repro_dir / "uncommitted.patch"
     patch_rel_path: Optional[str] = None
     if git_info.get("is_git") and git_info.get("diff"):
-        patch_file.write_text(str(git_info["diff"]))
+        write_text_lf(patch_file, str(git_info["diff"]))
         patch_rel_path = "repro/uncommitted.patch"
     elif patch_file.is_file():
         patch_file.unlink()
@@ -458,7 +518,9 @@ def refresh_code_snapshot(run_dir: Path, data: Dict[str, Any]) -> None:
 
 
 def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
-    run_dir = resolve_run_dir(runs_root, args.run, prompt_title="Select run to sync code snapshot into:")
+    run_dir = resolve_run_dir(
+        runs_root, args.run, prompt_title="Select run to sync code snapshot into:"
+    )
     data = load_run_json(run_dir)
     refresh_code_snapshot(run_dir, data)
 
@@ -472,8 +534,10 @@ def get_failed_or_missing_procs(data: Dict[str, Any]) -> List[Tuple[int, str]]:
     sweep_cnt = len(sweep_args)
 
     if sweep_cnt == 1:
-        ec = (data.get("execution") or {}).get("exit_code")
-        if ec != 0:
+        exec_rec = data.get("execution") or {}
+        ec = exec_rec.get("exit_code")
+        sig = exec_rec.get("signal")
+        if ec != 0 or sig:
             return [(0, sweep_args[0])]
         return []
 
@@ -487,7 +551,9 @@ def get_failed_or_missing_procs(data: Dict[str, Any]) -> List[Tuple[int, str]]:
 
 
 def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
-    run_dir = resolve_run_dir(runs_root, args.run, prompt_title="Select run to retry/continue:")
+    run_dir = resolve_run_dir(
+        runs_root, args.run, prompt_title="Select run to retry/continue:"
+    )
     live_clusters = query_live_condor_clusters()
     data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
     repro_dir = run_dir / "repro"
@@ -546,12 +612,21 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             cmd.extend(["-m", f"{req['memory_mb']}M"])
         if req.get("gpus") and req.get("architecture") != "GPU3090":
             cmd.extend(["-g", str(req["gpus"])])
+        if sub_meta.get("tag"):
+            cmd.extend(["-t", str(sub_meta["tag"])])
+        if sub_meta.get("no_venv"):
+            cmd.append("--no-venv")
+        elif sub_meta.get("venv"):
+            cmd.extend(["--venv", str(sub_meta["venv"])])
         for n in req.get("node_include") or []:
             cmd.extend(["--node", n])
         for ex in req.get("node_exclude") or []:
             cmd.extend(["--exclude", ex])
         if req.get("project_code"):
             cmd.extend(["--project", str(req["project_code"])])
+        if req.get("scratch_files"):
+            cmd.append("--scratch")
+            cmd.extend(str(sf) for sf in req["scratch_files"])
         if is_sweep:
             for _, arg_line in targets:
                 cmd.extend(["-s", arg_line])
@@ -605,13 +680,15 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         retry_epoch=retry_epoch,
     )
     retry_sub_path = repro_dir / "job_retry.sub"
-    retry_sub_path.write_text(retry_sub_content)
+    write_text_lf(retry_sub_path, retry_sub_content)
 
     res = subprocess.run(
         ["condor_submit", str(retry_sub_path)],
         cwd=run_dir,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if res.returncode != 0:
         console.print(
@@ -673,7 +750,9 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             continue
 
         match = False
-        if args.failed and st in ("FAILED", "SUBMIT_FAILED", "VANISHED"):
+        if args.failed and (
+            st in ("FAILED", "SUBMIT_FAILED", "VANISHED") or st.startswith("FAILED")
+        ):
             match = True
         if args.aborted and (st in ("ABORTED", "INTERRUPTED") or st.startswith("INTERRUPTED")):
             match = True
@@ -709,7 +788,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         for d in dirs:
             data = load_run_json(d)
             st = str(data.get("status", "UNKNOWN"))
-            if st.startswith(("RUNNING", "QUEUED")):
+            if st.startswith(("RUNNING", "QUEUED", "HELD")):
                 continue
             mb = dir_size_mb(d)
             choices.append(
@@ -756,6 +835,44 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs diff`
 # ---------------------------------------------------------------------------
+def _diff_directories(dir_a: Path, dir_b: Path) -> str:
+    """Computes a unified diff across all text files in two directories."""
+    files_a = {
+        p.relative_to(dir_a).as_posix() for p in dir_a.rglob("*") if p.is_file()
+    }
+    files_b = {
+        p.relative_to(dir_b).as_posix() for p in dir_b.rglob("*") if p.is_file()
+    }
+    all_rel = sorted(files_a | files_b)
+    chunks: List[str] = []
+
+    for rel in all_rel:
+        pa, pb = dir_a / rel, dir_b / rel
+        lines_a = (
+            pa.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            if pa.is_file()
+            else []
+        )
+        lines_b = (
+            pb.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            if pb.is_file()
+            else []
+        )
+        if lines_a == lines_b:
+            continue
+        diff_lines = list(
+            difflib.unified_diff(
+                lines_a,
+                lines_b,
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+            )
+        )
+        if diff_lines:
+            chunks.append("".join(diff_lines))
+    return "\n".join(chunks)
+
+
 def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
     dir_a = resolve_run_dir(runs_root, args.run_a, prompt_title="Select first run (A):")
     dir_b = resolve_run_dir(runs_root, args.run_b, prompt_title="Select second run (B):")
@@ -772,7 +889,11 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
 
     fields = [
         ("Status", da.get("status"), db.get("status")),
-        ("Target", da.get("submission", {}).get("target"), db.get("submission", {}).get("target")),
+        (
+            "Target",
+            da.get("submission", {}).get("target"),
+            db.get("submission", {}).get("target"),
+        ),
         (
             "Architecture",
             da.get("resources_requested", {}).get("architecture"),
@@ -799,13 +920,11 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
 
     code_a, code_b = dir_a / "repro" / "code", dir_b / "repro" / "code"
     if code_a.is_dir() and code_b.is_dir():
-        diff_res = subprocess.run(
-            ["diff", "-ruN", str(code_a), str(code_b)], capture_output=True, text=True
-        )
-        if diff_res.stdout.strip():
+        diff_text = _diff_directories(code_a, code_b).strip()
+        if diff_text:
             console.print(
                 Panel(
-                    Syntax(diff_res.stdout[:4000], "diff", theme="monokai"),
+                    Syntax(diff_text[:4000], "diff", theme="monokai"),
                     title="[bold yellow]Code Snapshot Diff (repro/code/)[/bold yellow]",
                     border_style="yellow",
                 )
@@ -830,39 +949,83 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("-n", "--limit", type=int, default=25, help="Max runs to display (default: 25)")
     p_ls.add_argument("-s", "--status", type=str, help="Filter by status (e.g. RUNNING, FAILED)")
     p_ls.add_argument("-t", "--tag", type=str, help="Filter by substring/tag in run ID")
+    p_ls.add_argument("-w", "--watch", action="store_true", help="Live-refresh table every N seconds")
+    p_ls.add_argument("-i", "--interval", type=int, default=2, help="Refresh interval in seconds for --watch")
 
-    p_ins = sub.add_parser("inspect", aliases=["info", "show"], help="Inspect run telemetry and stderr tails")
+    p_watch = sub.add_parser("watch", help="Live-watch runs and HTCondor queue progress")
+    p_watch.add_argument("-n", "--limit", type=int, default=25, help="Max runs to display (default: 25)")
+    p_watch.add_argument("-s", "--status", type=str, help="Filter by status (e.g. RUNNING, FAILED)")
+    p_watch.add_argument("-t", "--tag", type=str, help="Filter by substring/tag in run ID")
+    p_watch.add_argument("-i", "--interval", type=int, default=2, help="Refresh interval in seconds (default: 2)")
+
+    p_ins = sub.add_parser(
+        "inspect", aliases=["info", "show"], help="Inspect run telemetry and stderr tails"
+    )
     p_ins.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
 
     p_log = sub.add_parser("logs", aliases=["tail"], help="View or follow stdout/stderr/condor logs")
     p_log.add_argument("run", nargs="?", default="latest", help="Run ID, index (#), or 'latest'")
-    p_log.add_argument("-e", "--err", action="store_true", help="Show stderr (.err) instead of stdout (.out)")
-    p_log.add_argument("-c", "--condor", action="store_true", help="Show HTCondor scheduler log (repro/condor.log)")
-    p_log.add_argument("-p", "--proc", type=int, help="Process index for parallel sweeps (auto-selects failed proc on -e)")
+    p_log.add_argument(
+        "-e", "--err", action="store_true", help="Show stderr (.err) instead of stdout (.out)"
+    )
+    p_log.add_argument(
+        "-c", "--condor", action="store_true", help="Show HTCondor scheduler log (repro/condor.log)"
+    )
+    p_log.add_argument(
+        "-p",
+        "--proc",
+        type=int,
+        help="Process index for parallel sweeps (auto-selects failed proc on -e)",
+    )
     p_log.add_argument("-f", "--follow", action="store_true", help="Follow live log output (tail -f)")
     p_log.add_argument("-n", "--lines", type=int, default=60, help="Number of tail lines to display")
 
-    p_ret = sub.add_parser("retry", aliases=["resume", "continue"], help="Retry failed runs or partial sweeps")
+    p_ret = sub.add_parser(
+        "retry", aliases=["resume", "continue"], help="Retry failed runs or partial sweeps"
+    )
     p_ret.add_argument("run", nargs="?", help="Run ID, index (#), or 'latest'")
     p_ret.add_argument("--in-place", action="store_true", help="Resume inside the same run directory")
-    p_ret.add_argument("--new-run", action="store_true", help="Launch a brand-new run directory via `send`")
-    p_ret.add_argument("-u", "--update-code", action="store_true", help="Refresh repro/code/ snapshot from working tree before retrying")
-    p_ret.add_argument("--all", action="store_true", help="Re-run all sweep processes (even those with exit_code 0)")
-    p_ret.add_argument("--force", action="store_true", help="Allow in-place retry even if jobs are still active in condor_q")
+    p_ret.add_argument(
+        "--new-run", action="store_true", help="Launch a brand-new run directory via `send`"
+    )
+    p_ret.add_argument(
+        "-u",
+        "--update-code",
+        action="store_true",
+        help="Refresh repro/code/ snapshot from working tree before retrying",
+    )
+    p_ret.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-run all sweep processes (even those with exit_code 0)",
+    )
+    p_ret.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow in-place retry even if jobs are still active in condor_q",
+    )
     p_ret.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
 
-    p_sync = sub.add_parser("sync", help="Hot-patch a run's repro/code/ snapshot with current workspace files")
+    p_sync = sub.add_parser(
+        "sync", help="Hot-patch a run's repro/code/ snapshot with current workspace files"
+    )
     p_sync.add_argument("run", nargs="?", help="Run ID, index (#), or 'latest'")
 
     p_stop = sub.add_parser("stop", aliases=["kill", "rm"], help="Abort active HTCondor job (condor_rm)")
     p_stop.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
     p_stop.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
-    p_cln = sub.add_parser("clean", aliases=["prune"], help="Delete failed, aborted, dry-run, or old runs")
-    p_cln.add_argument("--failed", action="store_true", help="Remove FAILED, SUBMIT_FAILED, and VANISHED runs")
+    p_cln = sub.add_parser(
+        "clean", aliases=["prune"], help="Delete failed, aborted, dry-run, or old runs"
+    )
+    p_cln.add_argument(
+        "--failed", action="store_true", help="Remove FAILED, SUBMIT_FAILED, and VANISHED runs"
+    )
     p_cln.add_argument("--aborted", action="store_true", help="Remove ABORTED and INTERRUPTED runs")
     p_cln.add_argument("--dry", action="store_true", help="Remove DRY_RUN capsules")
-    p_cln.add_argument("--older-than", type=str, help="Remove runs older than e.g. '7d', '24h', '30m'")
+    p_cln.add_argument(
+        "--older-than", type=str, help="Remove runs older than e.g. '7d', '24h', '30m'"
+    )
     p_cln.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
     p_diff = sub.add_parser("diff", help="Compare provenance and code snapshots between two runs")
@@ -880,7 +1043,10 @@ def main() -> None:
     cmd = args.cmd or "ls"
     if cmd == "ls":
         if not hasattr(args, "limit"):
-            args.limit, args.status, args.tag = 25, None, None
+            args.limit, args.status, args.tag, args.watch, args.interval = 25, None, None, False, 2
+        cmd_ls(args, runs_root)
+    elif cmd == "watch":
+        args.watch = True
         cmd_ls(args, runs_root)
     elif cmd in ("inspect", "info", "show"):
         cmd_inspect(args, runs_root)

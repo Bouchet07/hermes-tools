@@ -1,9 +1,9 @@
 [project]
 name = "hermes-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "HTCondor Job Submission, Provenance & Run Manager for Hermes 2 (I3A)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "questionary>=2.1.1",
     "rich>=15.0.0",
@@ -13,6 +13,11 @@ dependencies = [
 send = "hermes_tools.send_cli:main"
 runs = "hermes_tools.runs_cli:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [build-system]
-requires = ["uv_build>=0.13.1,<0.14.0"]
+requires = ["uv_build>=0.11.0,<0.15.0"]
 build-backend = "uv_build"
