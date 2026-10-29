@@ -1,0 +1,18 @@
+[project]
+name = "hermes-tools"
+version = "0.1.0"
+description = "HTCondor Job Submission, Provenance & Run Manager for Hermes 2 (I3A)"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "questionary>=2.1.1",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+send = "hermes_tools.send_cli:main"
+runs = "hermes_tools.runs_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
