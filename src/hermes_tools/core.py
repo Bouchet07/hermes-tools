@@ -9,8 +9,10 @@ import itertools
 import json
 import os
 import re
+import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -395,11 +397,40 @@ def expand_arg_sweeps(expr: str) -> List[str]:
 
 
 def _is_valid_venv_dir(p: Path) -> bool:
-    return (p / "bin" / "activate").is_file() or (p / "Scripts" / "activate").is_file()
+    return (
+        (p / "bin" / "activate").is_file()
+        or (p / "bin" / "python").is_file()
+        or (p / "Scripts" / "activate").is_file()
+        or (p / "Scripts" / "python.exe").is_file()
+    )
+
+
+def resolve_submit_python() -> Path:
+    """
+    Finds the user's default Python 3 interpreter from the submit environment
+    so jobs without an explicit `.venv` still use Python 3 on worker nodes
+    (where HTCondor's default PATH `/usr/bin/python` may be Python 2.7).
+    """
+    for candidate in ("python3", "python"):
+        found = shutil.which(candidate)
+        if not found:
+            continue
+        try:
+            res = subprocess.run(
+                [found, "-c", "import sys; print(sys.version_info[0])"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res.returncode == 0 and res.stdout.strip() == "3":
+                return Path(found).resolve()
+        except Exception:
+            pass
+    return Path(sys.executable).resolve()
 
 
 def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Optional[Path]:
-    """Auto-discovers the active or local project venv, ignoring the CLI tool's own venv."""
+    """Auto-discovers the active or local project venv/conda env, ignoring the CLI tool's own venv."""
     tool_venv = Path(sys.executable).resolve().parent.parent
 
     if explicit_venv:
@@ -428,5 +459,11 @@ def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Opt
         if (curr / ".git").exists() or curr.parent == curr:
             break
         curr = curr.parent
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        p = Path(conda_prefix).resolve()
+        if p != tool_venv and _is_valid_venv_dir(p):
+            return p
 
     return None

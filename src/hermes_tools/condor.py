@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_tools.core import console, get_username, locked_mutate_run_json
+from hermes_tools.core import console, get_username, locked_mutate_run_json, resolve_submit_python
 
 ARCH_SPECS: Dict[str, Dict[str, object]] = {
     "GPU3090": {
@@ -156,26 +156,45 @@ fi
 
 SETUP_OK=1
 EXIT_CODE=0
+PYTHON_BIN=""
 if [ -n "${VENV_PATH}" ]; then
     if [ -f "${VENV_PATH}/bin/activate" ]; then
         # shellcheck disable=SC1091
         source "${VENV_PATH}/bin/activate"
+        PYTHON_BIN="$(command -v python3 || command -v python)"
         echo "  • Virtual Env      : ${VENV_PATH}"
-        echo "  • Python Binary    : $(command -v python) ($(python --version 2>&1))"
+        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
+    elif [ -x "${VENV_PATH}/bin/python" ]; then
+        export PATH="${VENV_PATH}/bin:${PATH}"
+        PYTHON_BIN="${VENV_PATH}/bin/python"
+        echo "  • Conda / Env      : ${VENV_PATH}"
+        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
     else
-        echo "❌ ERROR: Virtual environment activation script missing at ${VENV_PATH}/bin/activate" >&2
+        echo "❌ ERROR: Virtual environment missing at ${VENV_PATH}/bin" >&2
         SETUP_OK=0
         EXIT_CODE=1
     fi
 else
+    if [ -n "${SUBMIT_PYTHON:-}" ] && [ -x "${SUBMIT_PYTHON}" ]; then
+        PYTHON_BIN="${SUBMIT_PYTHON}"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_BIN="$(command -v python3)"
+    elif [ -n "${UPDATER_PYTHON:-}" ] && [ -x "${UPDATER_PYTHON}" ]; then
+        PYTHON_BIN="${UPDATER_PYTHON}"
+    else
+        PYTHON_BIN="$(command -v python)"
+    fi
     echo "  • Virtual Env      : None (Native/System execution)"
+    if [ -n "${PYTHON_BIN}" ]; then
+        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
+    fi
 fi
 
 if [ "${SETUP_OK}" -eq 1 ]; then
     echo ""
     echo "─── [4/4] Executing Workload ────────────────────────────────────────────────"
     case "${EXEC_TYPE}" in
-        python) CMD=(python -u "${TARGET_EXEC}" "$@") ;;
+        python) CMD=("${PYTHON_BIN}" -u "${TARGET_EXEC}" "$@") ;;
         bash)   CMD=(bash "${TARGET_EXEC}" "$@") ;;
         *)      CMD=("${TARGET_EXEC}" "$@") ;;
     esac
@@ -410,6 +429,7 @@ def generate_bash_wrapper(
     requested_cpus: Optional[int],
 ) -> str:
     updater_python = Path(sys.executable).resolve()
+    submit_python = resolve_submit_python()
     header = (
         "#!/usr/bin/env bash\n"
         "# =============================================================================\n"
@@ -426,6 +446,7 @@ def generate_bash_wrapper(
         f"REPRO_DIR={shlex.quote(repro_dir.as_posix())}\n"
         f'SUBMIT_EPOCH="${{SUBMIT_EPOCH:-{submit_epoch}}}"\n'
         f"SWEEP_COUNT={sweep_count}\n"
+        f"SUBMIT_PYTHON={shlex.quote(submit_python.as_posix())}\n"
         f"UPDATER_PYTHON={shlex.quote(updater_python.as_posix())}\n"
     )
     return header + _JOB_SH_BODY
