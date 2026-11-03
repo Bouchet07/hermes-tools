@@ -94,18 +94,25 @@ def resolve_run_dir(
 
     import questionary
 
-    choices = []
+    rows: List[Tuple[int, Path, str, str, str]] = []
     for i, d in enumerate(dirs[:35], start=1):
         rj = load_run_json(d)
-        st = rj.get("status", "UNKNOWN")
-        arch = rj.get("resources_requested", {}).get("architecture", "?")
-        cid = rj.get("submission", {}).get("cluster_id") or "—"
-        choices.append(
-            questionary.Choice(
-                title=f"[{i:02d}] {d.name:<42} │ {st:<22} │ {arch:<8} │ Cluster: {cid}",
-                value=d,
-            )
+        st = str(rj.get("status", "UNKNOWN"))
+        arch = str(rj.get("resources_requested", {}).get("architecture", "?"))
+        cid = str(rj.get("submission", {}).get("cluster_id") or "—")
+        rows.append((i, d, st, arch, cid))
+
+    name_w = max((len(d.name) for _, d, _, _, _ in rows), default=20)
+    st_w = max((len(st) for _, _, st, _, _ in rows), default=8)
+    arch_w = max((len(arch) for _, _, _, arch, _ in rows), default=6)
+
+    choices = [
+        questionary.Choice(
+            title=f"[{i:02d}] {d.name:<{name_w}} │ {st:<{st_w}} │ {arch:<{arch_w}} │ Cluster: {cid}",
+            value=d,
         )
+        for i, d, st, arch, cid in rows
+    ]
     selected = questionary.select(
         prompt_title, choices=choices, style=get_prompt_style()
     ).ask()
@@ -841,8 +848,10 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             return
         import questionary
 
+        name_w = max((len(d.name) for d, _ in inactive_runs), default=20)
+        st_w = max((len(st) for _, st in inactive_runs), default=8)
         choices = [
-            questionary.Choice(f"{d.name:<42} │ {st:<20}", value=(d, st))
+            questionary.Choice(f"{d.name:<{name_w}} │ {st:<{st_w}}", value=(d, st))
             for d, st in inactive_runs
         ]
         selected = questionary.checkbox(
