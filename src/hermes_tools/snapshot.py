@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
-from hermes_tools.core import console, write_text_lf
+from hermes_tools.core import write_text_lf
 
 _IGNORED_PARTS: Set[str] = {
     ".git",
@@ -27,8 +27,8 @@ _IGNORED_PARTS: Set[str] = {
     "wandb",
 }
 
-MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB per file
-MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB total snapshot cap
+MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB per file copied (larger files are symlinked)
+MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB total copied cap (remaining files are symlinked)
 MAX_SNAPSHOT_FILES = 2500
 
 
@@ -112,12 +112,27 @@ def get_git_info(cwd: Path) -> Dict[str, object]:
     return info
 
 
-def _copy_entry_safely(
-    src_file: Path, dest_file: Path, max_bytes: int = MAX_FILE_BYTES
+def _symlink_fallback(src_file: Path, dest_file: Path) -> None:
+    """Creates a symlink at dest_file pointing to src_file so relative paths never break."""
+    try:
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        if dest_file.exists() or dest_file.is_symlink():
+            dest_file.unlink()
+        os.symlink(src_file.resolve(), dest_file)
+    except OSError:
+        pass
+
+
+def _copy_or_link_entry(
+    src_file: Path,
+    dest_file: Path,
+    allow_copy: bool = True,
+    max_bytes: int = MAX_FILE_BYTES,
 ) -> Tuple[bool, int]:
     """
-    Copies regular files (<= max_bytes) and recreates symlinks without dereferencing.
-    Returns (copied, size_bytes).
+    Copies regular files (<= max_bytes when allow_copy is True) and symlinks larger/capped
+    files or existing symlinks so `Path(__file__).parent` relative lookups always work.
+    Returns (copied_bytes_flag, size_bytes).
     """
     try:
         st = src_file.lstat()
@@ -130,11 +145,15 @@ def _copy_entry_safely(
             if dest_file.exists() or dest_file.is_symlink():
                 dest_file.unlink()
             os.symlink(os.readlink(src_file), dest_file)
-            return True, 0
         except OSError:
-            return False, 0
+            pass
+        return False, 0
 
-    if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+    if not stat.S_ISREG(st.st_mode):
+        return False, 0
+
+    if not allow_copy or st.st_size > max_bytes:
+        _symlink_fallback(src_file, dest_file)
         return False, 0
 
     dest_file.parent.mkdir(parents=True, exist_ok=True)
@@ -146,9 +165,9 @@ def create_code_snapshot(
     target_path: Path, cwd: Path, repro_dir: Path, git_info: Dict[str, object]
 ) -> Tuple[Path, Optional[Path]]:
     """
-    Copies git-tracked and untracked source files (<=15MB each, <=100MB total) into repro/code/
-    so editing the workspace while a job is queued never breaks the run.
-    Used by both `send` (initial snapshot) and `runs` (sync / retry --update-code).
+    Copies source files (<=15MB each, <=100MB total) into repro/code/ and symlinks larger
+    files so editing the workspace while a job is queued never breaks the run, and relative
+    `Path(__file__)` lookups to datasets/weights still resolve cleanly.
     """
     code_dir = repro_dir / "code"
     if code_dir.exists():
@@ -160,7 +179,6 @@ def create_code_snapshot(
         git_root = Path(str(git_info["root"])).resolve()
         git_runs_root = (git_root / "runs").resolve()
         try:
-            # Snapshot tracked files first so source code always takes priority over untracked data
             tracked_res = subprocess.run(
                 ["git", "ls-files", "--cached"],
                 cwd=git_root,
@@ -189,7 +207,6 @@ def create_code_snapshot(
 
             total_bytes = 0
             total_files = 0
-            skipped_cap = 0
 
             for rel_file in tracked_files + untracked_files:
                 rel_path = Path(rel_file)
@@ -202,25 +219,23 @@ def create_code_snapshot(
                     or src_file.is_relative_to(repro_dir.resolve())
                 ):
                     continue
-                if total_files >= MAX_SNAPSHOT_FILES or total_bytes >= MAX_TOTAL_BYTES:
-                    skipped_cap += 1
-                    continue
+                allow_copy = (
+                    total_files < MAX_SNAPSHOT_FILES and total_bytes < MAX_TOTAL_BYTES
+                )
                 dest_file = code_dir / rel_path
-                ok, nbytes = _copy_entry_safely(src_file, dest_file)
-                if ok:
+                copied, nbytes = _copy_or_link_entry(
+                    src_file, dest_file, allow_copy=allow_copy
+                )
+                if copied:
                     total_files += 1
                     total_bytes += nbytes
-
-            if skipped_cap > 0:
-                console.print(
-                    f"[dim yellow]ℹ Snapshot cap reached ({MAX_TOTAL_BYTES // (1024 * 1024)} MB / {MAX_SNAPSHOT_FILES} files); "
-                    f"skipped {skipped_cap} extra file(s). Add large data folders to .gitignore.[/dim yellow]"
-                )
 
             if target_path.is_relative_to(git_root):
                 rel_target = target_path.relative_to(git_root)
                 snap_target = code_dir / rel_target
                 snap_target.parent.mkdir(parents=True, exist_ok=True)
+                if snap_target.is_symlink():
+                    snap_target.unlink()
                 shutil.copy2(target_path, snap_target)
                 return snap_target, code_dir
         except Exception:

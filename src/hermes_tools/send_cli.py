@@ -351,6 +351,7 @@ def main() -> None:
     ).strip()
 
     raw_sweep_inputs: List[str] = list(args.sweep)
+    cli_sweep_specs: List[str] = list(args.sweep)
     if args.sweep_file:
         sf_path = Path(args.sweep_file).expanduser().resolve()
         if not sf_path.is_file():
@@ -382,7 +383,10 @@ def main() -> None:
         ).ask()
         if ans_args is None:
             sys.exit(0)
-        sweep_list = expand_arg_sweeps(ans_args.strip())
+        ans_clean = ans_args.strip()
+        sweep_list = expand_arg_sweeps(ans_clean)
+        if len(sweep_list) > 1 and ans_clean:
+            cli_sweep_specs = [ans_clean]
     else:
         sweep_list = [combined_single_args]
 
@@ -432,10 +436,14 @@ def main() -> None:
     if scratch_files:
         cli_parts.append("--scratch")
         cli_parts.extend(shlex.quote(sf) for sf in scratch_files)
+    if args.sweep_file:
+        cli_parts.extend(["--sweep-file", shlex.quote(str(args.sweep_file))])
+    for s in cli_sweep_specs:
+        cli_parts.extend(["-s", shlex.quote(s)])
     if len(sweep_list) > 1:
-        for s in sweep_list:
-            cli_parts.extend(["-s", shlex.quote(s)])
-    elif sweep_list and sweep_list[0]:
+        if combined_single_args:
+            cli_parts.extend(["--", combined_single_args])
+    elif sweep_list and sweep_list[0] and not cli_sweep_specs and not args.sweep_file:
         cli_parts.extend(["--", sweep_list[0]])
 
     equivalent_cli = " ".join(cli_parts)
@@ -612,10 +620,9 @@ def main() -> None:
             "dirty": git_info["dirty"],
             "patch_file": patch_rel_path,
         },
+        "executions": [],
     }
-    if is_sweep:
-        run_json_data["executions"] = []
-    else:
+    if not is_sweep:
         run_json_data["execution"] = None
 
     run_json_path = run_dir / "run.json"

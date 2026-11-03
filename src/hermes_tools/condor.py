@@ -12,7 +12,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_tools.core import console, get_username, locked_mutate_run_json, resolve_submit_python
+from hermes_tools.core import (
+    console,
+    get_execution_records,
+    get_username,
+    load_run_json,
+    locked_mutate_run_json,
+    resolve_submit_python,
+    set_execution_records,
+)
 
 ARCH_SPECS: Dict[str, Dict[str, object]] = {
     "GPU3090": {
@@ -296,6 +304,8 @@ fi
 import fcntl
 import json
 import os
+import random
+import time
 from pathlib import Path
 
 run_json_path = Path(os.environ["UPD_RUN_JSON"])
@@ -340,48 +350,57 @@ exec_record = {
     "major_page_faults": safe_int(os.environ.get("UPD_FAULTS", "0")),
 }
 
-if sweep_count > 1:
-    node_tmp = repro_dir / f".node_{proc_id}.json.tmp.{os.getpid()}"
-    node_tmp.write_text(json.dumps(exec_record, indent=2) + "\n", encoding="utf-8")
-    os.replace(node_tmp, repro_dir / f"node_{proc_id}.json")
+# Always write lock-free per-process node_<proc_id>.json atomically first
+node_tmp = repro_dir / f".node_{proc_id}.json.tmp.{os.getpid()}"
+node_tmp.write_text(json.dumps(exec_record, indent=2) + "\n", encoding="utf-8")
+os.replace(node_tmp, repro_dir / f"node_{proc_id}.json")
 
+# Best-effort bounded non-blocking flock so concurrent sweep workers never stall on CephFS
 lock_path = repro_dir / ".run_json.lock"
 with open(lock_path, "a", encoding="utf-8") as lf:
-    fcntl.flock(lf, fcntl.LOCK_EX)
-    try:
-        data = (
-            json.loads(run_json_path.read_text(encoding="utf-8"))
-            if run_json_path.exists()
-            else {}
-        )
-        if sweep_count == 1:
-            if caught_sig:
-                data["status"] = f"INTERRUPTED ({caught_sig})"
-            else:
-                data["status"] = "COMPLETED" if exit_code == 0 else "FAILED"
-            data["execution"] = exec_record
-        else:
+    acquired = False
+    for _ in range(15):
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except BlockingIOError:
+            time.sleep(0.03 + random.uniform(0.0, 0.05))
+    if acquired:
+        try:
+            data = (
+                json.loads(run_json_path.read_text(encoding="utf-8"))
+                if run_json_path.exists()
+                else {}
+            )
             node_files = sorted(repro_dir.glob("node_*.json"))
             executions = [json.loads(nf.read_text(encoding="utf-8")) for nf in node_files]
             executions.sort(key=lambda x: x.get("process_id", 0))
             data["executions"] = executions
-            if len(executions) < sweep_count:
-                data["status"] = f"RUNNING ({len(executions)}/{sweep_count} finished)"
-            else:
-                any_sig = any(bool(x.get("signal")) for x in executions)
-                any_failed = any(x.get("exit_code", 0) != 0 for x in executions)
-                if any_sig:
-                    data["status"] = "INTERRUPTED"
-                elif any_failed:
-                    data["status"] = "COMPLETED_WITH_ERRORS"
+            if sweep_count == 1:
+                data["execution"] = executions[0] if executions else exec_record
+                if caught_sig:
+                    data["status"] = f"INTERRUPTED ({caught_sig})"
                 else:
-                    data["status"] = "COMPLETED"
+                    data["status"] = "COMPLETED" if exit_code == 0 else "FAILED"
+            else:
+                if len(executions) < sweep_count:
+                    data["status"] = f"RUNNING ({len(executions)}/{sweep_count} finished)"
+                else:
+                    any_sig = any(bool(x.get("signal")) for x in executions)
+                    any_failed = any(x.get("exit_code", 0) != 0 for x in executions)
+                    if any_sig:
+                        data["status"] = "INTERRUPTED"
+                    elif any_failed:
+                        data["status"] = "COMPLETED_WITH_ERRORS"
+                    else:
+                        data["status"] = "COMPLETED"
 
-        tmp_json = repro_dir / f".run.json.tmp.{proc_id}.{os.getpid()}"
-        tmp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp_json, run_json_path)
-    finally:
-        fcntl.flock(lf, fcntl.LOCK_UN)
+            tmp_json = repro_dir / f".run.json.tmp.{proc_id}.{os.getpid()}"
+            tmp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp_json, run_json_path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 PYEOF
 
 exit "${EXIT_CODE}"
@@ -467,9 +486,10 @@ def generate_sub_file(
     nodes_exclude: List[str],
     project_code: Optional[str],
     scratch_files: List[str],
+    retry_targets: Optional[List[Tuple[int, str]]] = None,
+    retry_epoch: Optional[int] = None,
 ) -> str:
     is_sweep = len(sweep_args) > 1
-    suffix = "_$(Process)" if is_sweep else ""
 
     lines = [
         "# =============================================================================",
@@ -522,6 +542,48 @@ def generate_sub_file(
         lines.append(f"transfer_input_files    = {', '.join(scratch_files)}")
         lines.append('transfer_output_files   = ""')
 
+    if retry_targets is not None:
+        lines.extend(
+            [
+                "",
+                "# --- Top-Level Logs & Repro Scheduler Log (In-Place Retry) ---",
+                f"Log                     = {repro_dir.as_posix()}/condor.log",
+                f'environment             = "SUBMIT_EPOCH={retry_epoch or 0}"',
+            ]
+        )
+        if not is_sweep:
+            single_encoded = (
+                format_condor_arg_line(retry_targets[0][1]) if retry_targets[0][1] else ""
+            )
+            arg_str = f'"0 {single_encoded}"' if single_encoded else '"0"'
+            lines.extend(
+                [
+                    f"Output                  = {run_dir.as_posix()}/{script_stem}.out",
+                    f"Error                   = {run_dir.as_posix()}/{script_stem}.err",
+                    "",
+                    "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
+                    f"Arguments               = {arg_str}",
+                    "queue 1",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"Output                  = {run_dir.as_posix()}/{script_stem}_$(orig_proc).out",
+                    f"Error                   = {run_dir.as_posix()}/{script_stem}_$(orig_proc).err",
+                    "",
+                    "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
+                    'Arguments               = "$(orig_proc) $(job_args)"',
+                    "queue orig_proc, job_args from (",
+                ]
+            )
+            for pid, raw_arg in retry_targets:
+                encoded = format_condor_arg_line(raw_arg)
+                lines.append(f"    {pid}, {encoded}" if encoded else f"    {pid},")
+            lines.append(")")
+        return "\n".join(lines) + "\n"
+
+    suffix = "_$(Process)" if is_sweep else ""
     lines.extend(
         [
             "",
@@ -560,11 +622,37 @@ def generate_retry_sub_file(
     is_sweep: bool,
     targets: List[Tuple[int, str]],
     retry_epoch: int,
+    run_data: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Builds `repro/job_retry.sub` with fresh SUBMIT_EPOCH and original proc ID mapping,
-    preserving all hardware, architecture, node requirement, project, and scratch directives.
+    Builds `repro/job_retry.sub` directly from structured `run.json` metadata via `generate_sub_file`,
+    falling back to `orig_sub_path` header extraction only if `run.json` is not present.
     """
+    data = run_data if run_data is not None else load_run_json(run_dir)
+    req = data.get("resources_requested", {})
+    sub = data.get("submission", {})
+    if req.get("architecture"):
+        project_cwd = Path(sub.get("working_directory") or run_dir.parent.parent)
+        sweep_args = list(req.get("sweep_arguments") or ([""] * (2 if is_sweep else 1)))
+        return generate_sub_file(
+            sh_path=repro_dir / "job.sh",
+            project_cwd=project_cwd,
+            run_dir=run_dir,
+            repro_dir=repro_dir,
+            script_stem=script_stem,
+            arch=str(req["architecture"]),
+            cpus=req.get("cpus"),
+            mem_mb=req.get("memory_mb"),
+            gpus=req.get("gpus"),
+            sweep_args=sweep_args,
+            nodes_include=list(req.get("node_include") or []),
+            nodes_exclude=list(req.get("node_exclude") or []),
+            project_code=req.get("project_code"),
+            scratch_files=list(req.get("scratch_files") or []),
+            retry_targets=targets,
+            retry_epoch=retry_epoch,
+        )
+
     orig_sub = orig_sub_path.read_text(encoding="utf-8")
     header_lines: List[str] = []
     for line in orig_sub.splitlines():
@@ -575,7 +663,6 @@ def generate_retry_sub_file(
             continue
         header_lines.append(line)
 
-    # Trim trailing blank lines from header_lines
     while header_lines and not header_lines[-1].strip():
         header_lines.pop()
 
@@ -737,7 +824,7 @@ def reconcile_run(
 
     sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
     synced_execs: Optional[List[Dict[str, Any]]] = None
-    if sweep_count > 1 and repro_dir.is_dir():
+    if repro_dir.is_dir():
         node_files = sorted(repro_dir.glob("node_*.json"))
         if node_files:
             loaded_execs: List[Dict[str, Any]] = []
@@ -747,9 +834,9 @@ def reconcile_run(
                 except Exception:
                     pass
             loaded_execs.sort(key=lambda x: x.get("process_id", 0))
-            if loaded_execs != data.get("executions", []):
+            if loaded_execs != get_execution_records(data):
                 synced_execs = loaded_execs
-                data["executions"] = loaded_execs
+                set_execution_records(data, loaded_execs)
 
     if live_clusters is None:
         return data
@@ -765,7 +852,7 @@ def reconcile_run(
             locked_mutate_run_json(
                 run_json_path,
                 repro_dir,
-                lambda d: d.update({"executions": synced_execs}),
+                lambda d: set_execution_records(d, synced_execs),
             )
         total_running = sum(live_clusters[c]["running"] for c in active_cids)
         total_held = sum(live_clusters[c]["held"] for c in active_cids)
@@ -773,7 +860,7 @@ def reconcile_run(
             data["_live_badge"] = f"HELD ({total_held} held)"
         elif total_running > 0:
             if sweep_count > 1:
-                done = len(data.get("executions", []))
+                done = len(get_execution_records(data))
                 data["_live_badge"] = (
                     f"RUNNING ({total_running} active, {done}/{sweep_count} done)"
                 )
@@ -785,38 +872,40 @@ def reconcile_run(
 
     if is_active_status and all_cids:
         fate = inspect_condor_log_fate(repro_dir / "condor.log", is_sweep=(sweep_count > 1))
-        if sweep_count > 1:
-            execs = data.get("executions", [])
-            if len(execs) >= sweep_count:
-                any_sig = any(bool(x.get("signal")) for x in execs)
-                any_err = any(x.get("exit_code", 0) != 0 for x in execs)
-                if any_sig:
-                    new_status = "INTERRUPTED"
-                elif any_err:
-                    new_status = "COMPLETED_WITH_ERRORS"
-                else:
-                    new_status = "COMPLETED"
+        execs = get_execution_records(data)
+        if len(execs) >= sweep_count:
+            any_sig = any(bool(x.get("signal")) for x in execs)
+            any_err = any(x.get("exit_code", 0) != 0 for x in execs)
+            if any_sig:
+                first_sig = next((x.get("signal") for x in execs if x.get("signal")), None)
+                new_status = (
+                    f"INTERRUPTED ({first_sig})"
+                    if sweep_count == 1 and first_sig
+                    else "INTERRUPTED"
+                )
+            elif any_err:
+                new_status = "COMPLETED_WITH_ERRORS" if sweep_count > 1 else "FAILED"
             else:
-                if fate == "ABORTED":
-                    new_status = "ABORTED"
-                elif fate == "FAILED":
-                    new_status = f"FAILED ({len(execs)}/{sweep_count} finished)"
-                else:
-                    new_status = f"INCOMPLETE ({len(execs)}/{sweep_count})"
+                new_status = "COMPLETED"
         else:
-            if data.get("execution") is not None:
-                ec = data["execution"].get("exit_code", 0)
-                sig = data["execution"].get("signal")
-                if sig:
-                    new_status = f"INTERRUPTED ({sig})"
-                else:
-                    new_status = "COMPLETED" if ec == 0 else "FAILED"
+            if fate == "ABORTED":
+                new_status = "ABORTED"
+            elif fate == "FAILED":
+                new_status = (
+                    f"FAILED ({len(execs)}/{sweep_count} finished)"
+                    if sweep_count > 1
+                    else "FAILED"
+                )
             else:
-                new_status = fate or "VANISHED"
+                new_status = (
+                    f"INCOMPLETE ({len(execs)}/{sweep_count})"
+                    if sweep_count > 1
+                    else (fate or "VANISHED")
+                )
 
         def _heal(d: Dict[str, Any]) -> None:
             if synced_execs is not None:
-                d["executions"] = synced_execs
+                set_execution_records(d, synced_execs)
             if str(d.get("status", "")).startswith(("QUEUED", "RUNNING", "HELD")):
                 d["status"] = new_status
 
@@ -825,7 +914,7 @@ def reconcile_run(
         data = locked_mutate_run_json(
             run_json_path,
             repro_dir,
-            lambda d: d.update({"executions": synced_execs}),
+            lambda d: set_execution_records(d, synced_execs),
         )
 
     return data

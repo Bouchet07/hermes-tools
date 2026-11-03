@@ -318,11 +318,29 @@ def dir_size_mb(path: Path) -> float:
     return total / (1024 * 1024)
 
 
+def get_execution_records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Returns a unified list of per-process execution dicts across single or sweep runs."""
+    exec_list = data.get("executions")
+    if isinstance(exec_list, list) and exec_list:
+        return [r for r in exec_list if isinstance(r, dict)]
+    exec_single = data.get("execution")
+    if isinstance(exec_single, dict):
+        return [exec_single]
+    return []
+
+
+def set_execution_records(data: Dict[str, Any], records: List[Dict[str, Any]]) -> None:
+    """Stores unified execution records into `data["executions"]` (and `data["execution"]` for 1-job runs)."""
+    sorted_recs = sorted(records, key=lambda x: int(x.get("process_id", 0)))
+    data["executions"] = sorted_recs
+    sweep_cnt = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
+    if sweep_cnt == 1:
+        data["execution"] = sorted_recs[0] if sorted_recs else None
+
+
 def summarize_metrics(data: Dict[str, Any]) -> Tuple[str, str, str]:
     """Returns (host_summary, runtime_summary, peak_ram_summary) across single or sweep runs."""
-    exec_single = data.get("execution")
-    exec_list = data.get("executions") or []
-    records = [exec_single] if isinstance(exec_single, dict) else exec_list
+    records = get_execution_records(data)
     if not records:
         return "—", "—", "—"
 

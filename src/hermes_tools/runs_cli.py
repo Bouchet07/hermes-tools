@@ -35,11 +35,13 @@ from hermes_tools.core import (
     console,
     dir_size_mb,
     format_duration,
+    get_execution_records,
     get_runs_root,
     list_run_dirs,
     load_run_json,
     locked_mutate_run_json,
     resolve_latest_symlink,
+    set_execution_records,
     style_status,
     summarize_metrics,
     update_latest_symlink,
@@ -156,7 +158,7 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
         )
 
         if sweep_cnt > 1:
-            execs = data.get("executions", [])
+            execs = get_execution_records(data)
             ok = sum(1 for x in execs if x.get("exit_code", -1) == 0)
             fail = sum(1 for x in execs if x.get("exit_code", 0) != 0)
             tasks_str = (
@@ -267,12 +269,7 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
         )
     )
 
-    sweep_cnt = int(req.get("sweep_count", 1) or 1)
-    records: List[Dict[str, Any]] = []
-    if sweep_cnt == 1 and isinstance(data.get("execution"), dict):
-        records = [data["execution"]]
-    elif sweep_cnt > 1:
-        records = list(data.get("executions") or [])
+    records = get_execution_records(data)
 
     if records:
         et = Table(
@@ -372,7 +369,7 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
                 if args.err:
                     failed_execs = [
                         int(x.get("process_id", 0))
-                        for x in (data.get("executions") or [])
+                        for x in get_execution_records(data)
                         if int(x.get("exit_code", 0)) != 0
                     ]
                     if failed_execs:
@@ -531,17 +528,7 @@ def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
 def get_failed_or_missing_procs(data: Dict[str, Any]) -> List[Tuple[int, str]]:
     req = data.get("resources_requested", {})
     sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
-    sweep_cnt = len(sweep_args)
-
-    if sweep_cnt == 1:
-        exec_rec = data.get("execution") or {}
-        ec = exec_rec.get("exit_code")
-        sig = exec_rec.get("signal")
-        if ec != 0 or sig:
-            return [(0, sweep_args[0])]
-        return []
-
-    execs = {int(x.get("process_id", -1)): x for x in (data.get("executions") or [])}
+    execs = {int(x.get("process_id", 0)): x for x in get_execution_records(data)}
     failed: List[Tuple[int, str]] = []
     for pid, arg_line in enumerate(sweep_args):
         rec = execs.get(pid)
@@ -678,6 +665,7 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         is_sweep=is_sweep,
         targets=targets,
         retry_epoch=retry_epoch,
+        run_data=data,
     )
     retry_sub_path = repro_dir / "job_retry.sub"
     write_text_lf(retry_sub_path, retry_sub_content)
@@ -702,13 +690,11 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
 
     def _record_retry(d: Dict[str, Any]) -> None:
         d["status"] = "QUEUED (RETRY)"
-        if not is_sweep:
-            d["execution"] = None
-        else:
-            retried_ids = {pid for pid, _ in targets}
-            d["executions"] = [
-                x for x in d.get("executions", []) if x.get("process_id") not in retried_ids
-            ]
+        retried_ids = {pid for pid, _ in targets}
+        remaining = [
+            x for x in get_execution_records(d) if x.get("process_id") not in retried_ids
+        ]
+        set_execution_records(d, remaining)
         sub_block = d.setdefault("submission", {})
         history = sub_block.setdefault("retry_clusters", [])
         old_cid = sub_block.get("cluster_id")

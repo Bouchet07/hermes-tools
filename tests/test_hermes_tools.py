@@ -278,3 +278,35 @@ def test_end_to_end_send_dry_run_and_runs_cli(tmp_path: Path) -> None:
     )
     assert res_ins.returncode == 0
     assert "GPU3090" in res_ins.stdout
+
+
+def test_sweep_equivalent_cli_stays_compact(tmp_path: Path) -> None:
+    script = tmp_path / "train.py"
+    script.write_text("print('sweep')\n", encoding="utf-8")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            "train.py",
+            "-a",
+            "GPU3090",
+            "--dry-run",
+            "--no-venv",
+            "-s",
+            "{0..5}",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res.returncode == 0, res.stderr
+    runs_dir = tmp_path / "runs"
+    run_folders = [p for p in runs_dir.iterdir() if p.is_dir() and not p.is_symlink()]
+    rj = load_run_json(run_folders[0])
+    assert rj["resources_requested"]["sweep_count"] == 6
+    assert "-s '{0..5}'" in rj["submission"]["equivalent_cli"] or "-s {0..5}" in rj["submission"]["equivalent_cli"]
+    assert "-s 0 -s 1" not in rj["submission"]["equivalent_cli"]
