@@ -355,35 +355,47 @@ node_tmp = repro_dir / f".node_{proc_id}.json.tmp.{os.getpid()}"
 node_tmp.write_text(json.dumps(exec_record, indent=2) + "\n", encoding="utf-8")
 os.replace(node_tmp, repro_dir / f"node_{proc_id}.json")
 
-# Best-effort bounded non-blocking flock so concurrent sweep workers never stall on CephFS
+# Zero-wait non-blocking flock: if another sweep worker holds the lock, exit in 0ms
+# (our node_<proc_id>.json is already on disk and will be merged by the lock holder or reconcile_run)
 lock_path = repro_dir / ".run_json.lock"
 with open(lock_path, "a", encoding="utf-8") as lf:
-    acquired = False
-    for _ in range(15):
-        try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-            break
-        except BlockingIOError:
-            time.sleep(0.03 + random.uniform(0.0, 0.05))
-    if acquired:
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
         try:
             data = (
                 json.loads(run_json_path.read_text(encoding="utf-8"))
                 if run_json_path.exists()
                 else {}
             )
-            node_files = sorted(repro_dir.glob("node_*.json"))
-            executions = [json.loads(nf.read_text(encoding="utf-8")) for nf in node_files]
-            executions.sort(key=lambda x: x.get("process_id", 0))
-            data["executions"] = executions
+            data.pop("execution", None)
             if sweep_count == 1:
-                data["execution"] = executions[0] if executions else exec_record
+                data["executions"] = [exec_record]
                 if caught_sig:
                     data["status"] = f"INTERRUPTED ({caught_sig})"
                 else:
                     data["status"] = "COMPLETED" if exit_code == 0 else "FAILED"
             else:
+                by_id = {
+                    int(x.get("process_id", 0)): x
+                    for x in data.get("executions", [])
+                    if isinstance(x, dict)
+                }
+                by_id[proc_id] = exec_record
+                # Only read node_<id>.json files not yet merged into data["executions"]
+                for entry in os.scandir(repro_dir):
+                    name = entry.name
+                    if name.startswith("node_") and name.endswith(".json"):
+                        try:
+                            nid = int(name[5:-5])
+                            if nid not in by_id:
+                                by_id[nid] = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                executions = [by_id[k] for k in sorted(by_id)]
+                data["executions"] = executions
                 if len(executions) < sweep_count:
                     data["status"] = f"RUNNING ({len(executions)}/{sweep_count} finished)"
                 else:
@@ -545,43 +557,15 @@ def generate_sub_file(
 
     if retry_targets is not None:
         lines.extend(
-            [
-                "",
-                "# --- Top-Level Logs & Repro Scheduler Log (In-Place Retry) ---",
-                f"Log                     = {repro_dir.as_posix()}/condor.log",
-                f'environment             = "SUBMIT_EPOCH={retry_epoch or 0}"',
-            ]
+            _format_retry_queue_section(
+                run_dir=run_dir,
+                repro_dir=repro_dir,
+                script_stem=script_stem,
+                is_sweep=is_sweep,
+                targets=retry_targets,
+                retry_epoch=retry_epoch or 0,
+            )
         )
-        if not is_sweep:
-            single_encoded = (
-                format_condor_arg_line(retry_targets[0][1]) if retry_targets[0][1] else ""
-            )
-            arg_str = f'"0 {single_encoded}"' if single_encoded else '"0"'
-            lines.extend(
-                [
-                    f"Output                  = {run_dir.as_posix()}/{script_stem}.out",
-                    f"Error                   = {run_dir.as_posix()}/{script_stem}.err",
-                    "",
-                    "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
-                    f"Arguments               = {arg_str}",
-                    "queue 1",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    f"Output                  = {run_dir.as_posix()}/{script_stem}_$(orig_proc).out",
-                    f"Error                   = {run_dir.as_posix()}/{script_stem}_$(orig_proc).err",
-                    "",
-                    "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
-                    'Arguments               = "$(orig_proc) $(job_args)"',
-                    "queue orig_proc, job_args from (",
-                ]
-            )
-            for pid, raw_arg in retry_targets:
-                encoded = format_condor_arg_line(raw_arg)
-                lines.append(f"    {pid}, {encoded}" if encoded else f"    {pid},")
-            lines.append(")")
         return "\n".join(lines) + "\n"
 
     suffix = "_$(Process)" if is_sweep else ""
@@ -613,6 +597,51 @@ def generate_sub_file(
         lines.append(")")
 
     return "\n".join(lines) + "\n"
+
+
+def _format_retry_queue_section(
+    run_dir: Path,
+    repro_dir: Path,
+    script_stem: str,
+    is_sweep: bool,
+    targets: List[Tuple[int, str]],
+    retry_epoch: int,
+) -> List[str]:
+    out = [
+        "",
+        "# --- Top-Level Logs & Repro Scheduler Log (In-Place Retry) ---",
+        f"Log                     = {repro_dir.as_posix()}/condor.log",
+        f'environment             = "SUBMIT_EPOCH={retry_epoch}"',
+    ]
+    if not is_sweep:
+        single_encoded = format_condor_arg_line(targets[0][1]) if targets[0][1] else ""
+        arg_str = f'"0 {single_encoded}"' if single_encoded else '"0"'
+        out.extend(
+            [
+                f"Output                  = {run_dir.as_posix()}/{script_stem}.out",
+                f"Error                   = {run_dir.as_posix()}/{script_stem}.err",
+                "",
+                "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
+                f"Arguments               = {arg_str}",
+                "queue 1",
+            ]
+        )
+    else:
+        out.extend(
+            [
+                f"Output                  = {run_dir.as_posix()}/{script_stem}_$(orig_proc).out",
+                f"Error                   = {run_dir.as_posix()}/{script_stem}_$(orig_proc).err",
+                "",
+                "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
+                'Arguments               = "$(orig_proc) $(job_args)"',
+                "queue orig_proc, job_args from (",
+            ]
+        )
+        for pid, raw_arg in targets:
+            encoded = format_condor_arg_line(raw_arg)
+            out.append(f"    {pid}, {encoded}" if encoded else f"    {pid},")
+        out.append(")")
+    return out
 
 
 def generate_retry_sub_file(
@@ -667,38 +696,14 @@ def generate_retry_sub_file(
     while header_lines and not header_lines[-1].strip():
         header_lines.pop()
 
-    common_lines = header_lines + [
-        "",
-        "# --- Top-Level Logs & Repro Scheduler Log (In-Place Retry) ---",
-        f"Log                     = {repro_dir.as_posix()}/condor.log",
-        f'environment             = "SUBMIT_EPOCH={retry_epoch}"',
-    ]
-
-    if not is_sweep:
-        single_encoded = format_condor_arg_line(targets[0][1]) if targets[0][1] else ""
-        arg_str = f'"0 {single_encoded}"' if single_encoded else '"0"'
-        retry_lines = common_lines + [
-            f"Output                  = {run_dir.as_posix()}/{script_stem}.out",
-            f"Error                   = {run_dir.as_posix()}/{script_stem}.err",
-            "",
-            "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
-            f"Arguments               = {arg_str}",
-            "queue 1",
-        ]
-    else:
-        retry_lines = common_lines + [
-            f"Output                  = {run_dir.as_posix()}/{script_stem}_$(orig_proc).out",
-            f"Error                   = {run_dir.as_posix()}/{script_stem}_$(orig_proc).err",
-            "",
-            "# --- Job Queue & Arguments (HTCondor New Quoted Syntax) ---",
-            'Arguments               = "$(orig_proc) $(job_args)"',
-            "queue orig_proc, job_args from (",
-        ]
-        for pid, raw_arg in targets:
-            encoded = format_condor_arg_line(raw_arg)
-            retry_lines.append(f"    {pid}, {encoded}" if encoded else f"    {pid},")
-        retry_lines.append(")")
-
+    retry_lines = header_lines + _format_retry_queue_section(
+        run_dir=run_dir,
+        repro_dir=repro_dir,
+        script_stem=script_stem,
+        is_sweep=is_sweep,
+        targets=targets,
+        retry_epoch=retry_epoch,
+    )
     return "\n".join(retry_lines) + "\n"
 
 

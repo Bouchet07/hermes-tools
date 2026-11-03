@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -27,9 +28,65 @@ _IGNORED_PARTS: Set[str] = {
     "wandb",
 }
 
-MAX_FILE_BYTES = 15 * 1024 * 1024  # 15 MB per file copied (larger files are symlinked)
-MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB total copied cap (remaining files are symlinked)
-MAX_SNAPSHOT_FILES = 2500
+# Binary, dataset, checkpoint, and media extensions that should always be symlinked (never copied)
+_SYMLINK_ONLY_EXTENSIONS: Set[str] = {
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".safetensors",
+    ".onnx",
+    ".bin",
+    ".h5",
+    ".hdf5",
+    ".npy",
+    ".npz",
+    ".pkl",
+    ".pickle",
+    ".joblib",
+    ".parquet",
+    ".feather",
+    ".arrow",
+    ".csv",
+    ".tsv",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".zip",
+    ".7z",
+    ".zst",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".webp",
+    ".svg",
+    ".pdf",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".mkv",
+    ".wav",
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".so",
+    ".dll",
+    ".dylib",
+    ".a",
+    ".o",
+    ".whl",
+}
+
+MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB per source file copied (larger files are symlinked)
+MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total copied cap (remaining files are symlinked)
+MAX_SNAPSHOT_FILES = 1500
 
 
 def _find_git_root(cwd: Path) -> Optional[Path]:
@@ -117,10 +174,17 @@ def get_git_info(cwd: Path) -> Dict[str, object]:
     return info
 
 
-def _symlink_fallback(src_file: Path, dest_file: Path) -> None:
+def _ensure_parent(dest_file: Path, created_dirs: Set[Path]) -> None:
+    parent = dest_file.parent
+    if parent not in created_dirs:
+        parent.mkdir(parents=True, exist_ok=True)
+        created_dirs.add(parent)
+
+
+def _symlink_fallback(src_file: Path, dest_file: Path, created_dirs: Set[Path]) -> None:
     """Creates a symlink at dest_file pointing to src_file so relative paths never break."""
     try:
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_parent(dest_file, created_dirs)
         if dest_file.exists() or dest_file.is_symlink():
             dest_file.unlink()
         os.symlink(src_file.resolve(), dest_file)
@@ -131,21 +195,26 @@ def _symlink_fallback(src_file: Path, dest_file: Path) -> None:
 def _copy_or_link_entry(
     src_file: Path,
     dest_file: Path,
+    created_dirs: Set[Path],
     allow_copy: bool = True,
     max_bytes: int = MAX_FILE_BYTES,
 ) -> Tuple[bool, int]:
     """
-    Copies regular files (<= max_bytes when allow_copy is True) and symlinks larger/capped
-    files or existing symlinks so `Path(__file__).parent` relative lookups always work.
-    Returns (copied_bytes_flag, size_bytes).
+    Copies source/config files (<= max_bytes when allow_copy is True) using fast copyfile
+    (skipping copystat RPCs) and symlinks binary/data/large files so `Path(__file__).parent`
+    relative lookups always work.
     """
+    if src_file.suffix.lower() in _SYMLINK_ONLY_EXTENSIONS:
+        _symlink_fallback(src_file, dest_file, created_dirs)
+        return False, 0
+
     try:
         st = src_file.lstat()
     except OSError:
         return False, 0
 
     if stat.S_ISLNK(st.st_mode):
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_parent(dest_file, created_dirs)
         try:
             if dest_file.exists() or dest_file.is_symlink():
                 dest_file.unlink()
@@ -158,11 +227,11 @@ def _copy_or_link_entry(
         return False, 0
 
     if not allow_copy or st.st_size > max_bytes:
-        _symlink_fallback(src_file, dest_file)
+        _symlink_fallback(src_file, dest_file, created_dirs)
         return False, 0
 
-    dest_file.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_file, dest_file)
+    _ensure_parent(dest_file, created_dirs)
+    shutil.copyfile(src_file, dest_file)
     return True, st.st_size
 
 
@@ -170,14 +239,15 @@ def create_code_snapshot(
     target_path: Path, cwd: Path, repro_dir: Path, git_info: Dict[str, object]
 ) -> Tuple[Path, Optional[Path]]:
     """
-    Copies source files (<=15MB each, <=100MB total) into repro/code/ and symlinks larger
-    files so editing the workspace while a job is queued never breaks the run, and relative
-    `Path(__file__)` lookups to datasets/weights still resolve cleanly.
+    Copies source/config files into repro/code/ and symlinks larger or binary/data files
+    so editing code while a job is queued never breaks the run, and relative `Path(__file__)`
+    lookups to datasets/weights still resolve cleanly.
     """
     code_dir = repro_dir / "code"
     if code_dir.exists():
         shutil.rmtree(code_dir, ignore_errors=True)
     code_dir.mkdir(parents=True, exist_ok=True)
+    created_dirs: Set[Path] = {code_dir}
     runs_root = (cwd / "runs").resolve()
     repro_resolved = repro_dir.resolve()
 
@@ -185,7 +255,6 @@ def create_code_snapshot(
         git_root = Path(str(git_info["root"])).resolve()
         git_runs_root = (git_root / "runs").resolve()
         try:
-            # Single git ls-files invocation with -t to distinguish tracked ('H') vs untracked ('?')
             ls_res = subprocess.run(
                 ["git", "ls-files", "-t", "--cached", "--others", "--exclude-standard"],
                 cwd=git_root,
@@ -229,7 +298,7 @@ def create_code_snapshot(
                 )
                 dest_file = code_dir / rel_path
                 copied, nbytes = _copy_or_link_entry(
-                    src_file, dest_file, allow_copy=allow_copy
+                    src_file, dest_file, created_dirs, allow_copy=allow_copy
                 )
                 if copied:
                     total_files += 1
@@ -238,23 +307,100 @@ def create_code_snapshot(
             if target_path.is_relative_to(git_root):
                 rel_target = target_path.relative_to(git_root)
                 snap_target = code_dir / rel_target
-                snap_target.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_parent(snap_target, created_dirs)
                 if snap_target.is_symlink():
                     snap_target.unlink()
-                shutil.copy2(target_path, snap_target)
+                shutil.copyfile(target_path, snap_target)
                 return snap_target, code_dir
         except Exception:
             pass
 
-    snap_target = code_dir / target_path.name
-    shutil.copy2(target_path, snap_target)
+    # Non-git fallback: fast scandir walk of cwd
+    cwd_resolved = cwd.resolve()
+    total_bytes = 0
+    total_files = 0
+    stack: List[Path] = [cwd_resolved]
+    while stack:
+        curr_dir = stack.pop()
+        try:
+            with os.scandir(curr_dir) as it:
+                for entry in it:
+                    if entry.name in _IGNORED_PARTS or entry.name.startswith(".hermes"):
+                        continue
+                    entry_path = Path(entry.path)
+                    if entry_path == runs_root or entry_path == repro_resolved:
+                        continue
+                    rel_path = entry_path.relative_to(cwd_resolved)
+                    dest_file = code_dir / rel_path
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry_path)
+                    else:
+                        allow_copy = (
+                            total_files < MAX_SNAPSHOT_FILES
+                            and total_bytes < MAX_TOTAL_BYTES
+                        )
+                        copied, nbytes = _copy_or_link_entry(
+                            entry_path, dest_file, created_dirs, allow_copy=allow_copy
+                        )
+                        if copied:
+                            total_files += 1
+                            total_bytes += nbytes
+        except OSError:
+            pass
+
+    if target_path.is_relative_to(cwd_resolved):
+        snap_target = code_dir / target_path.relative_to(cwd_resolved)
+    else:
+        snap_target = code_dir / target_path.name
+    _ensure_parent(snap_target, created_dirs)
+    if snap_target.is_symlink():
+        snap_target.unlink()
+    shutil.copyfile(target_path, snap_target)
     return snap_target, code_dir
 
 
-def freeze_python_env(venv_path: Optional[Path], repro_dir: Path) -> None:
-    """Writes `repro/env.txt` using `uv pip freeze` or `pip freeze`."""
+def _venv_state_mtime(venv_path: Path) -> float:
+    """Returns the latest mtime of the venv's package directories to validate the env.txt cache."""
+    latest = 0.0
+    candidates = [venv_path / "pyvenv.cfg", venv_path / "Lib" / "site-packages"]
+    lib_dir = venv_path / "lib"
+    if lib_dir.is_dir():
+        try:
+            with os.scandir(lib_dir) as it:
+                for entry in it:
+                    if entry.name.startswith("python"):
+                        candidates.append(Path(entry.path) / "site-packages")
+        except OSError:
+            pass
+    for p in candidates:
+        try:
+            st = p.stat()
+            if st.st_mtime > latest:
+                latest = st.st_mtime
+        except OSError:
+            pass
+    return latest
+
+
+def freeze_python_env(
+    venv_path: Optional[Path], repro_dir: Path, detach: bool = False
+) -> None:
+    """
+    Writes `repro/env.txt` using a mtime-validated cache in `.venv/.hermes_env_cache.txt` (0ms on cache hit),
+    or spawns `uv pip freeze` / `pip freeze` (optionally detached so `send` exits immediately).
+    """
     if not venv_path:
         return
+    target_env_txt = repro_dir / "env.txt"
+    cache_file = venv_path / ".hermes_env_cache.txt"
+    try:
+        if cache_file.is_file():
+            if cache_file.stat().st_mtime >= _venv_state_mtime(venv_path):
+                shutil.copyfile(cache_file, target_env_txt)
+                return
+    except OSError:
+        pass
+
     py_bin = (
         venv_path / "bin" / "python"
         if (venv_path / "bin" / "python").is_file()
@@ -265,27 +411,53 @@ def freeze_python_env(venv_path: Optional[Path], repro_dir: Path) -> None:
         if (venv_path / "bin" / "pip").is_file()
         else venv_path / "Scripts" / "pip.exe"
     )
-    try:
-        if shutil.which("uv") and py_bin.is_file():
-            freeze_res = subprocess.run(
-                ["uv", "pip", "freeze", "--python", str(py_bin)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        elif pip_bin.is_file():
-            freeze_res = subprocess.run(
-                [str(pip_bin), "freeze"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-        else:
-            freeze_res = None
+    uv_bin = shutil.which("uv")
+    if uv_bin and py_bin.is_file():
+        freeze_cmd = [uv_bin, "pip", "freeze", "--python", str(py_bin)]
+    elif pip_bin.is_file():
+        freeze_cmd = [str(pip_bin), "freeze"]
+    else:
+        return
 
-        if freeze_res and freeze_res.returncode == 0:
-            write_text_lf(repro_dir / "env.txt", freeze_res.stdout)
+    if detach:
+        helper_code = (
+            "import shutil, subprocess, sys; "
+            "r = subprocess.run(sys.argv[3:], capture_output=True, text=True, encoding='utf-8', errors='replace'); "
+            "r.returncode == 0 and ("
+            "open(sys.argv[1], 'w', encoding='utf-8', newline='\\n').write(r.stdout), "
+            "shutil.copyfile(sys.argv[1], sys.argv[2]))"
+        )
+        kwargs: Dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", helper_code, str(target_env_txt), str(cache_file), *freeze_cmd],
+                **kwargs,  # type: ignore[arg-type]
+            )
+            return
+        except Exception:
+            pass
+
+    try:
+        freeze_res = subprocess.run(
+            freeze_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if freeze_res.returncode == 0:
+            write_text_lf(target_env_txt, freeze_res.stdout)
+            try:
+                shutil.copyfile(target_env_txt, cache_file)
+            except OSError:
+                pass
     except Exception:
         pass

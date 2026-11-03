@@ -323,8 +323,8 @@ def format_duration(seconds: Optional[int]) -> str:
     return f"{s}s"
 
 
-def dir_size_mb(path: Path) -> float:
-    """Fast recursive directory size calculation using os.scandir to minimize CephFS stat calls."""
+def dir_size_mb(path: Path, include_code_snapshot: bool = False) -> float:
+    """Fast directory size calculation using os.scandir, skipping repro/code by default to avoid CephFS stat storms."""
     total = 0
     stack = [str(path)]
     while stack:
@@ -336,6 +336,8 @@ def dir_size_mb(path: Path) -> float:
                         if entry.is_symlink():
                             continue
                         if entry.is_dir(follow_symlinks=False):
+                            if not include_code_snapshot and entry.name == "code" and curr.endswith("repro"):
+                                continue
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             total += entry.stat(follow_symlinks=False).st_size
@@ -347,7 +349,7 @@ def dir_size_mb(path: Path) -> float:
 
 
 def get_execution_records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Returns a unified list of per-process execution dicts across single or sweep runs."""
+    """Returns the canonical list of per-process execution dicts (with backward-compatible fallback)."""
     exec_list = data.get("executions")
     if isinstance(exec_list, list) and exec_list:
         return [r for r in exec_list if isinstance(r, dict)]
@@ -358,12 +360,10 @@ def get_execution_records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def set_execution_records(data: Dict[str, Any], records: List[Dict[str, Any]]) -> None:
-    """Stores unified execution records into `data["executions"]` (and `data["execution"]` for 1-job runs)."""
+    """Stores unified execution records into `data["executions"]`."""
     sorted_recs = sorted(records, key=lambda x: int(x.get("process_id", 0)))
     data["executions"] = sorted_recs
-    sweep_cnt = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
-    if sweep_cnt == 1:
-        data["execution"] = sorted_recs[0] if sorted_recs else None
+    data.pop("execution", None)
 
 
 def summarize_metrics(data: Dict[str, Any]) -> Tuple[str, str, str]:

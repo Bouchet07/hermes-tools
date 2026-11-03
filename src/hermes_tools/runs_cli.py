@@ -768,9 +768,32 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         console.print("[dim]No runs to clean.[/dim]")
         return
 
+    has_filters = bool(args.failed or args.aborted or args.dry or args.older_than)
+    if not has_filters and not sys.stdin.isatty():
+        console.print(
+            "[yellow]Specify --failed, --aborted, --dry, or --older-than (e.g. 7d) in non-interactive mode.[/yellow]"
+        )
+        return
+
+    older_delta: Optional[datetime.timedelta] = None
+    if args.older_than:
+        m = re.match(r"^(\d+)([dhm])$", args.older_than.strip().lower())
+        if m:
+            val, unit = int(m.group(1)), m.group(2)
+            older_delta = (
+                datetime.timedelta(days=val)
+                if unit == "d"
+                else (
+                    datetime.timedelta(hours=val)
+                    if unit == "h"
+                    else datetime.timedelta(minutes=val)
+                )
+            )
+
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, int]]] = None
     now = datetime.datetime.now()
+    inactive_runs: List[Tuple[Path, str]] = []
     candidates: List[Tuple[Path, str, float]] = []
 
     for d in dirs:
@@ -787,6 +810,10 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         if st.startswith(("RUNNING", "QUEUED", "HELD")):
             continue
 
+        if not has_filters:
+            inactive_runs.append((d, st))
+            continue
+
         match = False
         if args.failed and (
             st in ("FAILED", "SUBMIT_FAILED", "VANISHED") or st.startswith("FAILED")
@@ -796,49 +823,24 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             match = True
         if args.dry and st == "DRY_RUN":
             match = True
-        if args.older_than:
-            m = re.match(r"^(\d+)([dhm])$", args.older_than.strip().lower())
-            if m:
-                val, unit = int(m.group(1)), m.group(2)
-                delta = (
-                    datetime.timedelta(days=val)
-                    if unit == "d"
-                    else (
-                        datetime.timedelta(hours=val)
-                        if unit == "h"
-                        else datetime.timedelta(minutes=val)
-                    )
-                )
-                mtime = datetime.datetime.fromtimestamp(d.stat().st_mtime)
-                if now - mtime > delta:
-                    match = True
+        if older_delta is not None:
+            mtime = datetime.datetime.fromtimestamp(d.stat().st_mtime)
+            if now - mtime > older_delta:
+                match = True
 
         if match:
             candidates.append((d, st, dir_size_mb(d)))
 
-    if not (args.failed or args.aborted or args.dry or args.older_than):
-        if not sys.stdin.isatty():
-            console.print(
-                "[yellow]Specify --failed, --aborted, --dry, or --older-than (e.g. 7d) in non-interactive mode.[/yellow]"
-            )
+    if not has_filters:
+        if not inactive_runs:
+            console.print("[green]No inactive runs eligible for deletion.[/green]")
             return
         import questionary
 
-        choices = []
-        for d in dirs:
-            data = load_run_json(d)
-            st = str(data.get("status", "UNKNOWN"))
-            if st.startswith(("RUNNING", "QUEUED", "HELD")):
-                continue
-            mb = dir_size_mb(d)
-            choices.append(
-                questionary.Choice(
-                    f"{d.name:<42} │ {st:<20} │ {mb:6.2f} MB", value=(d, st, mb)
-                )
-            )
-        if not choices:
-            console.print("[green]No inactive runs eligible for deletion.[/green]")
-            return
+        choices = [
+            questionary.Choice(f"{d.name:<42} │ {st:<20}", value=(d, st))
+            for d, st in inactive_runs
+        ]
         selected = questionary.checkbox(
             "Select runs to permanently delete (Space to toggle, Enter to confirm):",
             choices=choices,
@@ -846,7 +848,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         ).ask()
         if not selected:
             return
-        candidates = selected
+        candidates = [(d, st, dir_size_mb(d)) for d, st in selected]
 
     if not candidates:
         console.print("[green]No matching runs found to clean.[/green]")

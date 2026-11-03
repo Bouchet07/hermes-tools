@@ -334,3 +334,30 @@ def test_stop_does_not_mark_completed_run_as_aborted(tmp_path: Path, monkeypatch
     args = argparse.Namespace(run=run_dir.name, yes=True)
     runs_cli.cmd_stop(args, tmp_path / "runs")
     assert load_run_json(run_dir)["status"] == "COMPLETED"
+
+
+def test_freeze_python_env_uses_mtime_cache_and_dir_size_skips_code(tmp_path: Path) -> None:
+    from hermes_tools.core import dir_size_mb
+    from hermes_tools.snapshot import freeze_python_env
+
+    fake_venv = tmp_path / ".venv"
+    fake_venv.mkdir()
+    (fake_venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    cache_file = fake_venv / ".hermes_env_cache.txt"
+    cache_file.write_text("torch==2.5.0\n", encoding="utf-8")
+
+    repro_dir = tmp_path / "runs" / "r1" / "repro"
+    code_dir = repro_dir / "code"
+    code_dir.mkdir(parents=True)
+    # Write 2 MB into repro/code and 1 MB into run output root
+    (code_dir / "big_code.py").write_bytes(b"x" * (2 * 1024 * 1024))
+    (tmp_path / "runs" / "r1" / "checkpoint.bin").write_bytes(b"y" * (1 * 1024 * 1024))
+
+    freeze_python_env(fake_venv, repro_dir)
+    assert (repro_dir / "env.txt").read_text(encoding="utf-8") == "torch==2.5.0\n"
+
+    # dir_size_mb skips repro/code by default so only the 1 MB checkpoint is counted
+    mb_default = dir_size_mb(tmp_path / "runs" / "r1")
+    mb_full = dir_size_mb(tmp_path / "runs" / "r1", include_code_snapshot=True)
+    assert 0.95 <= mb_default <= 1.15
+    assert mb_full >= 2.95

@@ -11,7 +11,6 @@ import re
 import shlex
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -551,12 +550,9 @@ def main() -> None:
             console.print("[yellow]Submission cancelled.[/yellow]")
             sys.exit(0)
 
-    # 7. Materialize Run Directory & Repro Capsule (Overlap env freeze in background thread)
+    # 7. Materialize Run Directory & Repro Capsule (Cached/detached env freeze)
     repro_dir.mkdir(parents=True, exist_ok=True)
-    freeze_thread = threading.Thread(
-        target=freeze_python_env, args=(venv_path, repro_dir), daemon=True
-    )
-    freeze_thread.start()
+    freeze_python_env(venv_path, repro_dir, detach=True)
 
     snap_exec_path, snap_py_root = create_code_snapshot(target_path, cwd, repro_dir, git_info)
 
@@ -642,8 +638,6 @@ def main() -> None:
         },
         "executions": [],
     }
-    if not is_sweep:
-        run_json_data["execution"] = None
 
     run_json_path = run_dir / "run.json"
     atomic_write_json(run_json_path, run_json_data, repro_dir)
@@ -651,7 +645,6 @@ def main() -> None:
     if args.dry_run:
         from rich.syntax import Syntax
 
-        freeze_thread.join(timeout=3.0)
         update_latest_symlink(runs_root, run_dir)
         console.print(
             f"\n[bold yellow]✔ Dry run complete![/bold yellow] Generated capsule in: [cyan]runs/{run_id}/[/cyan]"
@@ -681,7 +674,6 @@ def main() -> None:
 
         locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
         update_latest_symlink(runs_root, run_dir)
-        freeze_thread.join(timeout=3.0)
 
         first_out = (
             f"runs/latest/{target_path.stem}_0.out"
@@ -709,7 +701,6 @@ def main() -> None:
         )
 
     except FileNotFoundError:
-        freeze_thread.join(timeout=2.0)
         locked_mutate_run_json(
             run_json_path,
             repro_dir,
@@ -721,7 +712,6 @@ def main() -> None:
         )
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        freeze_thread.join(timeout=2.0)
         err_msg = (e.stderr or e.stdout or "").strip()
 
         def _record_submit_err(data: Dict[str, Any]) -> None:
