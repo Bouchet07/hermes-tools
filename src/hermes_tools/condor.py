@@ -535,11 +535,12 @@ def generate_sub_file(
         lines.append(f'+Proyecto               = "{project_code.strip()}"')
 
     if scratch_files:
+        clean_scratch = [sf.rstrip("/\\") for sf in scratch_files if sf.rstrip("/\\")]
         lines.append("")
         lines.append("# --- High-Speed RAMDisk Scratch Space Transfer ---")
         lines.append("should_transfer_files   = YES")
         lines.append("when_to_transfer_output = ON_EXIT")
-        lines.append(f"transfer_input_files    = {', '.join(scratch_files)}")
+        lines.append(f"transfer_input_files    = {', '.join(clean_scratch)}")
         lines.append('transfer_output_files   = ""')
 
     if retry_targets is not None:
