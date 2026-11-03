@@ -1,5 +1,5 @@
 """
-snapshot.py — Git provenance, environment freezing, and source code snapshotting.
+snapshot.py — Fast Git provenance, environment freezing, and source code snapshotting.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from hermes_tools.core import write_text_lf
 
@@ -32,8 +32,22 @@ MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB total copied cap (remaining files 
 MAX_SNAPSHOT_FILES = 2500
 
 
+def _find_git_root(cwd: Path) -> Optional[Path]:
+    """Finds the git repository root in pure Python without spawning a subprocess."""
+    curr = cwd.resolve()
+    while True:
+        if (curr / ".git").exists():
+            return curr
+        if curr.parent == curr:
+            return None
+        curr = curr.parent
+
+
 def get_git_info(cwd: Path) -> Dict[str, object]:
-    """Extracts Git repository status, commit hash, branch, and uncommitted diff."""
+    """
+    Extracts Git repository status, commit hash, branch, and uncommitted diff
+    using a single `git status --porcelain=v2 --branch` call (and `git diff` only if dirty).
+    """
     info: Dict[str, object] = {
         "is_git": False,
         "commit": None,
@@ -43,69 +57,60 @@ def get_git_info(cwd: Path) -> Dict[str, object]:
         "diff": "",
         "status": "",
     }
+    git_root = _find_git_root(cwd)
+    if git_root is None:
+        return info
+
     try:
-        root_res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=cwd,
+        st_res = subprocess.run(
+            ["git", "status", "--porcelain=v2", "--branch"],
+            cwd=git_root,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             check=True,
         )
-        git_root = Path(root_res.stdout.strip()).resolve()
         info["is_git"] = True
         info["root"] = str(git_root)
 
-        commit_res = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=git_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        info["commit"] = (
-            commit_res.stdout.strip() if commit_res.returncode == 0 else "UNCOMMITTED"
-        )
+        commit = "UNCOMMITTED"
+        branch = "detached"
+        status_lines: List[str] = []
+        has_tracked_changes = False
 
-        branch_res = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=git_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        info["branch"] = (
-            branch_res.stdout.strip() if branch_res.returncode == 0 else "detached"
-        )
+        for line in st_res.stdout.splitlines():
+            if line.startswith("# branch.oid "):
+                oid = line[13:].strip()
+                if oid and oid != "(initial)":
+                    commit = oid
+            elif line.startswith("# branch.head "):
+                head = line[14:].strip()
+                if head and head != "(detached)":
+                    branch = head
+            elif not line.startswith("#"):
+                status_lines.append(line)
+                if line.startswith(("1 ", "2 ", "u ")):
+                    has_tracked_changes = True
 
-        status_res = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=git_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        info["status"] = status_res.stdout.strip()
-        info["dirty"] = bool(info["status"])
+        info["commit"] = commit
+        info["branch"] = branch
+        info["status"] = "\n".join(status_lines)
+        info["dirty"] = bool(status_lines)
 
-        diff_cmd = (
-            ["git", "diff", "HEAD"]
-            if info["commit"] != "UNCOMMITTED"
-            else ["git", "diff"]
-        )
-        diff_res = subprocess.run(
-            diff_cmd,
-            cwd=git_root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        info["diff"] = diff_res.stdout
+        if has_tracked_changes:
+            diff_cmd = (
+                ["git", "diff", "HEAD"] if commit != "UNCOMMITTED" else ["git", "diff"]
+            )
+            diff_res = subprocess.run(
+                diff_cmd,
+                cwd=git_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            info["diff"] = diff_res.stdout
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         pass
 
@@ -174,13 +179,15 @@ def create_code_snapshot(
         shutil.rmtree(code_dir, ignore_errors=True)
     code_dir.mkdir(parents=True, exist_ok=True)
     runs_root = (cwd / "runs").resolve()
+    repro_resolved = repro_dir.resolve()
 
     if git_info.get("is_git") and git_info.get("root"):
         git_root = Path(str(git_info["root"])).resolve()
         git_runs_root = (git_root / "runs").resolve()
         try:
-            tracked_res = subprocess.run(
-                ["git", "ls-files", "--cached"],
+            # Single git ls-files invocation with -t to distinguish tracked ('H') vs untracked ('?')
+            ls_res = subprocess.run(
+                ["git", "ls-files", "-t", "--cached", "--others", "--exclude-standard"],
                 cwd=git_root,
                 capture_output=True,
                 text=True,
@@ -188,22 +195,20 @@ def create_code_snapshot(
                 errors="replace",
                 check=True,
             )
-            untracked_res = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard"],
-                cwd=git_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=True,
-            )
-            tracked_files = [f.strip() for f in tracked_res.stdout.splitlines() if f.strip()]
-            tracked_set = set(tracked_files)
-            untracked_files = [
-                f.strip()
-                for f in untracked_res.stdout.splitlines()
-                if f.strip() and f.strip() not in tracked_set
-            ]
+            tracked_files: List[str] = []
+            untracked_files: List[str] = []
+            seen: Set[str] = set()
+            for raw_line in ls_res.stdout.splitlines():
+                if len(raw_line) < 3:
+                    continue
+                tag, rel_f = raw_line[0], raw_line[2:].strip()
+                if not rel_f or rel_f in seen:
+                    continue
+                seen.add(rel_f)
+                if tag == "?":
+                    untracked_files.append(rel_f)
+                else:
+                    tracked_files.append(rel_f)
 
             total_bytes = 0
             total_files = 0
@@ -216,7 +221,7 @@ def create_code_snapshot(
                 if (
                     src_file.is_relative_to(runs_root)
                     or src_file.is_relative_to(git_runs_root)
-                    or src_file.is_relative_to(repro_dir.resolve())
+                    or src_file.is_relative_to(repro_resolved)
                 ):
                     continue
                 allow_copy = (

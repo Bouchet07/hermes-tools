@@ -11,13 +11,12 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import questionary
 from rich import box
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
 
 from hermes_tools.condor import (
@@ -27,12 +26,12 @@ from hermes_tools.condor import (
     generate_sub_file,
 )
 from hermes_tools.core import (
-    PROMPT_STYLE,
     atomic_write_json,
     console,
     discover_project_venv,
     expand_arg_sweeps,
     get_hostname,
+    get_prompt_style,
     get_username,
     is_valid_memory_input,
     load_project_config,
@@ -146,7 +145,6 @@ def main() -> None:
     cwd = Path.cwd()
     proj_cfg = load_project_config(cwd)
 
-    # Apply project config defaults when CLI flags are omitted
     cfg_arch = str(proj_cfg.get("arch", "")).strip().upper() or None
     if cfg_arch and cfg_arch not in ARCH_SPECS:
         console.print(
@@ -173,6 +171,8 @@ def main() -> None:
     # 1. Resolve Target File
     target_str = args.target or proj_cfg.get("target")
     if not target_str:
+        import questionary
+
         interactive_mode = True
         candidates = sorted(
             [
@@ -188,18 +188,18 @@ def main() -> None:
             selected = questionary.select(
                 "Select script or executable to submit:",
                 choices=choices,
-                style=PROMPT_STYLE,
+                style=get_prompt_style(),
             ).ask()
             if selected is None:
                 sys.exit(0)
             target_str = (
-                questionary.path("Path to executable:", style=PROMPT_STYLE).ask()
+                questionary.path("Path to executable:", style=get_prompt_style()).ask()
                 if selected == "[Enter custom path...]"
                 else selected
             )
         else:
             target_str = questionary.path(
-                "Path to script or executable:", style=PROMPT_STYLE
+                "Path to script or executable:", style=get_prompt_style()
             ).ask()
 
         if not target_str:
@@ -226,9 +226,11 @@ def main() -> None:
                 "[yellow]⚠ No local Python virtual environment (.venv/venv) detected.[/yellow]"
             )
             if interactive_mode and sys.stdin.isatty():
+                import questionary
+
                 custom_venv = questionary.path(
                     "Enter path to venv (or leave empty to use system Python):",
-                    style=PROMPT_STYLE,
+                    style=get_prompt_style(),
                 ).ask()
                 if custom_venv is None:
                     sys.exit(0)
@@ -239,6 +241,8 @@ def main() -> None:
     # 3. Resolve Architecture & Hardware Resources
     arch = args.arch or (cfg_arch if not interactive_mode else None)
     if not arch:
+        import questionary
+
         interactive_mode = True
         arch_choices = [
             questionary.Choice(title=str(spec["title"]), value=k)
@@ -248,7 +252,7 @@ def main() -> None:
             "Select Hermes 2 Target Architecture (+Architecture):",
             choices=arch_choices,
             default=cfg_arch if cfg_arch in ARCH_SPECS else None,
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask()
         if not arch:
             sys.exit(0)
@@ -278,11 +282,13 @@ def main() -> None:
         cpus = None
         if gpus is None:
             if interactive_mode:
+                import questionary
+
                 g_ans = questionary.select(
                     "Number of NVIDIA A100 (40GB) GPUs to request:",
                     choices=["1", "2", "3", "4"],
                     default="1",
-                    style=PROMPT_STYLE,
+                    style=get_prompt_style(),
                 ).ask()
                 if not g_ans:
                     sys.exit(0)
@@ -291,12 +297,14 @@ def main() -> None:
                 gpus = 1
 
         if mem_mb is None and interactive_mode:
+            import questionary
+
             m_ans = questionary.text(
                 "System RAM request (Leave blank for default <=64G, or e.g. '120G'):",
                 default="",
                 validate=lambda v: is_valid_memory_input(v, allow_empty=True)
                 or "Enter valid size (e.g. '120G', '96GB', '98304M') or leave blank",
-                style=PROMPT_STYLE,
+                style=get_prompt_style(),
             ).ask()
             if m_ans is None:
                 sys.exit(0)
@@ -318,11 +326,13 @@ def main() -> None:
 
         if cpus is None:
             if interactive_mode:
+                import questionary
+
                 c_ans = questionary.text(
                     "Number of CPU cores (request_cpus):",
                     default="4",
                     validate=lambda v: (v.isdigit() and int(v) > 0) or "Enter a positive integer",
-                    style=PROMPT_STYLE,
+                    style=get_prompt_style(),
                 ).ask()
                 if not c_ans:
                     sys.exit(0)
@@ -332,12 +342,14 @@ def main() -> None:
 
         if mem_mb is None:
             if interactive_mode:
+                import questionary
+
                 m_ans = questionary.text(
                     "System RAM (e.g., '8G', '16G', '4096M'):",
                     default="8G",
                     validate=lambda v: is_valid_memory_input(v, allow_empty=False)
                     or "Enter valid size (e.g. '8G', '32GB', '4096M')",
-                    style=PROMPT_STYLE,
+                    style=get_prompt_style(),
                 ).ask()
                 if not m_ans:
                     sys.exit(0)
@@ -370,16 +382,17 @@ def main() -> None:
         expanded_sweeps.extend(expand_arg_sweeps(item))
 
     if expanded_sweeps:
-        # Keep literal base arguments intact (do not split JSON/dicts in --args / --)
         sweep_list = [
             f"{combined_single_args} {s}".strip() if combined_single_args else s
             for s in expanded_sweeps
         ]
     elif interactive_mode and not combined_single_args:
+        import questionary
+
         ans_args = questionary.text(
             "Arguments (Supports sweeps via '{0..4}', '{00..09}', '{a,b}', or ';' separator):",
             default="",
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask()
         if ans_args is None:
             sys.exit(0)
@@ -396,10 +409,12 @@ def main() -> None:
 
     raw_tag = args.tag.strip() or str(proj_cfg.get("tag", "")).strip()
     if interactive_mode and not raw_tag:
+        import questionary
+
         ans_tag = questionary.text(
             "Optional run tag for folder name (e.g., 'exp1_lr1e4', or Enter to skip):",
             default="",
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask()
         if ans_tag is None:
             sys.exit(0)
@@ -527,23 +542,28 @@ def main() -> None:
     )
 
     if not args.yes and not args.dry_run:
+        import questionary
+
         confirm = questionary.confirm(
-            "Submit job to HTCondor queue now?", default=True, style=PROMPT_STYLE
+            "Submit job to HTCondor queue now?", default=True, style=get_prompt_style()
         ).ask()
         if not confirm:
             console.print("[yellow]Submission cancelled.[/yellow]")
             sys.exit(0)
 
-    # 7. Materialize Run Directory & Repro Capsule
+    # 7. Materialize Run Directory & Repro Capsule (Overlap env freeze in background thread)
     repro_dir.mkdir(parents=True, exist_ok=True)
+    freeze_thread = threading.Thread(
+        target=freeze_python_env, args=(venv_path, repro_dir), daemon=True
+    )
+    freeze_thread.start()
+
     snap_exec_path, snap_py_root = create_code_snapshot(target_path, cwd, repro_dir, git_info)
 
     patch_rel_path: Optional[str] = None
     if git_info.get("is_git") and git_info.get("diff"):
         write_text_lf(repro_dir / "uncommitted.patch", str(git_info["diff"]))
         patch_rel_path = "repro/uncommitted.patch"
-
-    freeze_python_env(venv_path, repro_dir)
 
     sh_path = repro_dir / "job.sh"
     sh_content = generate_bash_wrapper(
@@ -629,6 +649,9 @@ def main() -> None:
     atomic_write_json(run_json_path, run_json_data, repro_dir)
 
     if args.dry_run:
+        from rich.syntax import Syntax
+
+        freeze_thread.join(timeout=3.0)
         update_latest_symlink(runs_root, run_dir)
         console.print(
             f"\n[bold yellow]✔ Dry run complete![/bold yellow] Generated capsule in: [cyan]runs/{run_id}/[/cyan]"
@@ -658,6 +681,7 @@ def main() -> None:
 
         locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
         update_latest_symlink(runs_root, run_dir)
+        freeze_thread.join(timeout=3.0)
 
         first_out = (
             f"runs/latest/{target_path.stem}_0.out"
@@ -685,6 +709,7 @@ def main() -> None:
         )
 
     except FileNotFoundError:
+        freeze_thread.join(timeout=2.0)
         locked_mutate_run_json(
             run_json_path,
             repro_dir,
@@ -696,6 +721,7 @@ def main() -> None:
         )
         sys.exit(1)
     except subprocess.CalledProcessError as e:
+        freeze_thread.join(timeout=2.0)
         err_msg = (e.stderr or e.stdout or "").strip()
 
         def _record_submit_err(data: Dict[str, Any]) -> None:

@@ -813,6 +813,20 @@ def inspect_condor_log_fate(condor_log: Path, is_sweep: bool = False) -> Optiona
     return None
 
 
+def run_needs_live_reconcile(data: Dict[str, Any]) -> bool:
+    """Returns True if a run is active or has incomplete execution records that may need reconciliation."""
+    status = str(data.get("status", "UNKNOWN"))
+    if status in ("DRY_RUN", "SUBMIT_FAILED"):
+        return False
+    if status.startswith(("QUEUED", "RUNNING", "HELD")):
+        return True
+    sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
+    return len(get_execution_records(data)) < sweep_count and status not in (
+        "ABORTED",
+        "VANISHED",
+    )
+
+
 def reconcile_run(
     run_dir: Path,
     data: Dict[str, Any],
@@ -820,10 +834,21 @@ def reconcile_run(
 ) -> Dict[str, Any]:
     """Synchronizes `run.json` with `repro/node_*.json` and all live `condor_q` clusters."""
     status = str(data.get("status", "UNKNOWN"))
+    is_active_status = status in ("QUEUED", "RUNNING", "HELD") or status.startswith(
+        ("QUEUED", "RUNNING", "HELD")
+    )
+    sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
+
+    # Fast path for terminal runs: skip CephFS globbing and condor_q checks completely
+    if not is_active_status and (
+        status in ("DRY_RUN", "SUBMIT_FAILED", "ABORTED")
+        or len(get_execution_records(data)) >= sweep_count
+    ):
+        return data
+
     repro_dir = run_dir / "repro"
     run_json_path = run_dir / "run.json"
 
-    sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
     synced_execs: Optional[List[Dict[str, Any]]] = None
     if repro_dir.is_dir():
         node_files = sorted(repro_dir.glob("node_*.json"))
@@ -844,9 +869,6 @@ def reconcile_run(
 
     all_cids = get_all_cluster_ids(data)
     active_cids = [c for c in all_cids if c in live_clusters]
-    is_active_status = status in ("QUEUED", "RUNNING", "HELD") or status.startswith(
-        ("QUEUED", "RUNNING", "HELD")
-    )
 
     if active_cids:
         if synced_execs is not None:

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import difflib
 import os
 import re
 import shlex
@@ -17,11 +16,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import questionary
 from rich import box
-from rich.live import Live
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
 
 from hermes_tools.condor import (
@@ -29,13 +25,14 @@ from hermes_tools.condor import (
     get_all_cluster_ids,
     query_live_condor_clusters,
     reconcile_run,
+    run_needs_live_reconcile,
 )
 from hermes_tools.core import (
-    PROMPT_STYLE,
     console,
     dir_size_mb,
     format_duration,
     get_execution_records,
+    get_prompt_style,
     get_runs_root,
     list_run_dirs,
     load_run_json,
@@ -74,8 +71,9 @@ def resolve_run_dir(
             return exact[0]
 
         matches = []
+        q_lower = q.lower()
         for d in dirs:
-            if q.lower() in d.name.lower():
+            if q_lower in d.name.lower():
                 matches.append(d)
             else:
                 rj = load_run_json(d)
@@ -94,6 +92,8 @@ def resolve_run_dir(
     if not sys.stdin.isatty():
         return dirs[0]
 
+    import questionary
+
     choices = []
     for i, d in enumerate(dirs[:35], start=1):
         rj = load_run_json(d)
@@ -106,7 +106,9 @@ def resolve_run_dir(
                 value=d,
             )
         )
-    selected = questionary.select(prompt_title, choices=choices, style=PROMPT_STYLE).ask()
+    selected = questionary.select(
+        prompt_title, choices=choices, style=get_prompt_style()
+    ).ask()
     if not selected:
         sys.exit(0)
     return selected
@@ -117,7 +119,6 @@ def resolve_run_dir(
 # ---------------------------------------------------------------------------
 def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
     dirs = list_run_dirs(runs_root)
-    live_clusters = query_live_condor_clusters()
     latest_target = resolve_latest_symlink(runs_root)
 
     table = Table(
@@ -138,15 +139,28 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
     shown = 0
     limit = getattr(args, "limit", 25)
     status_filter = getattr(args, "status", None)
+    status_upper = status_filter.upper() if status_filter else None
     tag_filter = getattr(args, "tag", None)
+    tag_lower = tag_filter.lower() if tag_filter else None
+
+    live_clusters_queried = False
+    live_clusters: Optional[Dict[int, Dict[str, int]]] = None
 
     for idx, d in enumerate(dirs, start=1):
-        data = reconcile_run(d, load_run_json(d), live_clusters)
-        display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
-
-        if status_filter and status_filter.upper() not in display_status.upper():
+        if tag_lower and tag_lower not in d.name.lower():
             continue
-        if tag_filter and tag_filter.lower() not in d.name.lower():
+
+        raw_data = load_run_json(d)
+        if run_needs_live_reconcile(raw_data):
+            if not live_clusters_queried:
+                live_clusters = query_live_condor_clusters()
+                live_clusters_queried = True
+            data = reconcile_run(d, raw_data, live_clusters)
+        else:
+            data = raw_data
+
+        display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+        if status_upper and status_upper not in display_status.upper():
             continue
 
         req = data.get("resources_requested", {})
@@ -197,6 +211,8 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
         return
 
     if getattr(args, "watch", False):
+        from rich.live import Live
+
         interval = max(1, int(getattr(args, "interval", 2) or 2))
         try:
             with Live(
@@ -218,8 +234,12 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(runs_root, args.run)
-    live_clusters = query_live_condor_clusters()
-    data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
+    raw_data = load_run_json(run_dir)
+    if run_needs_live_reconcile(raw_data):
+        live_clusters = query_live_condor_clusters()
+        data = reconcile_run(run_dir, raw_data, live_clusters)
+    else:
+        data = raw_data
 
     sub = data.get("submission", {})
     req = data.get("resources_requested", {})
@@ -316,16 +336,22 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
         console.print(et)
 
     err_files = sorted(run_dir.glob("*.err"))
+    syntax_cls = None
     for ef in err_files:
         try:
+            st = ef.stat()
+            if st.st_size == 0:
+                continue
             content = ef.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue
         if content:
+            if syntax_cls is None:
+                from rich.syntax import Syntax as syntax_cls
             tail_lines = "\n".join(content.splitlines()[-25:])
             console.print(
                 Panel(
-                    Syntax(tail_lines, "pytb", theme="monokai", word_wrap=True),
+                    syntax_cls(tail_lines, "pytb", theme="monokai", word_wrap=True),
                     title=f"[bold red]⚠ Stderr Tail: {ef.name}[/bold red]",
                     border_style="red",
                 )
@@ -448,10 +474,12 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
     target_cids = active_cids or cids
 
     if not args.yes:
+        import questionary
+
         if not questionary.confirm(
             f"Kill HTCondor cluster(s) {target_cids} ({run_dir.name})?",
             default=True,
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask():
             return
 
@@ -579,6 +607,8 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     update_code = args.update_code
 
     if mode is None and sys.stdin.isatty():
+        import questionary
+
         choice = questionary.select(
             f"Found {len(targets)}/{len(sweep_args)} process(es) to retry. Choose recovery mode:",
             choices=[
@@ -595,7 +625,7 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
                     value=("new_run", True),
                 ),
             ],
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask()
         if not choice:
             sys.exit(0)
@@ -643,7 +673,6 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         os.chdir(cwd)
         os.execv(send_bin, cmd)
 
-    # --- Guard against colliding with still-running jobs in condor_q ---
     if live_clusters is not None and not args.force:
         active_cids = [c for c in get_all_cluster_ids(data) if c in live_clusters]
         if active_cids:
@@ -653,7 +682,6 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             )
             sys.exit(1)
 
-    # --- In-Place Continuation Mode ---
     if update_code:
         refresh_code_snapshot(run_dir, data)
 
@@ -740,12 +768,21 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         console.print("[dim]No runs to clean.[/dim]")
         return
 
-    live_clusters = query_live_condor_clusters()
+    live_clusters_queried = False
+    live_clusters: Optional[Dict[int, Dict[str, int]]] = None
     now = datetime.datetime.now()
     candidates: List[Tuple[Path, str, float]] = []
 
     for d in dirs:
-        data = reconcile_run(d, load_run_json(d), live_clusters)
+        raw_data = load_run_json(d)
+        if run_needs_live_reconcile(raw_data):
+            if not live_clusters_queried:
+                live_clusters = query_live_condor_clusters()
+                live_clusters_queried = True
+            data = reconcile_run(d, raw_data, live_clusters)
+        else:
+            data = raw_data
+
         st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         if st.startswith(("RUNNING", "QUEUED", "HELD")):
             continue
@@ -785,6 +822,8 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
                 "[yellow]Specify --failed, --aborted, --dry, or --older-than (e.g. 7d) in non-interactive mode.[/yellow]"
             )
             return
+        import questionary
+
         choices = []
         for d in dirs:
             data = load_run_json(d)
@@ -803,7 +842,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         selected = questionary.checkbox(
             "Select runs to permanently delete (Space to toggle, Enter to confirm):",
             choices=choices,
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask()
         if not selected:
             return
@@ -818,10 +857,12 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         console.print(f"  • [bold]{d.name}[/bold] ({style_status(st)} — {mb:.2f} MB)")
 
     if not args.yes:
+        import questionary
+
         if not questionary.confirm(
             f"Delete {len(candidates)} run(s) and free {total_mb:.2f} MB?",
             default=False,
-            style=PROMPT_STYLE,
+            style=get_prompt_style(),
         ).ask():
             return
 
@@ -838,6 +879,8 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 def _diff_directories(dir_a: Path, dir_b: Path) -> str:
     """Computes a unified diff across all text files in two directories."""
+    import difflib
+
     files_a = {
         p.relative_to(dir_a).as_posix() for p in dir_a.rglob("*") if p.is_file()
     }
@@ -923,6 +966,8 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
     if code_a.is_dir() and code_b.is_dir():
         diff_text = _diff_directories(code_a, code_b).strip()
         if diff_text:
+            from rich.syntax import Syntax
+
             console.print(
                 Panel(
                     Syntax(diff_text[:4000], "diff", theme="monokai"),

@@ -11,19 +11,19 @@ import os
 import re
 import shutil
 import socket
-import stat
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import fcntl
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 
-from questionary import Style
+if TYPE_CHECKING:
+    from questionary import Style
+
 from rich.console import Console
 
 for _stream in (sys.stdout, sys.stderr):
@@ -35,18 +35,29 @@ for _stream in (sys.stdout, sys.stderr):
 
 console = Console(legacy_windows=False)
 
-PROMPT_STYLE = Style(
-    [
-        ("qmark", "fg:#00d7ff bold"),
-        ("question", "bold"),
-        ("answer", "fg:#00ff87 bold"),
-        ("pointer", "fg:#00d7ff bold"),
-        ("highlighted", "fg:#00d7ff bold"),
-        ("selected", "fg:#00ff87"),
-        ("separator", "fg:#6c6c6c"),
-        ("instruction", "fg:#808080 italic"),
-    ]
-)
+_PROMPT_STYLE_CACHE: Optional[Any] = None
+
+
+def get_prompt_style() -> Style:
+    """Lazily constructs the questionary Style so non-interactive commands skip importing prompt_toolkit."""
+    global _PROMPT_STYLE_CACHE
+    if _PROMPT_STYLE_CACHE is None:
+        from questionary import Style
+
+        _PROMPT_STYLE_CACHE = Style(
+            [
+                ("qmark", "fg:#00d7ff bold"),
+                ("question", "bold"),
+                ("answer", "fg:#00ff87 bold"),
+                ("pointer", "fg:#00d7ff bold"),
+                ("highlighted", "fg:#00d7ff bold"),
+                ("selected", "fg:#00ff87"),
+                ("separator", "fg:#6c6c6c"),
+                ("instruction", "fg:#808080 italic"),
+            ]
+        )
+    return _PROMPT_STYLE_CACHE
+
 
 STATUS_STYLES: Dict[str, str] = {
     "COMPLETED": "bold green",
@@ -132,10 +143,10 @@ def locked_mutate_run_json(
 
 def load_run_json(run_dir: Path) -> Dict[str, Any]:
     rj = run_dir / "run.json"
-    if not rj.is_file():
-        return {"run_id": run_dir.name, "status": "UNKNOWN"}
     try:
         return json.loads(rj.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"run_id": run_dir.name, "status": "UNKNOWN"}
     except Exception:
         return {"run_id": run_dir.name, "status": "CORRUPTED"}
 
@@ -154,6 +165,8 @@ def load_project_config(cwd: Path) -> Dict[str, Any]:
         hermes_toml = curr / ".hermes.toml"
         if hermes_toml.is_file():
             try:
+                import tomllib
+
                 raw = tomllib.loads(hermes_toml.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
                     return dict(raw.get("hermes", raw))
@@ -163,6 +176,8 @@ def load_project_config(cwd: Path) -> Dict[str, Any]:
         pyproject = curr / "pyproject.toml"
         if pyproject.is_file():
             try:
+                import tomllib
+
                 raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
                 cfg = raw.get("tool", {}).get("hermes")
                 if isinstance(cfg, dict):
@@ -177,7 +192,7 @@ def load_project_config(cwd: Path) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Run Directory & Symlink Helpers
+# Run Directory & Symlink Helpers (Fast os.scandir for CephFS)
 # ---------------------------------------------------------------------------
 def get_runs_root(cwd: Path) -> Path:
     curr = cwd.resolve()
@@ -191,13 +206,17 @@ def get_runs_root(cwd: Path) -> Path:
 
 
 def list_run_dirs(runs_root: Path) -> List[Path]:
-    if not runs_root.is_dir():
+    try:
+        with os.scandir(runs_root) as it:
+            dirs = [
+                Path(entry.path)
+                for entry in it
+                if not entry.name.startswith(".")
+                and not entry.is_symlink()
+                and entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
         return []
-    dirs = [
-        p
-        for p in runs_root.iterdir()
-        if p.is_dir() and not p.is_symlink() and not p.name.startswith(".")
-    ]
     dirs.sort(key=lambda p: p.name, reverse=True)
     return dirs
 
@@ -305,16 +324,25 @@ def format_duration(seconds: Optional[int]) -> str:
 
 
 def dir_size_mb(path: Path) -> float:
+    """Fast recursive directory size calculation using os.scandir to minimize CephFS stat calls."""
     total = 0
-    for root, _, files in os.walk(path, followlinks=False):
-        for f in files:
-            fp = Path(root) / f
-            try:
-                st = fp.lstat()
-                if stat.S_ISREG(st.st_mode):
-                    total += st.st_size
-            except OSError:
-                pass
+    stack = [str(path)]
+    while stack:
+        curr = stack.pop()
+        try:
+            with os.scandir(curr) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total / (1024 * 1024)
 
 
@@ -374,7 +402,6 @@ def _expand_single_brace_expr(expr: str) -> List[str]:
             start, end = int(s_start), int(s_end)
             raw_step = int(range_match.group(3) or 1)
             step = max(1, abs(raw_step))
-            # Support zero-padded ranges like {00..09} or {01..12}
             pad_width = 0
             for tok in (s_start, s_end):
                 digits = tok.lstrip("-")
@@ -426,22 +453,23 @@ def _is_valid_venv_dir(p: Path) -> bool:
 def resolve_submit_python() -> Path:
     """
     Finds the user's default Python 3 interpreter from the submit environment
-    so jobs without an explicit `.venv` still use Python 3 on worker nodes
-    (where HTCondor's default PATH `/usr/bin/python` may be Python 2.7).
+    without spawning a subprocess when `python3` is available in PATH.
     """
-    for candidate in ("python3", "python"):
-        found = shutil.which(candidate)
-        if not found:
-            continue
+    py3 = shutil.which("python3")
+    if py3:
+        return Path(py3).resolve()
+
+    py = shutil.which("python")
+    if py:
         try:
             res = subprocess.run(
-                [found, "-c", "import sys; print(sys.version_info[0])"],
+                [py, "-c", "import sys; print(sys.version_info[0])"],
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
             if res.returncode == 0 and res.stdout.strip() == "3":
-                return Path(found).resolve()
+                return Path(py).resolve()
         except Exception:
             pass
     return Path(sys.executable).resolve()
