@@ -213,6 +213,9 @@ if [ -n "${GPU_LINES}" ]; then
     printf "%s\n" "${GPU_LINES}"
 fi
 echo "  Env      ${PY_VER:-${EXEC_TYPE}} (${ENV_LABEL})${DISK_INFO:+ · Disk: ${DISK_INFO}}"
+if [ -n "${CUSTOM_ENV_SUMMARY:-}" ]; then
+    echo "  Exports  ${CUSTOM_ENV_SUMMARY}"
+fi
 echo "  Run Dir  ${HERMES_RUN_DIR}"
 echo "  Command  ${SHORT_CMD}"
 echo "  Started  ${START_ISO} (queued ${QUEUE_WAIT}s)"
@@ -487,12 +490,17 @@ def generate_bash_wrapper(
         "PYTHONUNBUFFERED": "1",
         "HOME": submit_home,
     }
+    custom_summary_parts: List[str] = []
     if env_vars:
         for k, v in env_vars.items():
             if k and v is not None:
-                merged_env[str(k).strip()] = str(v)
+                clean_k = str(k).strip()
+                clean_v = str(v)
+                merged_env[clean_k] = clean_v
+                custom_summary_parts.append(f"{clean_k}={clean_v}")
 
     env_lines = "\n".join(_format_bash_export(k, v) for k, v in merged_env.items())
+    custom_env_summary = " · ".join(custom_summary_parts)
 
     header = (
         "#!/usr/bin/env bash\n"
@@ -501,6 +509,7 @@ def generate_bash_wrapper(
         "# =============================================================================\n"
         "set -o pipefail\n\n"
         f"{env_lines}\n"
+        f"CUSTOM_ENV_SUMMARY={shlex.quote(custom_env_summary)}\n"
         f"EXEC_TYPE={shlex.quote(exec_type)}\n"
         f"TARGET_EXEC={shlex.quote(target_exec_path.as_posix())}\n"
         f"VENV_PATH={shlex.quote(venv_path.as_posix() if venv_path else '')}\n"

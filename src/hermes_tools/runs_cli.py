@@ -341,6 +341,10 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
         "Architecture",
         f"[bold magenta]{req.get('architecture', '—')}[/bold magenta] (CPUs: {req.get('cpus') or 'Auto'}, RAM: {req.get('memory_mb') or 'Auto'} MB, GPUs: {req.get('gpus') or 0})",
     )
+    env_map = req.get("env") or {}
+    if isinstance(env_map, dict) and env_map:
+        env_str = ", ".join(f"[cyan]{k}[/cyan]={v}" for k, v in env_map.items())
+        meta.add_row("Env Exports", env_str)
     if git.get("is_git"):
         dirty_str = (
             f"[yellow]dirty ({git.get('patch_file')})[/yellow]"
@@ -1034,6 +1038,11 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
             "Arguments / Sweep",
             str(da.get("resources_requested", {}).get("sweep_arguments")),
             str(db.get("resources_requested", {}).get("sweep_arguments")),
+        ),
+        (
+            "Env Exports",
+            str(da.get("resources_requested", {}).get("env") or "—"),
+            str(db.get("resources_requested", {}).get("env") or "—"),
         ),
         (
             "Git Commit",
