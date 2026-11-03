@@ -310,3 +310,27 @@ def test_sweep_equivalent_cli_stays_compact(tmp_path: Path) -> None:
     assert rj["resources_requested"]["sweep_count"] == 6
     assert "-s '{0..5}'" in rj["submission"]["equivalent_cli"] or "-s {0..5}" in rj["submission"]["equivalent_cli"]
     assert "-s 0 -s 1" not in rj["submission"]["equivalent_cli"]
+
+
+def test_stop_does_not_mark_completed_run_as_aborted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    run_dir = tmp_path / "runs" / "2026-11-03_train_GPU3090"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+    atomic_write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_dir.name,
+            "status": "COMPLETED",
+            "submission": {"cluster_id": 999},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0}],
+        },
+        repro_dir,
+    )
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+    args = argparse.Namespace(run=run_dir.name, yes=True)
+    runs_cli.cmd_stop(args, tmp_path / "runs")
+    assert load_run_json(run_dir)["status"] == "COMPLETED"

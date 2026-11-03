@@ -425,15 +425,27 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
     )
     repro_dir = run_dir / "repro"
     rj_path = run_dir / "run.json"
-    data = load_run_json(run_dir)
+    live_clusters = query_live_condor_clusters()
+    data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
+    status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
     cids = get_all_cluster_ids(data)
 
     if not cids:
         console.print(f"[yellow]Run {run_dir.name} has no HTCondor cluster_id.[/yellow]")
         return
 
-    live_clusters = query_live_condor_clusters()
-    target_cids = [c for c in cids if live_clusters is None or c in live_clusters] or cids
+    is_active_status = status.startswith(("QUEUED", "RUNNING", "HELD"))
+    active_cids = [c for c in cids if live_clusters is None or c in live_clusters]
+
+    if not active_cids and not is_active_status:
+        console.print(
+            f"[dim cyan]ℹ Run [bold]{run_dir.name}[/bold] has already finished ({style_status(status)}) "
+            f"and has no active jobs in condor_q.[/dim cyan]\n"
+            f"  [dim]Tip: Use [bold]runs clean[/bold] to delete run directories from disk.[/dim]"
+        )
+        return
+
+    target_cids = active_cids or cids
 
     if not args.yes:
         if not questionary.confirm(
@@ -443,6 +455,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
         ).ask():
             return
 
+    any_removed = False
     for cid in target_cids:
         res = subprocess.run(
             ["condor_rm", str(cid)],
@@ -452,14 +465,16 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             errors="replace",
         )
         if res.returncode == 0:
+            any_removed = True
             console.print(f"[bold green]✔ {res.stdout.strip()}[/bold green]")
         else:
             console.print(
                 f"[yellow]⚠ condor_rm {cid}: {(res.stderr or res.stdout).strip()}[/yellow]"
             )
 
-    locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": "ABORTED"}))
-    console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
+    if any_removed or is_active_status:
+        locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": "ABORTED"}))
+        console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
 
 
 # ---------------------------------------------------------------------------
