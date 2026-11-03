@@ -139,7 +139,8 @@ def test_bash_wrapper_cluster_hardening(tmp_path: Path) -> None:
     assert "LC_MESSAGES=C LC_NUMERIC=C /usr/bin/time -v" in sh
     assert 'if [ ! -x "${UPDATER_PYTHON}" ]; then' in sh
     assert "SUBMIT_PYTHON=" in sh
-    assert 'python) CMD=("${PYTHON_BIN}" -u "${TARGET_EXEC}" "$@") ;;' in sh
+    assert 'CMD=("${PYTHON_BIN}" -u "${TARGET_EXEC}" "$@")' in sh
+    assert "── Hermes 2 Job ·" in sh
 
 
 def test_reconcile_run_persists_sweep_nodes_and_heals_status(tmp_path: Path) -> None:

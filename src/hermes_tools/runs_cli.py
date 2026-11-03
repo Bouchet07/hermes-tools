@@ -184,7 +184,13 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
             tasks_str = "1"
 
         host_str, dur_str, ram_str = summarize_metrics(data)
-        name_label = f"{d.name} [bold yellow]★[/bold yellow]" if d == latest_target else d.name
+        if len(d.name) > 20 and d.name[4:5] == "-" and d.name[19:20] == "_":
+            styled_name = f"[dim]{d.name[:20]}[/dim][bold white]{d.name[20:]}[/bold white]"
+        else:
+            styled_name = f"[bold white]{d.name}[/bold white]"
+        name_label = (
+            f"{styled_name} [bold yellow]★[/bold yellow]" if d == latest_target else styled_name
+        )
 
         table.add_row(
             str(idx),
@@ -433,13 +439,11 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
             if log_file.is_relative_to(runs_root.parent)
             else log_file
         )
-        console.print(
-            Panel(
-                snippet,
-                title=f"[bold cyan]{rel_title}[/bold cyan]",
-                border_style="cyan",
-            )
-        )
+        console.rule(f"[bold cyan]{rel_title}[/bold cyan]", style="cyan")
+        if snippet:
+            sys.stdout.write(snippet + "\n")
+            sys.stdout.flush()
+        console.rule(style="dim cyan")
 
 
 # ---------------------------------------------------------------------------

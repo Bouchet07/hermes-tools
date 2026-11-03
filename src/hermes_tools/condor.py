@@ -100,49 +100,29 @@ trap 'trap_handler SIGTERM' SIGTERM
 trap 'trap_handler SIGINT' SIGINT
 trap 'trap_handler SIGHUP' SIGHUP
 
-echo "╔════════════════════════════════════════════════════════════════════════════╗"
-echo "║ 🚀 HERMES 2 JOB EXECUTION TELEMETRY                                        ║"
-echo "╚════════════════════════════════════════════════════════════════════════════╝"
-echo "  • Process ID       : ${CONDOR_PROC_ID} (of ${SWEEP_COUNT})"
-echo "  • Started At       : ${START_ISO} (Queue wait: ${QUEUE_WAIT}s)"
-echo "  • Execution Host   : $(hostname -f 2>/dev/null || hostname) ($(hostname -I 2>/dev/null | LC_ALL=C awk '{print $1}'))"
-echo "  • OS / Kernel      : $(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"') | $(uname -sr)"
-echo "  • Working Dir      : $(pwd)"
-echo "  • Run Output Dir   : ${HERMES_RUN_DIR}"
-echo "  • Snapshot Exec    : ${TARGET_EXEC}"
-echo "  • Job Arguments    : $*"
-echo ""
+# --- [1] Hardware & Environment Discovery ---
+HOST_FQDN=$(hostname -f 2>/dev/null || hostname)
+OS_NAME=$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+KERNEL_VER=$(uname -sr 2>/dev/null)
 
-echo "─── [1/4] Node Hardware & Memory Profile ────────────────────────────────────"
-CPU_MODEL=$(LC_ALL=C lscpu 2>/dev/null | LC_ALL=C awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
-CPU_SOCKETS=$(LC_ALL=C lscpu 2>/dev/null | LC_ALL=C awk -F: '/Socket\(s\)/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+LSCPU_OUT=$(LC_ALL=C lscpu 2>/dev/null || true)
+CPU_MODEL=$(printf "%s\n" "${LSCPU_OUT}" | LC_ALL=C awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
 CPU_ALLOC=$(nproc 2>/dev/null || echo "0")
-CPU_CORES=$(nproc --all 2>/dev/null || LC_ALL=C lscpu 2>/dev/null | LC_ALL=C awk -F: '/^CPU\(s\):/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
-MEM_TOTAL=$(LC_ALL=C free -h 2>/dev/null | LC_ALL=C awk '/^Mem:/ {print $2}')
-MEM_AVAIL=$(LC_ALL=C free -h 2>/dev/null | LC_ALL=C awk '/^Mem:/ {print $7}')
+CPU_CORES=$(nproc --all 2>/dev/null || printf "%s\n" "${LSCPU_OUT}" | LC_ALL=C awk -F: '/^CPU\(s\):/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
 
-echo "  • CPU Architecture : ${CPU_MODEL:-Unknown} (${CPU_ALLOC} allocated / ${CPU_CORES:-?} logical CPUs across ${CPU_SOCKETS:-1} socket(s))"
-echo "  • Node System RAM  : ${MEM_AVAIL:-?} available / ${MEM_TOTAL:-?} total"
-echo "  • Scratch / Disk   : $(LC_ALL=C df -h . 2>/dev/null | LC_ALL=C awk 'NR==2 {print $4 " free on " $1 " (" $5 " used)"}')"
+FREE_OUT=$(LC_ALL=C free -h 2>/dev/null || true)
+MEM_TOTAL=$(printf "%s\n" "${FREE_OUT}" | LC_ALL=C awk '/^Mem:/ {print $2}')
+MEM_AVAIL=$(printf "%s\n" "${FREE_OUT}" | LC_ALL=C awk '/^Mem:/ {print $7}')
+DISK_INFO=$(LC_ALL=C df -h . 2>/dev/null | LC_ALL=C awk 'NR==2 {print $4 " free on " $1}')
 
 GPU_SUMMARY="None"
+GPU_LINES=""
 if command -v nvidia-smi &>/dev/null && ( [ -n "${CUDA_VISIBLE_DEVICES:-}" ] || nvidia-smi -L &>/dev/null ); then
-    echo ""
-    echo "─── [2/4] GPU Acceleration Telemetry ────────────────────────────────────────"
-    echo "  • CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-All/Unset}"
     GPU_SUMMARY=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -n 1 || echo "NVIDIA GPU")
-    nvidia-smi --query-gpu=index,name,uuid,memory.total,memory.free,driver_version,temperature.gpu,pstate --format=csv,noheader 2>/dev/null | \
-        LC_ALL=C awk -F', ' '{printf "  • GPU [%s] %s | VRAM: %s free / %s total | Temp: %sC | P-State: %s | Driver: %s\n    UUID: %s\n", $1, $2, $5, $4, $7, $8, $6, $3}'
-    echo ""
-    nvidia-smi
-else
-    echo ""
-    echo "─── [2/4] GPU Acceleration Telemetry ────────────────────────────────────────"
-    echo "  • No GPU allocated or nvidia-smi unavailable on this worker."
+    GPU_LINES=$(nvidia-smi --query-gpu=index,name,memory.free,memory.total,temperature.gpu,driver_version --format=csv,noheader 2>/dev/null | \
+        LC_ALL=C awk -F', ' '{printf "  GPU      [%s] %s (%s / %s free · %s°C · Driver %s)\n", $1, $2, $3, $4, $5, $6}')
 fi
 
-echo ""
-echo "─── [3/4] Environment & Toolchain Setup ─────────────────────────────────────"
 if [ -n "${SNAP_PY_ROOT}" ]; then
     export PYTHONPATH="${SNAP_PY_ROOT}:${PROJECT_CWD}${PYTHONPATH:+:${PYTHONPATH}}"
 else
@@ -156,27 +136,19 @@ if [ -n "${REQUESTED_CPUS}" ]; then
     export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${REQUESTED_CPUS}}"
 fi
 
-echo "  • PYTHONPATH       : ${PYTHONPATH}"
-echo "  • HERMES_RUN_DIR   : ${HERMES_RUN_DIR}"
-if [ -n "${OMP_NUM_THREADS:-}" ]; then
-    echo "  • Thread Pool Cap  : OMP=${OMP_NUM_THREADS} | MKL=${MKL_NUM_THREADS:-unset} | OPENBLAS=${OPENBLAS_NUM_THREADS:-unset}"
-fi
-
 SETUP_OK=1
 EXIT_CODE=0
 PYTHON_BIN=""
+ENV_LABEL="System"
 if [ -n "${VENV_PATH}" ]; then
+    ENV_LABEL="${VENV_PATH##*/}"
     if [ -f "${VENV_PATH}/bin/activate" ]; then
         # shellcheck disable=SC1091
         source "${VENV_PATH}/bin/activate"
         PYTHON_BIN="$(command -v python3 || command -v python)"
-        echo "  • Virtual Env      : ${VENV_PATH}"
-        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
     elif [ -x "${VENV_PATH}/bin/python" ]; then
         export PATH="${VENV_PATH}/bin:${PATH}"
         PYTHON_BIN="${VENV_PATH}/bin/python"
-        echo "  • Conda / Env      : ${VENV_PATH}"
-        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
     else
         echo "❌ ERROR: Virtual environment missing at ${VENV_PATH}/bin" >&2
         SETUP_OK=0
@@ -192,23 +164,43 @@ else
     else
         PYTHON_BIN="$(command -v python)"
     fi
-    echo "  • Virtual Env      : None (Native/System execution)"
-    if [ -n "${PYTHON_BIN}" ]; then
-        echo "  • Python Binary    : ${PYTHON_BIN} ($(${PYTHON_BIN} --version 2>&1))"
-    fi
 fi
 
-if [ "${SETUP_OK}" -eq 1 ]; then
-    echo ""
-    echo "─── [4/4] Executing Workload ────────────────────────────────────────────────"
-    case "${EXEC_TYPE}" in
-        python) CMD=("${PYTHON_BIN}" -u "${TARGET_EXEC}" "$@") ;;
-        bash)   CMD=(bash "${TARGET_EXEC}" "$@") ;;
-        *)      CMD=("${TARGET_EXEC}" "$@") ;;
-    esac
-    echo "▶ Command: ${CMD[*]}"
-    echo "─────────────────────────────────────────────────────────────────────────────"
+PY_VER=""
+if [ -n "${PYTHON_BIN}" ] && [ -x "${PYTHON_BIN}" ]; then
+    PY_VER="$(${PYTHON_BIN} --version 2>&1)"
+fi
 
+TARGET_NAME="${TARGET_EXEC##*/}"
+case "${EXEC_TYPE}" in
+    python)
+        CMD=("${PYTHON_BIN}" -u "${TARGET_EXEC}" "$@")
+        SHORT_CMD="${PYTHON_BIN##*/} -u ${TARGET_NAME}${*:+ $*}"
+        ;;
+    bash)
+        CMD=(bash "${TARGET_EXEC}" "$@")
+        SHORT_CMD="bash ${TARGET_NAME}${*:+ $*}"
+        ;;
+    *)
+        CMD=("${TARGET_EXEC}" "$@")
+        SHORT_CMD="${TARGET_NAME}${*:+ $*}"
+        ;;
+esac
+
+# --- [2] Compact Header ---
+echo "── Hermes 2 Job · ${TARGET_NAME} [proc ${CONDOR_PROC_ID}/${SWEEP_COUNT}] ──────────────────────────────────────────────"
+echo "  Host     ${HOST_FQDN} (${OS_NAME:-Linux} · ${KERNEL_VER})"
+echo "  CPU/RAM  ${CPU_MODEL:-Unknown} (${CPU_ALLOC}/${CPU_CORES:-?} cores · ${MEM_AVAIL:-?}/${MEM_TOTAL:-?} free${OMP_NUM_THREADS:+ · OMP=${OMP_NUM_THREADS}})"
+if [ -n "${GPU_LINES}" ]; then
+    printf "%s\n" "${GPU_LINES}"
+fi
+echo "  Env      ${PY_VER:-${EXEC_TYPE}} (${ENV_LABEL})${DISK_INFO:+ · Disk: ${DISK_INFO}}"
+echo "  Run Dir  ${HERMES_RUN_DIR}"
+echo "  Command  ${SHORT_CMD}"
+echo "  Started  ${START_ISO} (queued ${QUEUE_WAIT}s)"
+echo "────────────────────────────────────────────────────────────────────────────────"
+
+if [ "${SETUP_OK}" -eq 1 ]; then
     if [ -x /usr/bin/time ]; then
         USED_USR_TIME=1
         LC_MESSAGES=C LC_NUMERIC=C /usr/bin/time -v -o "${TIME_TMP}" "${CMD[@]}" &
@@ -245,35 +237,36 @@ MAX_RSS_KB="0"
 MAX_RSS_MB="0.0"
 CPU_PCT="N/A"
 MAJ_FAULTS="0"
-VOL_CTX="0"
-INVOL_CTX="0"
 
 if [ -f "${TIME_TMP}" ]; then
     MAX_RSS_KB=$(LC_ALL=C awk -F: '/Maximum resident set size/ {gsub(/^[ \t]+/, "", $2); print $2}' "${TIME_TMP}")
     CPU_PCT=$(LC_ALL=C awk -F: '/Percent of CPU this job got/ {gsub(/^[ \t]+/, "", $2); print $2}' "${TIME_TMP}")
     MAJ_FAULTS=$(LC_ALL=C awk -F: '/Major \(requiring I\/O\) page faults/ {gsub(/^[ \t]+/, "", $2); print $2}' "${TIME_TMP}")
-    VOL_CTX=$(LC_ALL=C awk -F: '/Voluntary context switches/ {gsub(/^[ \t]+/, "", $2); print $2}' "${TIME_TMP}")
-    INVOL_CTX=$(LC_ALL=C awk -F: '/Involuntary context switches/ {gsub(/^[ \t]+/, "", $2); print $2}' "${TIME_TMP}")
     rm -f "${TIME_TMP}"
 fi
 
-echo "─────────────────────────────────────────────────────────────────────────────"
-echo ""
-echo "╔════════════════════════════════════════════════════════════════════════════╗"
-echo "║ 📊 POST-MORTEM RESOURCE HIGH-WATERMARKS & SUMMARY                          ║"
-echo "╚════════════════════════════════════════════════════════════════════════════╝"
-echo "  • Exit Code        : ${EXIT_CODE}${CAUGHT_SIG:+ (Signal: ${CAUGHT_SIG})}"
-echo "  • Finished At      : ${END_ISO}"
-LC_ALL=C printf "  • Wall-Clock Time  : %02dh %02dm %02ds (%d seconds | Queue wait: %ds)\n" "${HOURS}" "${MINS}" "${SECS}" "${DURATION}" "${QUEUE_WAIT}"
-
+RAM_LABEL="N/A"
 if [ -n "${MAX_RSS_KB}" ] && [ "${MAX_RSS_KB}" -gt 0 ] 2>/dev/null; then
     MAX_RSS_MB=$(LC_ALL=C awk -v kb="${MAX_RSS_KB}" 'BEGIN {printf "%.2f", kb / 1024}')
-    MAX_RSS_GB=$(LC_ALL=C awk -v kb="${MAX_RSS_KB}" 'BEGIN {printf "%.2f", kb / 1048576}')
-    echo "  • Peak RAM (MaxRSS): ${MAX_RSS_MB} MB (${MAX_RSS_GB} GB)"
+    if [ "${MAX_RSS_KB}" -ge 1048576 ] 2>/dev/null; then
+        MAX_RSS_GB=$(LC_ALL=C awk -v kb="${MAX_RSS_KB}" 'BEGIN {printf "%.2f", kb / 1048576}')
+        RAM_LABEL="${MAX_RSS_GB} GB"
+    else
+        RAM_LABEL="${MAX_RSS_MB} MB"
+    fi
 fi
-echo "  • Average CPU Load : ${CPU_PCT}"
-echo "  • I/O Page Faults  : ${MAJ_FAULTS} major faults"
-echo "  • Context Switches : ${VOL_CTX} voluntary / ${INVOL_CTX} involuntary"
+
+if [ -n "${CAUGHT_SIG}" ]; then
+    STATUS_WORD="Interrupted (${CAUGHT_SIG}, exit ${EXIT_CODE})"
+elif [ "${EXIT_CODE}" -eq 0 ]; then
+    STATUS_WORD="Completed (exit 0)"
+else
+    STATUS_WORD="Failed (exit ${EXIT_CODE})"
+fi
+
+echo "────────────────────────────────────────────────────────────────────────────────"
+LC_ALL=C printf "── %s · %02dh %02dm %02ds · Peak RAM: %s · CPU: %s · Faults: %s\n" \
+    "${STATUS_WORD}" "${HOURS}" "${MINS}" "${SECS}" "${RAM_LABEL}" "${CPU_PCT}" "${MAJ_FAULTS:-0}"
 
 # --- Atomically Update Unified run.json (Env-isolated, NFS-safe flock) ---
 export UPD_RUN_JSON="${RUN_JSON}"
@@ -281,7 +274,7 @@ export UPD_REPRO_DIR="${REPRO_DIR}"
 export UPD_SWEEP_COUNT="${SWEEP_COUNT}"
 export UPD_PROC_ID="${CONDOR_PROC_ID}"
 export UPD_ARGS="$*"
-export UPD_HOST="$(hostname -f 2>/dev/null || hostname)"
+export UPD_HOST="${HOST_FQDN}"
 export UPD_CPU_MODEL="${CPU_MODEL}"
 export UPD_CPU_ALLOC="${CPU_ALLOC:-0}"
 export UPD_CPU_NODE="${CPU_CORES:-0}"
