@@ -47,6 +47,57 @@ from hermes_tools.core import (
 from hermes_tools.snapshot import create_code_snapshot, freeze_python_env, get_git_info
 
 
+def _extract_run_display_parts(
+    run_dir: Path, data: Dict[str, Any]
+) -> Tuple[str, str, str]:
+    """
+    Returns (plain_label, rich_label, short_date) for a run:
+      - plain_label: e.g. 'r_peak_pipeline' or 'train (exp1)'
+      - rich_label : e.g. '[bold white]train[/bold white] [cyan](exp1)[/cyan]'
+      - short_date : e.g. '2026-11-03 15:22'
+    """
+    sub = data.get("submission", {})
+    req = data.get("resources_requested", {})
+    arch = str(req.get("architecture", "—"))
+    target_str = str(sub.get("target") or "").strip()
+    tag_str = str(sub.get("tag") or "").strip()
+
+    if target_str:
+        stem = Path(target_str).stem
+        if tag_str:
+            plain_label = f"{stem} ({tag_str})"
+            rich_label = f"[bold white]{stem}[/bold white] [cyan]({tag_str})[/cyan]"
+        else:
+            plain_label = stem
+            rich_label = f"[bold white]{stem}[/bold white]"
+    elif len(run_dir.name) > 20 and run_dir.name[4:5] == "-" and run_dir.name[19:20] == "_":
+        rest = run_dir.name[20:]
+        if arch != "—" and rest.endswith(f"_{arch}"):
+            rest = rest[: -(len(arch) + 1)]
+            plain_label = rest
+            rich_label = f"[bold white]{rest}[/bold white]"
+        elif arch != "—" and f"_{arch}_" in rest:
+            stem_part, tag_part = rest.split(f"_{arch}_", 1)
+            plain_label = f"{stem_part} ({tag_part})"
+            rich_label = f"[bold white]{stem_part}[/bold white] [cyan]({tag_part})[/cyan]"
+        else:
+            plain_label = rest
+            rich_label = f"[bold white]{rest}[/bold white]"
+    else:
+        plain_label = run_dir.name
+        rich_label = f"[bold white]{run_dir.name}[/bold white]"
+
+    raw_iso = str(sub.get("submitted_at") or "").strip()
+    if len(raw_iso) >= 16:
+        short_date = raw_iso[:16].replace("T", " ")
+    elif len(run_dir.name) >= 16 and run_dir.name[4:5] == "-" and run_dir.name[10:11] == "_":
+        short_date = f"{run_dir.name[:10]} {run_dir.name[11:16].replace('-', ':')}"
+    else:
+        short_date = "—"
+
+    return plain_label, rich_label, short_date
+
+
 def resolve_run_dir(
     runs_root: Path, query: Optional[str], prompt_title: str = "Select a run:"
 ) -> Path:
@@ -94,24 +145,34 @@ def resolve_run_dir(
 
     import questionary
 
-    rows: List[Tuple[int, Path, str, str, str]] = []
+    latest_target = resolve_latest_symlink(runs_root)
+    rows: List[Tuple[int, Path, str, str, str, str, str, str]] = []
     for i, d in enumerate(dirs[:35], start=1):
         rj = load_run_json(d)
+        plain_label, _, short_date = _extract_run_display_parts(d, rj)
         st = str(rj.get("status", "UNKNOWN"))
-        arch = str(rj.get("resources_requested", {}).get("architecture", "?"))
-        cid = str(rj.get("submission", {}).get("cluster_id") or "—")
-        rows.append((i, d, st, arch, cid))
+        arch = str(rj.get("resources_requested", {}).get("architecture", "—"))
+        _, dur_str, _ = summarize_metrics(rj)
+        raw_cid = rj.get("submission", {}).get("cluster_id")
+        cid_str = f"#{raw_cid}" if raw_cid else "—"
+        star = " ★" if d == latest_target else ""
+        rows.append((i, d, plain_label, arch, st, dur_str, short_date, f"{cid_str}{star}"))
 
-    name_w = max((len(d.name) for _, d, _, _, _ in rows), default=20)
-    st_w = max((len(st) for _, _, st, _, _ in rows), default=8)
-    arch_w = max((len(arch) for _, _, _, arch, _ in rows), default=6)
+    name_w = max((len(r[2]) for r in rows), default=14)
+    arch_w = max((len(r[3]) for r in rows), default=6)
+    st_w = max((len(r[4]) for r in rows), default=8)
+    dur_w = max((len(r[5]) for r in rows), default=6)
+    date_w = max((len(r[6]) for r in rows), default=16)
 
     choices = [
         questionary.Choice(
-            title=f"[{i:02d}] {d.name:<{name_w}} │ {st:<{st_w}} │ {arch:<{arch_w}} │ Cluster: {cid}",
+            title=(
+                f"[{i:02d}] {label:<{name_w}} │ {arch:<{arch_w}} │ {st:<{st_w}} │ "
+                f"{dur:>{dur_w}} │ {dt:<{date_w}} │ {cid}"
+            ),
             value=d,
         )
-        for i, d, st, arch, cid in rows
+        for i, d, label, arch, st, dur, dt, cid in rows
     ]
     selected = questionary.select(
         prompt_title, choices=choices, style=get_prompt_style()
@@ -267,9 +328,10 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     meta.add_row("Run ID", f"[bold]{run_dir.name}[/bold]")
     meta.add_row("Status", style_status(display_status))
     meta.add_row("HTCondor Cluster(s)", ", ".join(str(c) for c in cids) if cids else "—")
+    submitted_fmt = str(sub.get("submitted_at", "—")).replace("T", " ")
     meta.add_row(
         "Submitted At",
-        f"{sub.get('submitted_at', '—')} by {sub.get('user', '—')}@{sub.get('submit_host', '—')}",
+        f"{submitted_fmt} by {sub.get('user', '—')}@{sub.get('submit_host', '—')}",
     )
     meta.add_row(
         "Target Script",
@@ -285,7 +347,8 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
             if git.get("dirty")
             else "[green]clean[/green]"
         )
-        sync_note = f" [dim](synced {git.get('synced_at')})[/dim]" if git.get("synced_at") else ""
+        synced_fmt = str(git.get("synced_at", "")).replace("T", " ")
+        sync_note = f" [dim](synced {synced_fmt})[/dim]" if synced_fmt else ""
         meta.add_row(
             "Git Provenance",
             f"{git.get('branch')} @ {str(git.get('commit'))[:8]} ({dirty_str}){sync_note}",
@@ -804,7 +867,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, int]]] = None
     now = datetime.datetime.now()
-    inactive_runs: List[Tuple[Path, str]] = []
+    inactive_runs: List[Tuple[Path, str, str, str, str]] = []
     candidates: List[Tuple[Path, str, float]] = []
 
     for d in dirs:
@@ -822,7 +885,10 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             continue
 
         if not has_filters:
-            inactive_runs.append((d, st))
+            plain_label, _, short_date = _extract_run_display_parts(d, data)
+            arch = str(data.get("resources_requested", {}).get("architecture", "—"))
+            _, dur_str, _ = summarize_metrics(data)
+            inactive_runs.append((d, st, plain_label, arch, f"{dur_str} │ {short_date}"))
             continue
 
         match = False
@@ -848,11 +914,15 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             return
         import questionary
 
-        name_w = max((len(d.name) for d, _ in inactive_runs), default=20)
-        st_w = max((len(st) for _, st in inactive_runs), default=8)
+        name_w = max((len(x[2]) for x in inactive_runs), default=14)
+        arch_w = max((len(x[3]) for x in inactive_runs), default=6)
+        st_w = max((len(x[1]) for x in inactive_runs), default=8)
         choices = [
-            questionary.Choice(f"{d.name:<{name_w}} │ {st:<{st_w}}", value=(d, st))
-            for d, st in inactive_runs
+            questionary.Choice(
+                f"{label:<{name_w}} │ {arch:<{arch_w}} │ {st:<{st_w}} │ {meta_tail}",
+                value=(d, st),
+            )
+            for d, st, label, arch, meta_tail in inactive_runs
         ]
         selected = questionary.checkbox(
             "Select runs to permanently delete (Space to toggle, Enter to confirm):",
