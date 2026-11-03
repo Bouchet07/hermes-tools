@@ -362,3 +362,39 @@ def test_freeze_python_env_uses_mtime_cache_and_dir_size_skips_code(tmp_path: Pa
     mb_full = dir_size_mb(tmp_path / "runs" / "r1", include_code_snapshot=True)
     assert 0.95 <= mb_default <= 1.15
     assert mb_full >= 2.95
+
+
+def test_env_config_and_auto_cuda_home_exports(tmp_path: Path) -> None:
+    (tmp_path / ".hermes.toml").write_text(
+        'arch = "GPU3090"\n\n'
+        "[env]\n"
+        'CUDA_HOME = "/mnt/cephfs/home/bio/dbouchet/cuda-12.1"\n'
+        'TORCH_CUDA_ARCH_LIST = "8.6"\n'
+        'WANDB_MODE = "offline"\n',
+        encoding="utf-8",
+    )
+    cfg = load_project_config(tmp_path)
+    assert cfg["env"]["CUDA_HOME"] == "/mnt/cephfs/home/bio/dbouchet/cuda-12.1"
+    assert cfg["env"]["TORCH_CUDA_ARCH_LIST"] == "8.6"
+    assert cfg["env"]["WANDB_MODE"] == "offline"
+
+    sh = generate_bash_wrapper(
+        exec_type="bash",
+        target_exec_path=tmp_path / "pipeline.sh",
+        venv_path=None,
+        pythonpath_dir=tmp_path / "repro" / "code",
+        project_cwd=tmp_path,
+        run_dir=tmp_path / "runs" / "r1",
+        repro_dir=tmp_path / "runs" / "r1" / "repro",
+        submit_epoch=1700000000,
+        sweep_count=1,
+        requested_cpus=None,
+        env_vars=cfg["env"],
+    )
+    assert "export PYTHONUNBUFFERED=1" in sh
+    assert "export HOME=" in sh
+    assert "export CUDA_HOME=/mnt/cephfs/home/bio/dbouchet/cuda-12.1" in sh
+    assert "export TORCH_CUDA_ARCH_LIST=8.6" in sh
+    assert "export WANDB_MODE=offline" in sh
+    assert 'export PATH="${CUDA_HOME}/bin:${PATH}"' in sh
+    assert 'export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' in sh

@@ -177,10 +177,20 @@ no_venv = false
 node = []
 exclude = ["her07-100"]
 scratch = []
+
+[tool.hermes.env]
+CUDA_HOME = "/mnt/cephfs/home/bio/dbouchet/cuda-12.1"
+TORCH_CUDA_ARCH_LIST = "8.6"
+WANDB_MODE = "offline"
 ```
 
+> **Automatic Worker Environment Exports**:
+> * `PYTHONUNBUFFERED=1` and `HOME=<your_submit_home>` are **always exported automatically** in `repro/job.sh`.
+> * If `CUDA_HOME` is defined in `[env]` / `[tool.hermes.env]` (or via `-e CUDA_HOME=...`), `job.sh` **automatically prepends** `$CUDA_HOME/bin` to `PATH` and `$CUDA_HOME/lib64` to `LD_LIBRARY_PATH`.
+> * Values in `[env]` also support shell variable expansion (e.g., `PATH = "$CUDA_HOME/bin:$PATH"`).
+
 **Precedence Order (Highest to Lowest):**
-1. Explicit CLI flags (`-a`, `-c`, `-m`, `-g`, `--project`, `--venv`, `--no-venv`, `--node`, `--exclude`, `-t`, `--scratch`)
+1. Explicit CLI flags (`-a`, `-c`, `-m`, `-g`, `--project`, `--venv`, `--no-venv`, `--node`, `--exclude`, `-t`, `--scratch`, `-e`/`--env`)
 2. `.hermes.toml` in current or parent directory
 3. `[tool.hermes]` in `pyproject.toml`
 4. Built-in defaults / interactive prompt

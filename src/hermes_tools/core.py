@@ -169,7 +169,10 @@ def load_project_config(cwd: Path) -> Dict[str, Any]:
 
                 raw = tomllib.loads(hermes_toml.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    return dict(raw.get("hermes", raw))
+                    base = dict(raw.get("hermes", raw))
+                    if "env" in raw and "env" not in base and isinstance(raw["env"], dict):
+                        base["env"] = raw["env"]
+                    return base
             except Exception:
                 pass
 

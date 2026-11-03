@@ -733,6 +733,8 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         if req.get("scratch_files"):
             cmd.append("--scratch")
             cmd.extend(str(sf) for sf in req["scratch_files"])
+        for ek, ev in (req.get("env") or {}).items():
+            cmd.extend(["-e", f"{ek}={ev}"])
         if is_sweep:
             for _, arg_line in targets:
                 cmd.extend(["-s", arg_line])

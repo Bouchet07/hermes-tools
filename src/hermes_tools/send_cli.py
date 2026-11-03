@@ -111,6 +111,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable RAMDisk scratch mode and transfer specified input files",
     )
     parser.add_argument(
+        "-e",
+        "--env",
+        action="append",
+        default=[],
+        help="Export custom environment variable(s) inside job.sh, e.g. -e WANDB_MODE=offline",
+    )
+    parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation prompt and submit immediately"
     )
     parser.add_argument(
@@ -164,6 +171,21 @@ def main() -> None:
     nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
     nodes_exclude = list(args.exclude) or _as_str_list(proj_cfg.get("exclude"))
     scratch_files = list(args.scratch) or _as_str_list(proj_cfg.get("scratch"))
+
+    env_vars: Dict[str, str] = {}
+    cfg_env = proj_cfg.get("env")
+    if isinstance(cfg_env, dict):
+        for k, v in cfg_env.items():
+            if k and v is not None:
+                env_vars[str(k).strip()] = str(v)
+    for item in args.env:
+        if "=" not in item:
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Invalid --env '{item}' (expected KEY=VALUE)."
+            )
+            sys.exit(1)
+        k, v = item.split("=", 1)
+        env_vars[k.strip()] = v
 
     interactive_mode = False
 
@@ -450,6 +472,8 @@ def main() -> None:
     if scratch_files:
         cli_parts.append("--scratch")
         cli_parts.extend(shlex.quote(sf) for sf in scratch_files)
+    for item in args.env:
+        cli_parts.extend(["-e", shlex.quote(item)])
     if args.sweep_file:
         cli_parts.extend(["--sweep-file", shlex.quote(str(args.sweep_file))])
     for s in cli_sweep_specs:
@@ -528,6 +552,10 @@ def main() -> None:
     else:
         summary_table.add_row("Code Snapshot", "Isolated copy in [cyan]repro/code/[/cyan]")
 
+    if env_vars:
+        env_preview = ", ".join(f"[cyan]{k}[/cyan]={v}" for k, v in env_vars.items())
+        summary_table.add_row("Env Exports", env_preview)
+
     summary_table.add_row("Fast CLI Command", f"[bold green]{equivalent_cli}[/bold green]")
 
     console.print()
@@ -573,6 +601,7 @@ def main() -> None:
         submit_epoch=submit_epoch,
         sweep_count=len(sweep_list),
         requested_cpus=cpus,
+        env_vars=env_vars,
     )
     write_text_lf(sh_path, sh_content)
     try:
@@ -628,6 +657,7 @@ def main() -> None:
             "node_exclude": nodes_exclude,
             "project_code": str(project_code) if project_code else None,
             "scratch_files": scratch_files,
+            "env": env_vars,
         },
         "git": {
             "is_git": git_info["is_git"],
