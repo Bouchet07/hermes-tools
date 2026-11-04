@@ -185,7 +185,11 @@ def resolve_run_dir(
 # ---------------------------------------------------------------------------
 # Subcommand: `runs ls` & `runs watch`
 # ---------------------------------------------------------------------------
-def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
+def _build_ls_table_with_state(
+    args: argparse.Namespace,
+    runs_root: Path,
+    terminal_cache: Optional[Dict[Path, Dict[str, Any]]] = None,
+) -> Tuple[Table, Tuple[Tuple[str, ...], ...]]:
     dirs = list_run_dirs(runs_root)
     latest_target = resolve_latest_symlink(runs_root)
 
@@ -213,19 +217,29 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
 
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, int]]] = None
+    row_signatures: List[Tuple[str, ...]] = []
 
     for idx, d in enumerate(dirs, start=1):
         if tag_lower and tag_lower not in d.name.lower():
             continue
 
-        raw_data = load_run_json(d)
-        if run_needs_live_reconcile(raw_data):
-            if not live_clusters_queried:
-                live_clusters = query_live_condor_clusters()
-                live_clusters_queried = True
-            data = reconcile_run(d, raw_data, live_clusters)
+        if terminal_cache is not None and d in terminal_cache:
+            data = terminal_cache[d]
         else:
-            data = raw_data
+            raw_data = load_run_json(d)
+            if run_needs_live_reconcile(raw_data):
+                if not live_clusters_queried:
+                    live_clusters = query_live_condor_clusters()
+                    live_clusters_queried = True
+                data = reconcile_run(d, raw_data, live_clusters)
+            else:
+                data = raw_data
+            if (
+                terminal_cache is not None
+                and not run_needs_live_reconcile(data)
+                and "_live_badge" not in data
+            ):
+                terminal_cache[d] = data
 
         display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         if status_upper and status_upper not in display_status.upper():
@@ -236,7 +250,9 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
         sweep_cnt = int(req.get("sweep_count", 1) or 1)
         cids = get_all_cluster_ids(data)
         cid_str = (
-            str(cids[-1]) + (f" (+{len(cids) - 1})" if len(cids) > 1 else "") if cids else "—"
+            str(cids[-1]) + (f" (+{len(cids) - 1})" if len(cids) - 1 > 0 else "")
+            if cids
+            else "—"
         )
 
         if sweep_cnt > 1:
@@ -260,7 +276,7 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
             f"{styled_name} [bold yellow]★[/bold yellow]" if d == latest_target else styled_name
         )
 
-        table.add_row(
+        row_cells = (
             str(idx),
             name_label,
             cid_str,
@@ -271,10 +287,17 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
             dur_str,
             ram_str,
         )
+        table.add_row(*row_cells)
+        row_signatures.append(row_cells)
         shown += 1
         if limit and shown >= limit:
             break
 
+    return table, tuple(row_signatures)
+
+
+def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
+    table, _ = _build_ls_table_with_state(args, runs_root)
     return table
 
 
@@ -288,15 +311,24 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
         from rich.live import Live
 
         interval = max(1, int(getattr(args, "interval", 2) or 2))
+        terminal_cache: Dict[Path, Dict[str, Any]] = {}
+        initial_table, last_sig = _build_ls_table_with_state(
+            args, runs_root, terminal_cache
+        )
         try:
             with Live(
-                _build_ls_table(args, runs_root),
+                initial_table,
                 console=console,
-                refresh_per_second=1,
+                auto_refresh=False,
             ) as live:
                 while True:
                     time.sleep(interval)
-                    live.update(_build_ls_table(args, runs_root))
+                    new_table, new_sig = _build_ls_table_with_state(
+                        args, runs_root, terminal_cache
+                    )
+                    if new_sig != last_sig:
+                        last_sig = new_sig
+                        live.update(new_table, refresh=True)
         except KeyboardInterrupt:
             return
     else:
