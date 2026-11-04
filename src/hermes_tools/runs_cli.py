@@ -194,7 +194,8 @@ def _build_ls_table_with_state(
     latest_target = resolve_latest_symlink(runs_root)
 
     table = Table(
-        title=f"[bold cyan]📊 Hermes 2 Runs ({runs_root})[/bold cyan]",
+        title=f"📊 Hermes 2 Runs ({runs_root})",
+        title_style="bold cyan",
         box=box.ROUNDED,
         header_style="bold cyan",
     )
@@ -406,6 +407,7 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     if records:
         et = Table(
             title="Process Execution Breakdown",
+            title_style="bold cyan",
             box=box.SIMPLE_HEAVY,
             header_style="bold cyan",
         )
@@ -1046,7 +1048,8 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
     da, db = load_run_json(dir_a), load_run_json(dir_b)
 
     t = Table(
-        title="[bold cyan]⚖️  Run Provenance Comparison[/bold cyan]",
+        title="⚖️  Run Provenance Comparison",
+        title_style="bold cyan",
         box=box.ROUNDED,
         header_style="bold cyan",
     )
