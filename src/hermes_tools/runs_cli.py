@@ -188,7 +188,7 @@ def resolve_run_dir(
 def _build_ls_table_with_state(
     args: argparse.Namespace,
     runs_root: Path,
-    terminal_cache: Optional[Dict[Path, Dict[str, Any]]] = None,
+    terminal_cache: Optional[Dict[Path, Tuple[Tuple[int, int, int], Dict[str, Any]]]] = None,
 ) -> Tuple[Table, Tuple[Tuple[str, ...], ...]]:
     dirs = list_run_dirs(runs_root)
     latest_target = resolve_latest_symlink(runs_root)
@@ -224,8 +224,17 @@ def _build_ls_table_with_state(
         if tag_lower and tag_lower not in d.name.lower():
             continue
 
-        if terminal_cache is not None and d in terminal_cache:
-            data = terminal_cache[d]
+        rj_stat_key: Optional[Tuple[int, int, int]] = None
+        if terminal_cache is not None:
+            try:
+                st_rj = (d / "run.json").stat()
+                rj_stat_key = (st_rj.st_ino, st_rj.st_mtime_ns, st_rj.st_size)
+            except OSError:
+                rj_stat_key = None
+
+        cached_entry = terminal_cache.get(d) if terminal_cache is not None else None
+        if cached_entry is not None and rj_stat_key is not None and cached_entry[0] == rj_stat_key:
+            data = cached_entry[1]
         else:
             raw_data = load_run_json(d)
             if run_needs_live_reconcile(raw_data):
@@ -240,7 +249,16 @@ def _build_ls_table_with_state(
                 and not run_needs_live_reconcile(data)
                 and "_live_badge" not in data
             ):
-                terminal_cache[d] = data
+                try:
+                    st_after = (d / "run.json").stat()
+                    terminal_cache[d] = (
+                        (st_after.st_ino, st_after.st_mtime_ns, st_after.st_size),
+                        data,
+                    )
+                except OSError:
+                    pass
+            elif terminal_cache is not None:
+                terminal_cache.pop(d, None)
 
         display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         if status_upper and status_upper not in display_status.upper():
@@ -312,7 +330,7 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
         from rich.live import Live
 
         interval = max(1, int(getattr(args, "interval", 2) or 2))
-        terminal_cache: Dict[Path, Dict[str, Any]] = {}
+        terminal_cache: Dict[Path, Tuple[Tuple[int, int, int], Dict[str, Any]]] = {}
         initial_table, last_sig = _build_ls_table_with_state(
             args, runs_root, terminal_cache
         )

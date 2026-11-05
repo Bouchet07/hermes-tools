@@ -398,3 +398,46 @@ def test_env_config_and_auto_cuda_home_exports(tmp_path: Path) -> None:
     assert "export WANDB_MODE=offline" in sh
     assert 'export PATH="${CUDA_HOME}/bin:${PATH}"' in sh
     assert 'export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' in sh
+
+
+def test_watch_terminal_cache_detects_in_place_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    run_dir = tmp_path / "runs" / "2026-11-05_16-00-00_train_GPU3090"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+    atomic_write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_dir.name,
+            "status": "FAILED",
+            "submission": {"cluster_id": 100},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 1}],
+        },
+        repro_dir,
+    )
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {101: {"total": 1, "running": 1, "idle": 0, "held": 0}})
+
+    args = argparse.Namespace(limit=25, status=None, tag=None)
+    cache: dict = {}
+    _, sig1 = runs_cli._build_ls_table_with_state(args, tmp_path / "runs", cache)
+    assert run_dir in cache
+    assert any("FAILED" in cell for cell in sig1[0])
+
+    # Now simulate in-place retry updating run.json -> QUEUED (RETRY) with cluster 101
+    atomic_write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_dir.name,
+            "status": "QUEUED (RETRY)",
+            "submission": {"cluster_id": 101, "retry_clusters": [100]},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [],
+        },
+        repro_dir,
+    )
+    _, sig2 = runs_cli._build_ls_table_with_state(args, tmp_path / "runs", cache)
+    assert sig2 != sig1
+    assert any("RUNNING" in cell for cell in sig2[0])
