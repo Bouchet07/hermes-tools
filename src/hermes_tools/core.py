@@ -105,6 +105,35 @@ def write_text_lf(path: Path, content: str) -> None:
         f.write(content)
 
 
+def tail_file_lines(path: Path, n: int = 60, block_size: int = 65536) -> List[str]:
+    """
+    Reads the last `n` lines of `path` in O(1) memory by seeking backward from EOF
+    in `block_size` chunks, avoiding reading multi-hundred-MB log files over CephFS.
+    """
+    if n <= 0:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            if pos == 0:
+                return []
+            chunks: List[bytes] = []
+            newlines_found = 0
+            while pos > 0 and newlines_found <= n:
+                read_len = min(block_size, pos)
+                pos -= read_len
+                f.seek(pos, os.SEEK_SET)
+                buf = f.read(read_len)
+                chunks.append(buf)
+                newlines_found += buf.count(b"\n")
+            raw = b"".join(reversed(chunks))
+            lines = raw.decode("utf-8", errors="replace").splitlines()
+            return lines[-n:]
+    except OSError:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Atomic JSON & File Locking (NFS / CephFS Safe + Local Dev Compatible)
 # ---------------------------------------------------------------------------

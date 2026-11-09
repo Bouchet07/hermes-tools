@@ -441,3 +441,32 @@ def test_watch_terminal_cache_detects_in_place_retry(tmp_path: Path, monkeypatch
     _, sig2 = runs_cli._build_ls_table_with_state(args, tmp_path / "runs", cache)
     assert sig2 != sig1
     assert any("RUNNING" in cell for cell in sig2[0])
+
+
+def test_tail_file_lines_o1_seek_and_diff_symlinks(tmp_path: Path) -> None:
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.core import tail_file_lines
+
+    log_f = tmp_path / "big.log"
+    lines = [f"line-{i:05d}" for i in range(2500)]
+    log_f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Small block size exercises multi-chunk backward seeking
+    assert tail_file_lines(log_f, 5, block_size=64) == lines[-5:]
+    assert tail_file_lines(tmp_path / "missing.log", 10) == []
+
+    # Verify _diff_directories does not crash on broken symlinks or read binary blobs
+    dir_a = tmp_path / "snap_a"
+    dir_b = tmp_path / "snap_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    (dir_a / "train.py").write_text("lr = 1e-3\n", encoding="utf-8")
+    (dir_b / "train.py").write_text("lr = 1e-4\n", encoding="utf-8")
+    (dir_a / "weights.bin").write_bytes(b"\x00\x01\x02" * 100)
+    (dir_b / "weights.bin").write_bytes(b"\x00\x01\x02" * 200)
+
+    diff_out = runs_cli._diff_directories(dir_a, dir_b)
+    assert "-lr = 1e-3" in diff_out
+    assert "+lr = 1e-4" in diff_out
+    assert "[binary file:" in diff_out
+

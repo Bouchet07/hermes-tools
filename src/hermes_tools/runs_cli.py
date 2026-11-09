@@ -41,6 +41,7 @@ from hermes_tools.core import (
     set_execution_records,
     style_status,
     summarize_metrics,
+    tail_file_lines,
     update_latest_symlink,
     write_text_lf,
 )
@@ -469,25 +470,46 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 
     err_files = sorted(run_dir.glob("*.err"))
     syntax_cls = None
+    shown_any_err = False
     for ef in err_files:
         try:
-            st = ef.stat()
-            if st.st_size == 0:
+            if ef.stat().st_size == 0:
                 continue
-            content = ef.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue
-        if content:
+        lines = [line for line in tail_file_lines(ef, 25) if line.strip()]
+        if lines:
+            shown_any_err = True
             if syntax_cls is None:
                 from rich.syntax import Syntax as syntax_cls
-            tail_lines = "\n".join(content.splitlines()[-25:])
             console.print(
                 Panel(
-                    syntax_cls(tail_lines, "pytb", theme="monokai", word_wrap=True),
+                    syntax_cls("\n".join(lines), "pytb", theme="monokai", word_wrap=True),
                     title=f"[bold red]⚠ Stderr Tail: {ef.name}[/bold red]",
                     border_style="red",
                 )
             )
+
+    if not shown_any_err and display_status.startswith(
+        ("FAILED", "COMPLETED_WITH_ERRORS", "INTERRUPTED")
+    ):
+        for of in sorted(run_dir.glob("*.out")):
+            try:
+                if of.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            out_lines = [line for line in tail_file_lines(of, 25) if line.strip()]
+            if out_lines:
+                if syntax_cls is None:
+                    from rich.syntax import Syntax as syntax_cls
+                console.print(
+                    Panel(
+                        syntax_cls("\n".join(out_lines), "text", theme="monokai", word_wrap=True),
+                        title=f"[bold yellow]⚠ Stdout Tail (stderr empty): {of.name}[/bold yellow]",
+                        border_style="yellow",
+                    )
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -495,11 +517,12 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 def _follow_file_python(log_file: Path, initial_lines: int) -> None:
     try:
-        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-            for line in lines[-initial_lines:]:
-                sys.stdout.write(line)
+        tail = tail_file_lines(log_file, initial_lines)
+        if tail:
+            sys.stdout.write("\n".join(tail) + "\n")
             sys.stdout.flush()
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
             while True:
                 line = f.readline()
                 if line:
@@ -558,8 +581,7 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
         else:
             _follow_file_python(log_file, args.lines)
     else:
-        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        snippet = "\n".join(lines[-args.lines :])
+        snippet = "\n".join(tail_file_lines(log_file, args.lines))
         rel_title = (
             log_file.relative_to(runs_root.parent)
             if log_file.is_relative_to(runs_root.parent)
@@ -1020,31 +1042,58 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs diff`
 # ---------------------------------------------------------------------------
+def _collect_snapshot_entries(root: Path) -> Dict[str, Path]:
+    """Collects relative POSIX paths of regular files and symlinks without following directory symlinks."""
+    entries: Dict[str, Path] = {}
+    for cur_root, dirs, files in os.walk(root, followlinks=False):
+        cur_path = Path(cur_root)
+        # Keep directory symlinks as leaf entries without descending into them
+        kept_dirs: List[str] = []
+        for d in dirs:
+            dp = cur_path / d
+            if dp.is_symlink():
+                entries[dp.relative_to(root).as_posix()] = dp
+            else:
+                kept_dirs.append(d)
+        dirs[:] = kept_dirs
+        for f in files:
+            fp = cur_path / f
+            entries[fp.relative_to(root).as_posix()] = fp
+    return entries
+
+
+def _read_diffable_lines(path: Optional[Path]) -> List[str]:
+    """Returns diffable lines for a snapshot entry without reading symlink targets or large binary files."""
+    if path is None:
+        return []
+    try:
+        if path.is_symlink():
+            return [f"symlink -> {os.readlink(path)}\n"]
+        st = path.stat()
+        if st.st_size > 2 * 1024 * 1024:
+            return [f"[large file: {st.st_size} bytes]\n"]
+        with open(path, "rb") as f:
+            head = f.read(4096)
+            if b"\x00" in head:
+                return [f"[binary file: {st.st_size} bytes]\n"]
+            rest = f.read()
+        return (head + rest).decode("utf-8", errors="replace").splitlines(keepends=True)
+    except OSError:
+        return []
+
+
 def _diff_directories(dir_a: Path, dir_b: Path) -> str:
-    """Computes a unified diff across all text files in two directories."""
+    """Computes a unified diff across all text files and symlinks in two directories."""
     import difflib
 
-    files_a = {
-        p.relative_to(dir_a).as_posix() for p in dir_a.rglob("*") if p.is_file()
-    }
-    files_b = {
-        p.relative_to(dir_b).as_posix() for p in dir_b.rglob("*") if p.is_file()
-    }
-    all_rel = sorted(files_a | files_b)
+    map_a = _collect_snapshot_entries(dir_a)
+    map_b = _collect_snapshot_entries(dir_b)
+    all_rel = sorted(map_a.keys() | map_b.keys())
     chunks: List[str] = []
 
     for rel in all_rel:
-        pa, pb = dir_a / rel, dir_b / rel
-        lines_a = (
-            pa.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-            if pa.is_file()
-            else []
-        )
-        lines_b = (
-            pb.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-            if pb.is_file()
-            else []
-        )
+        lines_a = _read_diffable_lines(map_a.get(rel))
+        lines_b = _read_diffable_lines(map_b.get(rel))
         if lines_a == lines_b:
             continue
         diff_lines = list(
