@@ -147,11 +147,20 @@ def resolve_run_dir(
     import questionary
 
     latest_target = resolve_latest_symlink(runs_root)
+    live_clusters_queried = False
+    live_clusters: Optional[Dict[int, Dict[str, Any]]] = None
     rows: List[Tuple[int, Path, str, str, str, str, str, str]] = []
     for i, d in enumerate(dirs[:35], start=1):
-        rj = load_run_json(d)
+        raw_rj = load_run_json(d)
+        if run_needs_live_reconcile(raw_rj):
+            if not live_clusters_queried:
+                live_clusters = query_live_condor_clusters()
+                live_clusters_queried = True
+            rj = reconcile_run(d, raw_rj, live_clusters)
+        else:
+            rj = raw_rj
         plain_label, _, short_date = _extract_run_display_parts(d, rj)
-        st = str(rj.get("status", "UNKNOWN"))
+        st = str(rj.get("_live_badge") or rj.get("status", "UNKNOWN"))
         arch = str(rj.get("resources_requested", {}).get("architecture", "—"))
         _, dur_str, _ = summarize_metrics(rj)
         raw_cid = rj.get("submission", {}).get("cluster_id")
@@ -379,6 +388,12 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 
     meta.add_row("Run ID", f"[bold]{run_dir.name}[/bold]")
     meta.add_row("Status", style_status(display_status))
+    hold_reasons = data.get("_hold_reasons") or []
+    if hold_reasons:
+        meta.add_row(
+            "Hold Reason",
+            f"[bold magenta]{' ; '.join(str(r) for r in hold_reasons)}[/bold magenta]",
+        )
     meta.add_row("HTCondor Cluster(s)", ", ".join(str(c) for c in cids) if cids else "—")
     submitted_fmt = str(sub.get("submitted_at", "—")).replace("T", " ")
     meta.add_row(
@@ -597,12 +612,82 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs stop`
 # ---------------------------------------------------------------------------
+def _stop_single_run(
+    run_dir: Path,
+    target_cids: List[int],
+    is_active_status: bool,
+) -> None:
+    repro_dir = run_dir / "repro"
+    rj_path = run_dir / "run.json"
+    any_removed = False
+    for cid in target_cids:
+        res = subprocess.run(
+            ["condor_rm", str(cid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode == 0:
+            any_removed = True
+            console.print(f"[bold green]✔ {res.stdout.strip()}[/bold green]")
+        else:
+            console.print(
+                f"[yellow]⚠ condor_rm {cid}: {(res.stderr or res.stdout).strip()}[/yellow]"
+            )
+
+    if any_removed or is_active_status:
+        locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": "ABORTED"}))
+        console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
+
+
 def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
+    if getattr(args, "all", False):
+        dirs = list_run_dirs(runs_root)
+        if not dirs:
+            console.print("[dim]No runs found.[/dim]")
+            return
+        live_clusters = query_live_condor_clusters()
+        active_targets: List[Tuple[Path, List[int], bool, str]] = []
+        for d in dirs:
+            raw_data = load_run_json(d)
+            if not run_needs_live_reconcile(raw_data):
+                continue
+            data = reconcile_run(d, raw_data, live_clusters)
+            st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+            cids = get_all_cluster_ids(data)
+            if not cids:
+                continue
+            is_act = st.startswith(("QUEUED", "RUNNING", "HELD"))
+            act_cids = [c for c in cids if live_clusters is None or c in live_clusters]
+            if act_cids or is_act:
+                active_targets.append((d, act_cids or cids, is_act, st))
+
+        if not active_targets:
+            console.print("[green]No active (QUEUED/RUNNING/HELD) runs found.[/green]")
+            return
+
+        for d, tcids, _, st in active_targets:
+            console.print(
+                f"  • [bold]{d.name}[/bold] ({style_status(st)} — cluster(s) {tcids})"
+            )
+        if not args.yes:
+            import questionary
+
+            if not questionary.confirm(
+                f"Abort all {len(active_targets)} active run(s)?",
+                default=True,
+                style=get_prompt_style(),
+            ).ask():
+                return
+
+        for d, tcids, is_act, _ in active_targets:
+            _stop_single_run(d, tcids, is_act)
+        return
+
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to stop (condor_rm):"
     )
-    repro_dir = run_dir / "repro"
-    rj_path = run_dir / "run.json"
     live_clusters = query_live_condor_clusters()
     data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
     status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
@@ -635,26 +720,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
         ).ask():
             return
 
-    any_removed = False
-    for cid in target_cids:
-        res = subprocess.run(
-            ["condor_rm", str(cid)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if res.returncode == 0:
-            any_removed = True
-            console.print(f"[bold green]✔ {res.stdout.strip()}[/bold green]")
-        else:
-            console.print(
-                f"[yellow]⚠ condor_rm {cid}: {(res.stderr or res.stdout).strip()}[/yellow]"
-            )
-
-    if any_removed or is_active_status:
-        locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": "ABORTED"}))
-        console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
+    _stop_single_run(run_dir, target_cids, is_active_status)
 
 
 # ---------------------------------------------------------------------------
@@ -1109,10 +1175,26 @@ def _diff_directories(dir_a: Path, dir_b: Path) -> str:
     return "\n".join(chunks)
 
 
+def _format_env_summary(data: Dict[str, Any]) -> str:
+    env_map = data.get("resources_requested", {}).get("env")
+    if isinstance(env_map, dict) and env_map:
+        return ", ".join(f"{k}={v}" for k, v in env_map.items())
+    return "—"
+
+
 def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
     dir_a = resolve_run_dir(runs_root, args.run_a, prompt_title="Select first run (A):")
     dir_b = resolve_run_dir(runs_root, args.run_b, prompt_title="Select second run (B):")
-    da, db = load_run_json(dir_a), load_run_json(dir_b)
+    raw_a, raw_b = load_run_json(dir_a), load_run_json(dir_b)
+    if run_needs_live_reconcile(raw_a) or run_needs_live_reconcile(raw_b):
+        live_clusters = query_live_condor_clusters()
+        da = reconcile_run(dir_a, raw_a, live_clusters) if run_needs_live_reconcile(raw_a) else raw_a
+        db = reconcile_run(dir_b, raw_b, live_clusters) if run_needs_live_reconcile(raw_b) else raw_b
+    else:
+        da, db = raw_a, raw_b
+
+    st_a = str(da.get("_live_badge") or da.get("status", "UNKNOWN"))
+    st_b = str(db.get("_live_badge") or db.get("status", "UNKNOWN"))
 
     t = Table(
         title="⚖️  Run Provenance Comparison",
@@ -1124,8 +1206,8 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
     t.add_column(f"Run A: {dir_a.name}", style="white")
     t.add_column(f"Run B: {dir_b.name}", style="white")
 
+    t.add_row("Status", style_status(st_a), style_status(st_b))
     fields = [
-        ("Status", da.get("status"), db.get("status")),
         (
             "Target",
             da.get("submission", {}).get("target"),
@@ -1143,8 +1225,8 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
         ),
         (
             "Env Exports",
-            str(da.get("resources_requested", {}).get("env") or "—"),
-            str(db.get("resources_requested", {}).get("env") or "—"),
+            _format_env_summary(da),
+            _format_env_summary(db),
         ),
         (
             "Git Commit",
@@ -1257,6 +1339,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stop = sub.add_parser("stop", aliases=["kill", "rm"], help="Abort active HTCondor job (condor_rm)")
     p_stop.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
+    p_stop.add_argument("-a", "--all", action="store_true", help="Abort all currently active runs")
     p_stop.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
     p_cln = sub.add_parser(

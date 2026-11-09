@@ -470,3 +470,46 @@ def test_tail_file_lines_o1_seek_and_diff_symlinks(tmp_path: Path) -> None:
     assert "+lr = 1e-4" in diff_out
     assert "[binary file:" in diff_out
 
+
+def test_hold_reason_surfacing_and_batch_stop_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    run_dir = tmp_path / "runs" / "2026-11-05_17-00-00_train_A100"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+    atomic_write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_dir.name,
+            "status": "QUEUED",
+            "submission": {"cluster_id": 505},
+            "resources_requested": {"architecture": "A100", "sweep_count": 1},
+            "executions": [],
+        },
+        repro_dir,
+    )
+
+    live_map = {
+        505: {
+            "total": 1,
+            "running": 0,
+            "idle": 0,
+            "held": 1,
+            "hold_reasons": ["Transfer input file dataset.tar not found"],
+        }
+    }
+    rec = reconcile_run(run_dir, load_run_json(run_dir), live_clusters=live_map)
+    assert rec["_live_badge"] == "HELD (1 held)"
+    assert rec["_hold_reasons"] == ["Transfer input file dataset.tar not found"]
+
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_map)
+    monkeypatch.setattr(
+        runs_cli.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(args=a[0], returncode=0, stdout="Cluster 505 removed", stderr=""),
+    )
+    args = argparse.Namespace(run=None, all=True, yes=True)
+    runs_cli.cmd_stop(args, tmp_path / "runs")
+    assert load_run_json(run_dir)["status"] == "ABORTED"
+

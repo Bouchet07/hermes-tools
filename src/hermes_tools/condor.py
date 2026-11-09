@@ -775,14 +775,14 @@ def get_all_cluster_ids(data: Dict[str, Any]) -> List[int]:
     return cids
 
 
-def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, int]]]:
+def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
     if not shutil.which("condor_q"):
         return None
     user = get_username()
     cmd = ["condor_q"]
     if user and user != "unknown":
         cmd.append(user)
-    cmd.extend(["-json", "-attributes", "ClusterId,ProcId,JobStatus"])
+    cmd.extend(["-json", "-attributes", "ClusterId,ProcId,JobStatus,HoldReason"])
     try:
         res = subprocess.run(
             cmd,
@@ -798,11 +798,14 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, int]]]:
         if not raw:
             return {}
         items = json.loads(raw)
-        clusters: Dict[int, Dict[str, int]] = {}
+        clusters: Dict[int, Dict[str, Any]] = {}
         for job in items:
             cid = int(job.get("ClusterId", -1))
             st = int(job.get("JobStatus", 0))  # 1=Idle, 2=Running, 5=Held
-            info = clusters.setdefault(cid, {"total": 0, "running": 0, "idle": 0, "held": 0})
+            info = clusters.setdefault(
+                cid,
+                {"total": 0, "running": 0, "idle": 0, "held": 0, "hold_reasons": []},
+            )
             info["total"] += 1
             if st == 2:
                 info["running"] += 1
@@ -810,6 +813,9 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, int]]]:
                 info["idle"] += 1
             elif st == 5:
                 info["held"] += 1
+                hr = str(job.get("HoldReason") or "").strip()
+                if hr and hr not in info["hold_reasons"]:
+                    info["hold_reasons"].append(hr)
         return clusters
     except Exception:
         return None
@@ -878,7 +884,7 @@ def run_needs_live_reconcile(data: Dict[str, Any]) -> bool:
 def reconcile_run(
     run_dir: Path,
     data: Dict[str, Any],
-    live_clusters: Optional[Dict[int, Dict[str, int]]],
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
 ) -> Dict[str, Any]:
     """Synchronizes `run.json` with `repro/node_*.json` and all live `condor_q` clusters."""
     status = str(data.get("status", "UNKNOWN"))
@@ -925,10 +931,17 @@ def reconcile_run(
                 repro_dir,
                 lambda d: set_execution_records(d, synced_execs),
             )
-        total_running = sum(live_clusters[c]["running"] for c in active_cids)
-        total_held = sum(live_clusters[c]["held"] for c in active_cids)
+        total_running = sum(int(live_clusters[c].get("running", 0)) for c in active_cids)
+        total_held = sum(int(live_clusters[c].get("held", 0)) for c in active_cids)
         if total_held > 0:
             data["_live_badge"] = f"HELD ({total_held} held)"
+            reasons: List[str] = []
+            for c in active_cids:
+                for hr in live_clusters[c].get("hold_reasons") or []:
+                    if hr and hr not in reasons:
+                        reasons.append(str(hr))
+            if reasons:
+                data["_hold_reasons"] = reasons
         elif total_running > 0:
             if sweep_count > 1:
                 done = len(get_execution_records(data))
