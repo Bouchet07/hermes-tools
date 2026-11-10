@@ -143,60 +143,13 @@ def _as_str_list(val: Any) -> List[str]:
     return []
 
 
-def main() -> None:
-    argv = sys.argv[1:]
-    passthrough_args = ""
-    if "--" in argv:
-        sep_idx = argv.index("--")
-        passthrough_list = argv[sep_idx + 1 :]
-        argv = argv[:sep_idx]
-        passthrough_args = " ".join(shlex.quote(x) for x in passthrough_list)
-
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
-    cwd = Path.cwd()
-    proj_cfg = load_project_config(cwd)
-
-    cfg_arch = str(proj_cfg.get("arch", "")).strip().upper() or None
-    if cfg_arch and cfg_arch not in ARCH_SPECS:
-        console.print(
-            f"[bold red]✘ Error:[/bold red] Invalid arch '{cfg_arch}' in project config (must be one of {list(ARCH_SPECS.keys())})."
-        )
-        sys.exit(1)
-
-    cpus_arg = args.cpus if args.cpus is not None else proj_cfg.get("cpus")
-    if cpus_arg is not None and int(cpus_arg) <= 0:
-        console.print("[bold red]✘ Error:[/bold red] --cpus must be a positive integer.")
-        sys.exit(1)
-
-    mem_arg = args.mem if args.mem is not None else proj_cfg.get("mem")
-    gpus_arg = args.gpus if args.gpus is not None else proj_cfg.get("gpus")
-    venv_arg = args.venv if args.venv is not None else proj_cfg.get("venv")
-    no_venv_flag = bool(args.no_venv or proj_cfg.get("no_venv", False))
-    project_code = args.project if args.project is not None else proj_cfg.get("project")
-    nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
-    nodes_exclude = list(args.exclude) or _as_str_list(proj_cfg.get("exclude"))
-    scratch_files = list(args.scratch) or _as_str_list(proj_cfg.get("scratch"))
-
-    env_vars: Dict[str, str] = {}
-    cfg_env = proj_cfg.get("env")
-    if isinstance(cfg_env, dict):
-        for k, v in cfg_env.items():
-            if k and v is not None:
-                env_vars[str(k).strip()] = str(v)
-    for item in args.env:
-        if "=" not in item:
-            console.print(
-                f"[bold red]✘ Error:[/bold red] Invalid --env '{item}' (expected KEY=VALUE)."
-            )
-            sys.exit(1)
-        k, v = item.split("=", 1)
-        env_vars[k.strip()] = v
-
+def _resolve_target_and_venv(
+    args: argparse.Namespace,
+    proj_cfg: Dict[str, Any],
+    cwd: Path,
+) -> tuple[Path, str, Optional[Path], bool, bool, bool]:
+    """Resolves the target executable and virtual environment, returning (target_path, exec_type, venv_path, explicit_venv_used, no_venv_flag, interactive_mode)."""
     interactive_mode = False
-
-    # 1. Resolve Target File
     target_str = args.target or proj_cfg.get("target")
     if not target_str:
         import questionary
@@ -244,7 +197,8 @@ def main() -> None:
         else ("bash" if target_path.suffix == ".sh" else "binary")
     )
 
-    # 2. Discover Virtual Environment
+    venv_arg = args.venv if args.venv is not None else proj_cfg.get("venv")
+    no_venv_flag = bool(args.no_venv or proj_cfg.get("no_venv", False))
     venv_path: Optional[Path] = None
     explicit_venv_used = bool(venv_arg)
     if not no_venv_flag:
@@ -266,7 +220,30 @@ def main() -> None:
                     venv_path = discover_project_venv(cwd, custom_venv.strip())
                     explicit_venv_used = True
 
-    # 3. Resolve Architecture & Hardware Resources
+    return target_path, exec_type, venv_path, explicit_venv_used, no_venv_flag, interactive_mode
+
+
+def _resolve_hardware_resources(
+    args: argparse.Namespace,
+    proj_cfg: Dict[str, Any],
+    interactive_mode: bool,
+) -> tuple[str, Optional[int], Optional[int], Optional[int], bool]:
+    """Resolves architecture, CPUs, RAM (MB), and GPUs, returning (arch, cpus, mem_mb, gpus, interactive_mode)."""
+    cfg_arch = str(proj_cfg.get("arch", "")).strip().upper() or None
+    if cfg_arch and cfg_arch not in ARCH_SPECS:
+        console.print(
+            f"[bold red]✘ Error:[/bold red] Invalid arch '{cfg_arch}' in project config (must be one of {list(ARCH_SPECS.keys())})."
+        )
+        sys.exit(1)
+
+    cpus_arg = args.cpus if args.cpus is not None else proj_cfg.get("cpus")
+    if cpus_arg is not None and int(cpus_arg) <= 0:
+        console.print("[bold red]✘ Error:[/bold red] --cpus must be a positive integer.")
+        sys.exit(1)
+
+    mem_arg = args.mem if args.mem is not None else proj_cfg.get("mem")
+    gpus_arg = args.gpus if args.gpus is not None else proj_cfg.get("gpus")
+
     arch = args.arch or (cfg_arch if not interactive_mode else None)
     if not arch:
         import questionary
@@ -385,7 +362,16 @@ def main() -> None:
             else:
                 mem_mb = 8192
 
-    # 4. Resolve Arguments, Sweeps & Tag
+    return arch, cpus, mem_mb, gpus, interactive_mode
+
+
+def _resolve_sweeps_and_tag(
+    args: argparse.Namespace,
+    proj_cfg: Dict[str, Any],
+    passthrough_args: str,
+    interactive_mode: bool,
+) -> tuple[str, List[str], List[str], str]:
+    """Resolves single/sweep arguments and run tag, returning (combined_single_args, sweep_list, cli_sweep_specs, tag)."""
     combined_single_args = " ".join(
         x for x in [args.args.strip(), passthrough_args.strip()] if x
     ).strip()
@@ -448,53 +434,25 @@ def main() -> None:
             sys.exit(0)
         raw_tag = ans_tag.strip()
 
-    tag = sanitize_tag(raw_tag)
+    return combined_single_args, sweep_list, cli_sweep_specs, sanitize_tag(raw_tag)
 
-    # 5. Build Reproducible CLI String
-    rel_target = (
-        target_path.relative_to(cwd).as_posix()
-        if target_path.is_relative_to(cwd)
-        else target_path.as_posix()
-    )
-    base_tokens = build_send_command_tokens(
-        send_bin="send",
-        target=rel_target,
-        arch=arch,
-        cpus=cpus,
-        mem_mb=mem_mb,
-        gpus=gpus,
-        tag=tag or None,
-        no_venv=no_venv_flag,
-        venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
-        nodes_include=nodes_include,
-        nodes_exclude=nodes_exclude,
-        project_code=str(project_code) if project_code else None,
-        scratch_files=scratch_files,
-        env_items=list(args.env),
-        sweep_file=str(args.sweep_file) if args.sweep_file else None,
-        sweep_specs=cli_sweep_specs,
-    )
-    cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
-    if len(sweep_list) > 1:
-        if combined_single_args:
-            cli_parts.extend(["--", combined_single_args])
-    elif sweep_list and sweep_list[0] and not cli_sweep_specs and not args.sweep_file:
-        cli_parts.extend(["--", sweep_list[0]])
 
-    equivalent_cli = " ".join(cli_parts)
-
-    # 6. Prepare Paths & Display Summary Panel
-    now = datetime.datetime.now()
-    submit_epoch = int(now.timestamp())
-    ts_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-    safe_tag = f"_{tag}" if tag else ""
-    run_id = f"{ts_str}_{target_path.stem}_{arch}{safe_tag}"
-    runs_root = (cwd / "runs").resolve()
-    run_dir = runs_root / run_id
-    repro_dir = run_dir / "repro"
-
-    git_info = get_git_info(cwd)
-
+def _render_submission_summary(
+    *,
+    rel_target: str,
+    exec_type: str,
+    cwd: Path,
+    run_id: str,
+    venv_path: Optional[Path],
+    arch: str,
+    cpus: Optional[int],
+    mem_mb: Optional[int],
+    gpus: Optional[int],
+    sweep_list: List[str],
+    git_info: Dict[str, object],
+    env_vars: Dict[str, str],
+    equivalent_cli: str,
+) -> None:
     summary_table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     summary_table.add_column("Property", style="bold cyan", width=20)
     summary_table.add_column("Value", style="white")
@@ -563,6 +521,118 @@ def main() -> None:
             border_style="cyan",
             expand=False,
         )
+    )
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    passthrough_args = ""
+    if "--" in argv:
+        sep_idx = argv.index("--")
+        passthrough_list = argv[sep_idx + 1 :]
+        argv = argv[:sep_idx]
+        passthrough_args = " ".join(shlex.quote(x) for x in passthrough_list)
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    cwd = Path.cwd()
+    proj_cfg = load_project_config(cwd)
+
+    project_code = args.project if args.project is not None else proj_cfg.get("project")
+    nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
+    nodes_exclude = list(args.exclude) or _as_str_list(proj_cfg.get("exclude"))
+    scratch_files = list(args.scratch) or _as_str_list(proj_cfg.get("scratch"))
+
+    env_vars: Dict[str, str] = {}
+    cfg_env = proj_cfg.get("env")
+    if isinstance(cfg_env, dict):
+        for k, v in cfg_env.items():
+            if k and v is not None:
+                env_vars[str(k).strip()] = str(v)
+    for item in args.env:
+        if "=" not in item:
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Invalid --env '{item}' (expected KEY=VALUE)."
+            )
+            sys.exit(1)
+        k, v = item.split("=", 1)
+        env_vars[k.strip()] = v
+
+    (
+        target_path,
+        exec_type,
+        venv_path,
+        explicit_venv_used,
+        no_venv_flag,
+        interactive_mode,
+    ) = _resolve_target_and_venv(args, proj_cfg, cwd)
+
+    arch, cpus, mem_mb, gpus, interactive_mode = _resolve_hardware_resources(
+        args, proj_cfg, interactive_mode
+    )
+
+    combined_single_args, sweep_list, cli_sweep_specs, tag = _resolve_sweeps_and_tag(
+        args, proj_cfg, passthrough_args, interactive_mode
+    )
+
+    rel_target = (
+        target_path.relative_to(cwd).as_posix()
+        if target_path.is_relative_to(cwd)
+        else target_path.as_posix()
+    )
+    base_tokens = build_send_command_tokens(
+        send_bin="send",
+        target=rel_target,
+        arch=arch,
+        cpus=cpus,
+        mem_mb=mem_mb,
+        gpus=gpus,
+        tag=tag or None,
+        no_venv=no_venv_flag,
+        venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
+        nodes_include=nodes_include,
+        nodes_exclude=nodes_exclude,
+        project_code=str(project_code) if project_code else None,
+        scratch_files=scratch_files,
+        env_items=list(args.env),
+        sweep_file=str(args.sweep_file) if args.sweep_file else None,
+        sweep_specs=cli_sweep_specs,
+    )
+    cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
+    if len(sweep_list) > 1:
+        if combined_single_args:
+            cli_parts.extend(["--", combined_single_args])
+    elif sweep_list and sweep_list[0] and not cli_sweep_specs and not args.sweep_file:
+        cli_parts.extend(["--", sweep_list[0]])
+
+    equivalent_cli = " ".join(cli_parts)
+
+    now = datetime.datetime.now()
+    submit_epoch = int(now.timestamp())
+    ts_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+    safe_tag = f"_{tag}" if tag else ""
+    run_id = f"{ts_str}_{target_path.stem}_{arch}{safe_tag}"
+    runs_root = (cwd / "runs").resolve()
+    run_dir = runs_root / run_id
+    repro_dir = run_dir / "repro"
+
+    git_info = get_git_info(cwd)
+
+    _render_submission_summary(
+        rel_target=rel_target,
+        exec_type=exec_type,
+        cwd=cwd,
+        run_id=run_id,
+        venv_path=venv_path,
+        arch=arch,
+        cpus=cpus,
+        mem_mb=mem_mb,
+        gpus=gpus,
+        sweep_list=sweep_list,
+        git_info=git_info,
+        env_vars=env_vars,
+        equivalent_cli=equivalent_cli,
     )
 
     if not args.yes and not args.dry_run:
