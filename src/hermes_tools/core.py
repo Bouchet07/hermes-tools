@@ -401,22 +401,36 @@ def set_execution_records(data: Dict[str, Any], records: List[Dict[str, Any]]) -
 def summarize_metrics(data: Dict[str, Any]) -> Tuple[str, str, str]:
     """Returns (host_summary, runtime_summary, peak_ram_summary) across single or sweep runs."""
     records = get_execution_records(data)
-    if not records:
+    live_hosts = [str(h).split(".")[0] for h in (data.get("_live_hosts") or []) if h]
+    live_rt = int(data.get("_live_runtime_sec") or 0)
+    live_ram = float(data.get("_live_ram_mb") or 0.0)
+
+    if not records and not live_hosts and live_rt <= 0 and live_ram <= 0:
         return "—", "—", "—"
 
-    hosts = sorted({r.get("hostname", "").split(".")[0] for r in records if r.get("hostname")})
+    hosts = sorted(
+        {r.get("hostname", "").split(".")[0] for r in records if r.get("hostname")}
+        | set(live_hosts)
+    )
     host_str = ", ".join(hosts[:2]) + (f" (+{len(hosts) - 2})" if len(hosts) > 2 else "")
     if not host_str:
         host_str = "—"
 
-    max_dur = max((int(r.get("runtime_seconds", 0) or 0) for r in records), default=0)
-    max_ram = max((float(r.get("peak_ram_mb", 0.0) or 0.0) for r in records), default=0.0)
+    max_dur = max(
+        max((int(r.get("runtime_seconds", 0) or 0) for r in records), default=0),
+        live_rt,
+    )
+    max_ram = max(
+        max((float(r.get("peak_ram_mb", 0.0) or 0.0) for r in records), default=0.0),
+        live_ram,
+    )
     ram_str = (
         f"{max_ram / 1024:.2f} GB"
         if max_ram >= 1024
         else (f"{max_ram:.0f} MB" if max_ram > 0 else "—")
     )
-    return host_str, format_duration(max_dur), ram_str
+    dur_str = format_duration(max_dur) if (records or max_dur > 0) else "—"
+    return host_str, dur_str, ram_str
 
 
 def _expand_single_brace_expr(expr: str) -> List[str]:

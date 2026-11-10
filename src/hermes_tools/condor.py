@@ -811,11 +811,21 @@ def get_all_cluster_ids(data: Dict[str, Any]) -> List[int]:
 def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
     if not shutil.which("condor_q"):
         return None
+    import time as _time
+
     user = get_username()
     cmd = ["condor_q"]
     if user and user != "unknown":
         cmd.append(user)
-    cmd.extend(["-json", "-attributes", "ClusterId,ProcId,JobStatus,HoldReason"])
+    cmd.extend(
+        [
+            "-json",
+            "-attributes",
+            "ClusterId,ProcId,JobStatus,HoldReason,RemoteHost,"
+            "JobCurrentStartExecutingDate,JobCurrentStartDate,EnteredCurrentStatus,"
+            "ServerTime,MemoryUsage,ResidentSetSize",
+        ]
+    )
     try:
         res = subprocess.run(
             cmd,
@@ -831,17 +841,50 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
         if not raw:
             return {}
         items = json.loads(raw)
+        now_fallback = int(_time.time())
         clusters: Dict[int, Dict[str, Any]] = {}
         for job in items:
             cid = int(job.get("ClusterId", -1))
             st = int(job.get("JobStatus", 0))  # 1=Idle, 2=Running, 5=Held
             info = clusters.setdefault(
                 cid,
-                {"total": 0, "running": 0, "idle": 0, "held": 0, "hold_reasons": []},
+                {
+                    "total": 0,
+                    "running": 0,
+                    "idle": 0,
+                    "held": 0,
+                    "hold_reasons": [],
+                    "hosts": [],
+                    "max_runtime_sec": 0,
+                    "max_ram_mb": 0.0,
+                },
             )
             info["total"] += 1
             if st == 2:
                 info["running"] += 1
+                raw_host = str(job.get("RemoteHost") or "").strip()
+                if raw_host:
+                    host_part = raw_host.split("@")[-1].split(".")[0]
+                    if host_part and host_part not in info["hosts"]:
+                        info["hosts"].append(host_part)
+                start_ts = int(
+                    job.get("JobCurrentStartExecutingDate")
+                    or job.get("JobCurrentStartDate")
+                    or job.get("EnteredCurrentStatus")
+                    or 0
+                )
+                srv_now = int(job.get("ServerTime") or now_fallback)
+                if start_ts > 0 and srv_now >= start_ts:
+                    info["max_runtime_sec"] = max(int(info["max_runtime_sec"]), srv_now - start_ts)
+                mem_mb = job.get("MemoryUsage")
+                rss_kb = job.get("ResidentSetSize")
+                live_mb = 0.0
+                if isinstance(mem_mb, (int, float)) and mem_mb > 0:
+                    live_mb = float(mem_mb)
+                elif isinstance(rss_kb, (int, float)) and rss_kb > 0:
+                    live_mb = float(rss_kb) / 1024.0
+                if live_mb > 0:
+                    info["max_ram_mb"] = max(float(info["max_ram_mb"]), live_mb)
             elif st == 1:
                 info["idle"] += 1
             elif st == 5:
@@ -996,6 +1039,25 @@ def reconcile_run(
                 )
             else:
                 data["_live_badge"] = "RUNNING"
+            live_hosts: List[str] = []
+            for c in active_cids:
+                for h in live_clusters[c].get("hosts") or []:
+                    if h and h not in live_hosts:
+                        live_hosts.append(str(h))
+            if live_hosts:
+                data["_live_hosts"] = live_hosts
+            max_rt = max(
+                (int(live_clusters[c].get("max_runtime_sec") or 0) for c in active_cids),
+                default=0,
+            )
+            if max_rt > 0:
+                data["_live_runtime_sec"] = max_rt
+            max_ram = max(
+                (float(live_clusters[c].get("max_ram_mb") or 0.0) for c in active_cids),
+                default=0.0,
+            )
+            if max_ram > 0:
+                data["_live_ram_mb"] = max_ram
         else:
             data["_live_badge"] = "QUEUED"
         return data

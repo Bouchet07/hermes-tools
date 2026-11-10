@@ -985,6 +985,32 @@ nv3090-09.i3a.es
     assert p_lxc["elapsed"] == "04:00"  # (10050000 - 10026000) / 100 = 240s = 04:00
     assert p_lxc["cpu_pct"] == 50.0  # (9000 + 3000) / 24000 * 100 = 50.0%
 
+    # Verify live Host(s), Wall Time, and RAM for RUNNING runs in `runs ls` / `summarize_metrics`
+    from hermes_tools.condor import reconcile_run
+    from hermes_tools.core import summarize_metrics
+
+    rec_data = reconcile_run(
+        rd,
+        json.loads((rd / "run.json").read_text(encoding="utf-8")),
+        {
+            1074510: {
+                "total": 1,
+                "running": 1,
+                "idle": 0,
+                "held": 0,
+                "hold_reasons": [],
+                "hosts": ["nv3090-09"],
+                "max_runtime_sec": 754,
+                "max_ram_mb": 2048.0,
+            }
+        },
+    )
+    host_s, dur_s, ram_s = summarize_metrics(rec_data)
+    assert host_s == "nv3090-09"
+    assert dur_s == "12m 34s"
+    assert ram_s == "2.00 GB"
+
+
 
 
 
