@@ -38,6 +38,7 @@ from hermes_tools.core import (
     get_execution_records,
     get_prompt_style,
     get_runs_root,
+    get_username,
     list_run_dirs,
     load_run_json,
     locked_mutate_run_json,
@@ -1232,25 +1233,70 @@ def _format_free_total(free: int, total: int, unit: str = "") -> str:
     return f"[dim]0/{total}{sfx}[/dim]"
 
 
+def _format_users_cell(users_map: Dict[str, int], current_user: str) -> str:
+    if not users_map:
+        return "[dim]—[/dim]"
+    parts: List[str] = []
+    for u, cnt in sorted(users_map.items(), key=lambda kv: (-kv[1], kv[0])):
+        label = f"{u}({cnt})" if cnt > 1 else u
+        if current_user and u.lower() == current_user.lower():
+            parts.append(f"[bold cyan]{label}[/bold cyan]")
+        else:
+            parts.append(label)
+    return ", ".join(parts)
+
+
+def _resolve_target_user_filter(args: argparse.Namespace, current_user: str) -> str:
+    if getattr(args, "mine", False):
+        return current_user
+    raw_u = getattr(args, "user", None)
+    if raw_u == "__ME__":
+        return current_user
+    return str(raw_u or "").strip()
+
+
+def _node_matches_user(node: Dict[str, Any], target_user: str) -> bool:
+    if not target_user:
+        return True
+    needle = target_user.lower()
+    users_map = node.get("users", {}) or {}
+    return any(needle in u.lower() for u in users_map)
+
+
 def _build_nodes_view(
     args: argparse.Namespace,
     nodes: List[Dict[str, Any]],
 ) -> Tuple[Any, Tuple[Tuple[str, ...], ...]]:
     from rich.console import Group
 
+    current_user = get_username()
     arch_filter = (getattr(args, "arch", None) or "").strip().upper()
+    node_filter = (getattr(args, "node", None) or "").strip().lower()
+    user_filter = _resolve_target_user_filter(args, current_user)
     free_only = bool(getattr(args, "free", False))
+    busy_only = bool(getattr(args, "busy", False))
+    detail_mode = bool(getattr(args, "detail", False))
 
     filtered = [
         n
         for n in nodes
-        if (not arch_filter or str(n["arch"]).upper() == arch_filter)
+        if (not arch_filter or arch_filter in str(n["arch"]).upper())
+        and (
+            not node_filter
+            or node_filter in str(n["host"]).lower()
+            or node_filter in str(n["machine"]).lower()
+        )
         and (not free_only or n["state"] in ("FREE", "MIXED"))
+        and (not busy_only or n["state"] in ("BUSY", "MIXED") or int(n.get("active_jobs", 0)) > 0)
+        and _node_matches_user(n, user_filter)
     ]
 
-    pool_map = summarize_condor_pools(
-        [n for n in nodes if not arch_filter or str(n["arch"]).upper() == arch_filter]
+    pool_source = (
+        filtered
+        if (node_filter or user_filter or busy_only)
+        else [n for n in nodes if not arch_filter or arch_filter in str(n["arch"]).upper()]
     )
+    pool_map = summarize_condor_pools(pool_source)
 
     pool_table = Table(
         title="🖥️  Hermes 2 Architecture Pools (Free / Total)",
@@ -1265,6 +1311,7 @@ def _build_nodes_view(
     pool_table.add_column("CPUs", justify="right", no_wrap=True)
     pool_table.add_column("RAM (GB)", justify="right", no_wrap=True)
     pool_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+    pool_table.add_column("Users")
 
     sig_rows: List[Tuple[str, ...]] = []
     for arch, p in pool_map.items():
@@ -1293,6 +1340,7 @@ def _build_nodes_view(
             if p["mem_total_mb"] > 0
             else "[dim]—[/dim]",
             str(p["active_jobs"]),
+            _format_users_cell(p.get("users", {}), current_user),
         )
         pool_table.add_row(*p_row)
         sig_rows.append(p_row)
@@ -1310,11 +1358,15 @@ def _build_nodes_view(
     node_table.add_column("CPUs", justify="right", no_wrap=True)
     node_table.add_column("RAM (GB)", justify="right", no_wrap=True)
     node_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+    node_table.add_column("Users", no_wrap=True)
+    if detail_mode:
+        node_table.add_column("Load", justify="right", no_wrap=True)
+        node_table.add_column("GPU / Disk", style="dim", no_wrap=True)
 
     for n in filtered:
         mem_tot_gb = round(int(n["mem_total_mb"]) / 1024)
         mem_free_gb = round(int(n["mem_free_mb"]) / 1024)
-        n_row = (
+        base_cols: List[str] = [
             str(n["host"]),
             str(n["arch"]),
             _style_node_state(str(n["state"])),
@@ -1324,22 +1376,94 @@ def _build_nodes_view(
             if int(n["mem_total_mb"]) > 0
             else "[dim]—[/dim]",
             str(n["active_jobs"]),
-        )
+            _format_users_cell(n.get("users", {}), current_user),
+        ]
+        if detail_mode:
+            load_val = n.get("load_avg")
+            disk_val = n.get("disk_free_gb")
+            gpu_model = str(n.get("gpu_model") or "")
+            hw_parts: List[str] = []
+            if gpu_model:
+                hw_parts.append(gpu_model)
+            if isinstance(disk_val, (int, float)) and disk_val > 0:
+                hw_parts.append(f"{disk_val:.0f}G free")
+            base_cols.extend(
+                [
+                    f"{load_val:.2f}" if isinstance(load_val, (int, float)) else "[dim]—[/dim]",
+                    " · ".join(hw_parts) if hw_parts else "[dim]—[/dim]",
+                ]
+            )
+        n_row = tuple(base_cols)
         node_table.add_row(*n_row)
         sig_rows.append(n_row)
 
-    return Group(pool_table, node_table), tuple(sig_rows)
+    renderables: List[Any] = [pool_table, node_table]
+
+    if detail_mode or user_filter:
+        claims_list: List[Dict[str, Any]] = []
+        for n in filtered:
+            for c in n.get("claims", []):
+                if not user_filter or user_filter.lower() in str(c.get("user", "")).lower():
+                    claims_list.append(c)
+
+        if claims_list or detail_mode:
+            claims_table = Table(
+                title="⚡ Active Slot Claims & Running Jobs",
+                title_style="bold cyan",
+                box=box.ROUNDED,
+                header_style="bold cyan",
+            )
+            claims_table.add_column("Node", style="bold white", no_wrap=True)
+            claims_table.add_column("Pool", style="magenta", no_wrap=True)
+            claims_table.add_column("Slot", style="dim", no_wrap=True)
+            claims_table.add_column("User", no_wrap=True)
+            claims_table.add_column("Job", style="cyan", no_wrap=True)
+            claims_table.add_column("GPUs", justify="right", no_wrap=True)
+            claims_table.add_column("CPUs", justify="right", no_wrap=True)
+            claims_table.add_column("RAM", justify="right", no_wrap=True)
+            claims_table.add_column("Runtime", justify="right", style="green", no_wrap=True)
+
+            for c in claims_list:
+                u_str = str(c.get("user") or "—")
+                if current_user and u_str.lower() == current_user.lower():
+                    u_cell = f"[bold cyan]{u_str}[/bold cyan]"
+                else:
+                    u_cell = u_str
+                rt_sec = c.get("runtime_seconds")
+                rt_str = format_duration(rt_sec) if isinstance(rt_sec, (int, float)) else "[dim]—[/dim]"
+                mem_gb = round(int(c.get("mem_mb", 0)) / 1024, 1)
+                slot_str = str(c.get("slot", "—"))
+                if slot_str.startswith("slot"):
+                    slot_str = slot_str[4:] or slot_str
+                c_row = (
+                    str(c.get("host", "—")),
+                    str(c.get("arch", "—")),
+                    slot_str,
+                    u_cell,
+                    str(c.get("job_id") or "—"),
+                    str(c.get("gpus", 0)),
+                    str(c.get("cpus", 0)),
+                    f"{mem_gb:g}G" if mem_gb > 0 else "[dim]—[/dim]",
+                    rt_str,
+                )
+                claims_table.add_row(*c_row)
+                sig_rows.append(c_row)
+
+            renderables.append(claims_table)
+
+    return Group(*renderables), tuple(sig_rows)
 
 
 def cmd_nodes(args: argparse.Namespace) -> None:
-    nodes = query_condor_nodes()
+    constraint = getattr(args, "where", None)
+    nodes = query_condor_nodes(constraint=constraint)
     if nodes is None:
         console.print(
             "[yellow]⚠ 'condor_status' is not available or returned an error (are you on hermes2?).[/yellow]"
         )
         sys.exit(1)
     if not nodes:
-        console.print("[dim]No worker nodes reported by condor_status.[/dim]")
+        console.print("[dim]No worker nodes matched the query in condor_status.[/dim]")
         return
 
     if getattr(args, "watch", False):
@@ -1351,7 +1475,7 @@ def cmd_nodes(args: argparse.Namespace) -> None:
             with Live(initial_view, console=console, auto_refresh=False) as live:
                 while True:
                     time.sleep(interval)
-                    fresh_nodes = query_condor_nodes()
+                    fresh_nodes = query_condor_nodes(constraint=constraint)
                     if fresh_nodes is None:
                         continue
                     new_view, new_sig = _build_nodes_view(args, fresh_nodes)
@@ -1466,13 +1590,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_nodes = sub.add_parser(
         "nodes",
         aliases=["cluster", "pools"],
-        help="Show live Hermes 2 architecture pool and worker node availability (condor_status)",
+        help="Show live Hermes 2 architecture pool, worker node, and slot claim status (condor_status)",
     )
     p_nodes.add_argument(
         "-a", "--arch", type=str, help="Filter by architecture pool (e.g. GPU3090, A100, AMD)"
     )
     p_nodes.add_argument(
+        "-n", "--node", type=str, help="Filter by node hostname substring (e.g. 3090, her07)"
+    )
+    p_nodes.add_argument(
+        "-u",
+        "--user",
+        nargs="?",
+        const="__ME__",
+        help="Filter by active RemoteUser (defaults to your username if given without value)",
+    )
+    p_nodes.add_argument(
+        "-m", "--mine", action="store_true", help="Show only nodes and slot claims running your jobs"
+    )
+    p_nodes.add_argument(
         "-f", "--free", action="store_true", help="Show only nodes with free GPUs/CPUs"
+    )
+    p_nodes.add_argument(
+        "-b", "--busy", action="store_true", help="Show only busy/claimed nodes"
+    )
+    p_nodes.add_argument(
+        "-d",
+        "--detail",
+        "--slots",
+        dest="detail",
+        action="store_true",
+        help="Show hardware load, GPU model, disk, and per-slot active job claims",
+    )
+    p_nodes.add_argument(
+        "--where",
+        type=str,
+        help="Pass a custom HTCondor ClassAd -constraint expression to condor_status",
     )
     p_nodes.add_argument(
         "-w", "--watch", action="store_true", help="Live-refresh cluster availability"

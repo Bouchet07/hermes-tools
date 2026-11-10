@@ -618,12 +618,22 @@ def test_parse_condor_status_ads_and_runs_nodes(
         },
         {
             "Machine": "nv3090-02.i3a.es",
+            "Name": "slot1_1@nv3090-02.i3a.es",
             "SlotType": "Dynamic",
             "State": "Claimed",
+            "Activity": "Busy",
             "Architecture": "GPU3090",
             "Cpus": 1,
             "Memory": 8000,
             "GPUs": 1,
+            "RemoteUser": "diego@i3a.es",
+            "JobId": "1402.0",
+            "EnteredCurrentActivity": 1000,
+            "MyCurrentTime": 4660,
+            "CUDADeviceName": "NVIDIA GeForce RTX 3090",
+            "CUDAGlobalMemoryMb": 24576,
+            "TotalLoadAvg": 4.25,
+            "Disk": 500 * 1024 * 1024,
         },
         # Node 3: Mixed A100 (2 GPUs free, 2 GPUs claimed)
         {
@@ -637,15 +647,22 @@ def test_parse_condor_status_ads_and_runs_nodes(
             "TotalSlotMemory": 512000,
             "GPUs": 2,
             "TotalSlotGPUs": 4,
+            "CUDADeviceName": "NVIDIA A100-SXM4-40GB",
         },
         {
             "Machine": "nv-a100-01.i3a.es",
+            "Name": "slot1_1@nv-a100-01.i3a.es",
             "SlotType": "Dynamic",
             "State": "Claimed",
+            "Activity": "Busy",
             "Architecture": "A100",
             "Cpus": 64,
             "Memory": 256000,
             "GPUs": 2,
+            "RemoteUser": "alice@i3a.es",
+            "JobId": "1550.3",
+            "EnteredCurrentActivity": 2000,
+            "MyCurrentTime": 2600,
         },
     ]
 
@@ -657,22 +674,62 @@ def test_parse_condor_status_ads_and_runs_nodes(
     assert by_host["nv3090-02"]["state"] == "BUSY"
     assert by_host["nv3090-02"]["gpus_free"] == 0
     assert by_host["nv3090-02"]["cpus_free"] == 0  # GPU3090 full-node lock zeroes free CPUs when busy
+    assert by_host["nv3090-02"]["users"] == {"diego": 1}
+    assert by_host["nv3090-02"]["claims"][0]["job_id"] == "1402.0"
+    assert by_host["nv3090-02"]["claims"][0]["runtime_seconds"] == 3660.0
+    assert "RTX 3090" in by_host["nv3090-02"]["gpu_model"]
     assert by_host["nv-a100-01"]["state"] == "MIXED"
     assert by_host["nv-a100-01"]["gpus_free"] == 2
     assert by_host["nv-a100-01"]["gpus_total"] == 4
+    assert by_host["nv-a100-01"]["users"] == {"alice": 1}
 
     pools = summarize_condor_pools(nodes)
     assert pools["GPU3090"]["gpus_free"] == 1
     assert pools["GPU3090"]["gpus_total"] == 2
+    assert pools["GPU3090"]["users"] == {"diego": 1}
     assert pools["A100"]["gpus_free"] == 2
     assert pools["A100"]["gpus_total"] == 4
+    assert pools["A100"]["users"] == {"alice": 1}
 
-    monkeypatch.setattr(runs_cli, "query_condor_nodes", lambda: nodes)
-    args = argparse.Namespace(arch=None, free=False, watch=False, interval=2)
+    monkeypatch.setattr(runs_cli, "query_condor_nodes", lambda constraint=None: nodes)
+    args = argparse.Namespace(
+        arch=None,
+        node=None,
+        user=None,
+        mine=False,
+        free=False,
+        busy=False,
+        detail=False,
+        where=None,
+        watch=False,
+        interval=2,
+    )
     runs_cli.cmd_nodes(args)
     out = capsys.readouterr().out
     assert "GPU3090" in out
     assert "A100" in out
     assert "nv3090-01" in out
     assert "nv-a100-01" in out
+    assert "diego" in out
+    assert "alice" in out
+
+    # Detail mode + user filter
+    detail_args = argparse.Namespace(
+        arch=None,
+        node=None,
+        user="diego",
+        mine=False,
+        free=False,
+        busy=False,
+        detail=True,
+        where=None,
+        watch=False,
+        interval=2,
+    )
+    runs_cli.cmd_nodes(detail_args)
+    detail_out = capsys.readouterr().out
+    assert "Active Slot Claims" in detail_out
+    assert "1402.0" in detail_out
+    assert "1h 01m" in detail_out
+    assert "nv-a100-01" not in detail_out
 

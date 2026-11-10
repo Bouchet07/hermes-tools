@@ -1088,11 +1088,51 @@ def _count_assigned_gpus(val: Any) -> int:
     return 0
 
 
-def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _clean_condor_user(raw_user: Any) -> str:
+    s = str(raw_user or "").strip()
+    if not s or s.lower() in ("none", "undefined"):
+        return ""
+    return s.split("@")[0]
+
+
+def _extract_gpu_model(ad: Dict[str, Any]) -> str:
+    raw_name = str(
+        ad.get("CUDADeviceName")
+        or ad.get("GPUs_DeviceName")
+        or ad.get("CUDA0DeviceName")
+        or ""
+    ).strip()
+    if not raw_name or raw_name.lower() in ("none", "undefined"):
+        return ""
+    short = (
+        raw_name.replace("NVIDIA GeForce ", "")
+        .replace("NVIDIA ", "")
+        .replace("Tesla ", "")
+        .strip()
+    )
+    vram_mb = int(
+        ad.get("CUDAGlobalMemoryMb")
+        or ad.get("GPUs_GlobalMemoryMb")
+        or ad.get("CUDA0GlobalMemoryMb")
+        or 0
+    )
+    if vram_mb > 0:
+        vram_gb = round(vram_mb / 1024)
+        if f"{vram_gb}GB" not in short.upper():
+            return f"{short} ({vram_gb}GB)"
+    return short
+
+
+def parse_condor_status_ads(
+    items: List[Dict[str, Any]], now_epoch: Optional[int] = None
+) -> List[Dict[str, Any]]:
     """
-    Aggregates raw `condor_status -json` slot ClassAds into per-machine hardware
-    availability records, handling both Partitionable+Dynamic slots and Static slots.
+    Aggregates raw `condor_status -json` slot ClassAds into per-machine hardware,
+    user, and active-claim records, handling both Partitionable+Dynamic and Static slots.
     """
+    import time as _time
+
+    ref_now = int(now_epoch if now_epoch is not None else _time.time())
     by_machine: Dict[str, List[Dict[str, Any]]] = {}
     for ad in items:
         if not isinstance(ad, dict):
@@ -1108,10 +1148,13 @@ def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for machine, ads in by_machine.items():
         host = machine.split(".")[0]
         arch = "AMD"
+        gpu_model = ""
         for ad in ads:
             cand = _infer_node_arch(ad, host)
             if cand != "AMD" or arch == "AMD":
                 arch = cand
+            if not gpu_model:
+                gpu_model = _extract_gpu_model(ad)
 
         cpus_free = 0
         cpus_used = 0
@@ -1125,12 +1168,20 @@ def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         gpus_used = 0
         gpus_rep_total = 0
 
+        disk_free_kb = 0
+        load_avg = 0.0
+        sum_slot_load = 0.0
+
         active_jobs = 0
         draining = False
+        users_count: Dict[str, int] = {}
+        claims: List[Dict[str, Any]] = []
 
         for ad in ads:
             state = str(ad.get("State") or "").strip()
             slot_type = str(ad.get("SlotType") or "").strip()
+            slot_raw_name = str(ad.get("Name") or "").strip()
+            slot_short = slot_raw_name.split("@")[0] if "@" in slot_raw_name else (slot_raw_name or "slot")
             is_draining = bool(ad.get("Draining")) or state == "Drained"
             if is_draining:
                 draining = True
@@ -1151,16 +1202,51 @@ def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 cpus_rep_total = max(cpus_rep_total, tc)
                 mem_rep_total = max(mem_rep_total, tm)
                 gpus_rep_total = max(gpus_rep_total, tg)
+            disk_free_kb = max(disk_free_kb, int(ad.get("Disk") or 0))
+
+            tot_load = ad.get("TotalLoadAvg") or ad.get("TotalCondorLoadAvg")
+            if tot_load is not None:
+                try:
+                    load_avg = max(load_avg, float(tot_load))
+                except (ValueError, TypeError):
+                    pass
+            try:
+                sum_slot_load += float(ad.get("LoadAvg") or 0.0)
+            except (ValueError, TypeError):
+                pass
 
             if state == "Claimed":
                 active_jobs += 1
                 cpus_used += c
                 mem_used += m
                 gpus_used += g
+                user = _clean_condor_user(ad.get("RemoteUser") or ad.get("RemoteOwner"))
+                if user:
+                    users_count[user] = users_count.get(user, 0) + 1
+                entered = int(ad.get("EnteredCurrentActivity") or 0)
+                ad_now = int(ad.get("MyCurrentTime") or ref_now)
+                runtime_sec = max(0, ad_now - entered) if entered > 0 else None
+                claims.append(
+                    {
+                        "host": host,
+                        "arch": arch,
+                        "slot": slot_short,
+                        "user": user or "unknown",
+                        "job_id": str(ad.get("JobId") or "—"),
+                        "gpus": g or (1 if arch == "GPU3090" else 0),
+                        "cpus": c,
+                        "mem_mb": m,
+                        "runtime_seconds": runtime_sec,
+                        "activity": str(ad.get("Activity") or "Busy"),
+                    }
+                )
             elif state == "Unclaimed" and not is_draining:
                 cpus_free += c
                 mem_free += m
                 gpus_free += g
+
+        if load_avg == 0.0 and sum_slot_load > 0.0:
+            load_avg = sum_slot_load
 
         cpus_total = max(cpus_free + cpus_used, cpus_rep_total)
         mem_total = max(mem_free + mem_used, mem_rep_total)
@@ -1198,6 +1284,11 @@ def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "cpus_total": cpus_total,
                 "mem_free_mb": mem_free,
                 "mem_total_mb": mem_total,
+                "disk_free_gb": round(disk_free_kb / (1024 * 1024)) if disk_free_kb > 0 else 0,
+                "load_avg": round(load_avg, 1),
+                "gpu_model": gpu_model,
+                "users": users_count,
+                "claims": claims,
             }
         )
 
@@ -1205,17 +1296,23 @@ def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return nodes
 
 
-def query_condor_nodes() -> Optional[List[Dict[str, Any]]]:
-    """Queries `condor_status -json` and returns per-node hardware availability."""
+def query_condor_nodes(constraint: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    """Queries `condor_status -json` and returns per-node hardware, user, and slot availability."""
     if not shutil.which("condor_status"):
         return None
     attrs = (
         "Machine,Name,SlotType,State,Activity,Architecture,Cpus,TotalSlotCpus,TotalCpus,"
-        "Memory,TotalSlotMemory,TotalMemory,GPUs,TotalSlotGPUs,TotalGPUs,AssignedGPUs,Draining"
+        "Memory,TotalSlotMemory,TotalMemory,GPUs,TotalSlotGPUs,TotalGPUs,AssignedGPUs,Draining,"
+        "RemoteUser,RemoteOwner,JobId,EnteredCurrentActivity,MyCurrentTime,"
+        "TotalLoadAvg,TotalCondorLoadAvg,LoadAvg,Disk,"
+        "CUDADeviceName,GPUs_DeviceName,CUDAGlobalMemoryMb,GPUs_GlobalMemoryMb"
     )
+    cmd = ["condor_status", "-json", "-attributes", attrs]
+    if constraint and constraint.strip():
+        cmd.extend(["-constraint", constraint.strip()])
     try:
         res = subprocess.run(
-            ["condor_status", "-json", "-attributes", attrs],
+            cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1235,9 +1332,9 @@ def query_condor_nodes() -> Optional[List[Dict[str, Any]]]:
         return None
 
 
-def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
-    """Aggregates per-node availability into per-architecture pool totals."""
-    pools: Dict[str, Dict[str, int]] = {}
+def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Aggregates per-node availability and active users into per-architecture pool totals."""
+    pools: Dict[str, Dict[str, Any]] = {}
     for n in nodes:
         arch = str(n["arch"])
         p = pools.setdefault(
@@ -1252,6 +1349,7 @@ def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, i
                 "mem_free_mb": 0,
                 "mem_total_mb": 0,
                 "active_jobs": 0,
+                "users": {},
             },
         )
         p["nodes_total"] += 1
@@ -1264,4 +1362,6 @@ def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, i
         p["mem_free_mb"] += int(n["mem_free_mb"])
         p["mem_total_mb"] += int(n["mem_total_mb"])
         p["active_jobs"] += int(n["active_jobs"])
+        for u, cnt in (n.get("users") or {}).items():
+            p["users"][u] = p["users"].get(u, 0) + int(cnt)
     return pools

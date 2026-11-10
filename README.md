@@ -395,14 +395,22 @@ runs clean --older-than 7d -y  # Delete inactive runs older than 7 days (support
 
 ### 6.9 `runs nodes` (`cluster`, `pools`)
 
-Queries live `condor_status` across Hermes 2 and renders both an **Architecture Pools Summary** (`GPU3090`, `A100`, `EPYC7662`, `AMD`, `INTEL`) and a **Worker Nodes Breakdown** (`FREE`, `MIXED`, `BUSY`, `DRAINING`, free/total GPUs, CPUs, RAM, and active jobs):
+Queries live `condor_status` across Hermes 2 and renders:
+1. **Architecture Pools Summary** (`GPU3090`, `A100`, `EPYC7662`, `AMD`, `INTEL`) with free/total nodes, GPUs, CPUs, RAM, active job counts, and active `RemoteUser` owners (highlighting your username in bold cyan).
+2. **Worker Nodes Breakdown** (`FREE`, `MIXED`, `BUSY`, `DRAINING`, free/total GPUs, CPUs, RAM, active jobs, and active users).
+3. **Active Slot Claims & Running Jobs** (shown with `-d`/`--detail` or `-u`/`-m`), displaying per-slot `RemoteUser`, HTCondor `JobId`, claimed GPUs/CPUs/RAM, and live slot runtime, plus node CPU load, GPU hardware model (`CUDADeviceName`), and free scratch disk.
 
 ```bash
-runs nodes                     # Show all Hermes 2 pools and worker nodes
+runs nodes                     # Show all Hermes 2 pools, worker nodes, and active users
 runs cluster                   # Alias for `runs nodes`
-runs nodes -a GPU3090          # Filter to a specific architecture pool
-runs nodes -f                  # Show only nodes with free GPUs/CPUs
-runs nodes -w                  # Flicker-free live cluster availability dashboard
+runs nodes -d                  # Detailed view: add Load, GPU model, Disk, and per-slot claims table
+runs nodes -m                  # Filter to nodes and slot claims running YOUR jobs
+runs nodes -u alice            # Filter to nodes and slot claims running jobs for 'alice'
+runs nodes -a GPU3090 -f       # Show only GPU3090 nodes with free GPUs
+runs nodes -b                  # Show only busy/claimed nodes
+runs nodes -n her07            # Filter by node hostname substring
+runs nodes --where 'GPUs > 0'  # Pass a raw HTCondor ClassAd -constraint expression
+runs nodes -d -w               # Flicker-free live cluster & slot claims dashboard
 ```
 > **Interactive `send` Integration**: When you run `send` interactively, the `+Architecture` selector automatically displays `[free/total GPUs free]` (or `[free/total CPUs free]`) next to each pool.
 
