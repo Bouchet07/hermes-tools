@@ -1551,3 +1551,258 @@ def query_condor_better_analyze(job_target: str) -> Optional[Dict[str, Any]]:
         return parse_condor_better_analyze(combined)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Live Worker Node GPU & Process Telemetry (`condor_ssh_to_job`)
+# ---------------------------------------------------------------------------
+_IGNORED_PROBE_COMMS = {
+    "ps",
+    "sh",
+    "bash",
+    "dash",
+    "sshd",
+    "condor_starter",
+    "condor_exec.exe",
+    "sleep",
+    "nvidia-smi",
+    "hostname",
+    "cat",
+    "id",
+    "time",
+}
+
+
+def build_ssh_telemetry_probe(interval: Optional[int] = None) -> str:
+    """
+    Builds a POSIX-safe shell one-liner for `condor_ssh_to_job` that emits
+    hostname, loadavg, GPU metrics (`nvidia-smi`), and user processes (`ps`).
+    """
+    body = (
+        "LC_ALL=C; export LC_ALL; "
+        "emit_frame() { "
+        "echo '===HERMES_FRAME_BEGIN==='; "
+        "echo '---HOST---'; "
+        "hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown; "
+        "cat /proc/loadavg 2>/dev/null || echo ''; "
+        "echo '---GPU---'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-gpu=index,name,gpu_bus_id,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit "
+        "--format=csv,noheader,nounits 2>/dev/null || true; "
+        "fi; "
+        "echo '---GPU_APPS---'; "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "nvidia-smi --query-compute-apps=pid,gpu_bus_id,used_memory --format=csv,noheader,nounits 2>/dev/null || true; "
+        "fi; "
+        "echo '---PS---'; "
+        "ps -u \"$(id -un)\" -o pid=,pcpu=,rss=,etime=,comm=,args= --sort=-pcpu 2>/dev/null || true; "
+        "echo '===HERMES_FRAME_END==='; "
+        "}; "
+    )
+    if interval is not None and interval > 0:
+        return body + f"while true; do emit_frame; sleep {int(interval)}; done"
+    return body + "emit_frame"
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(val).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
+    """
+    Parses a single telemetry frame emitted by `build_ssh_telemetry_probe` into
+    host metadata, GPU telemetry records, and active user workload processes.
+    """
+    section = ""
+    host_lines: List[str] = []
+    gpu_lines: List[str] = []
+    app_lines: List[str] = []
+    ps_lines: List[str] = []
+
+    for line in (raw_frame or "").splitlines():
+        s = line.strip()
+        if s in ("===HERMES_FRAME_BEGIN===", "===HERMES_FRAME_END==="):
+            continue
+        if s == "---HOST---":
+            section = "HOST"
+            continue
+        if s == "---GPU---":
+            section = "GPU"
+            continue
+        if s == "---GPU_APPS---":
+            section = "GPU_APPS"
+            continue
+        if s == "---PS---":
+            section = "PS"
+            continue
+
+        if section == "HOST" and s:
+            host_lines.append(s)
+        elif section == "GPU" and s:
+            gpu_lines.append(s)
+        elif section == "GPU_APPS" and s:
+            app_lines.append(s)
+        elif section == "PS" and s:
+            ps_lines.append(s)
+
+    hostname = host_lines[0] if host_lines else "unknown"
+    load_avg: Optional[float] = None
+    if len(host_lines) >= 2:
+        toks = host_lines[1].split()
+        if toks:
+            try:
+                load_avg = float(toks[0])
+            except ValueError:
+                load_avg = None
+
+    gpus: List[Dict[str, Any]] = []
+    for g_line in gpu_lines:
+        parts = [p.strip() for p in g_line.split(",")]
+        if len(parts) < 6:
+            continue
+        short_model = (
+            parts[1]
+            .replace("NVIDIA GeForce ", "")
+            .replace("NVIDIA ", "")
+            .replace("Tesla ", "")
+            .strip()
+        )
+        gpus.append(
+            {
+                "index": parts[0],
+                "model": short_model,
+                "bus_id": parts[2],
+                "util_pct": _safe_float(parts[3]),
+                "mem_used_mb": _safe_float(parts[4]),
+                "mem_total_mb": _safe_float(parts[5]),
+                "temp_c": _safe_float(parts[6]) if len(parts) > 6 else None,
+                "power_w": _safe_float(parts[7]) if len(parts) > 7 else None,
+                "power_limit_w": _safe_float(parts[8]) if len(parts) > 8 else None,
+            }
+        )
+
+    pid_vram_mb: Dict[int, float] = {}
+    for a_line in app_lines:
+        parts = [p.strip() for p in a_line.split(",")]
+        if len(parts) >= 3 and parts[0].isdigit():
+            pid = int(parts[0])
+            pid_vram_mb[pid] = pid_vram_mb.get(pid, 0.0) + _safe_float(parts[2])
+
+    processes: List[Dict[str, Any]] = []
+    for p_line in ps_lines:
+        # Format: pid pcpu rss etime comm args
+        toks = p_line.split(None, 5)
+        if len(toks) < 5 or not toks[0].isdigit():
+            continue
+        pid = int(toks[0])
+        cpu_pct = _safe_float(toks[1])
+        rss_kb = _safe_float(toks[2])
+        etime = toks[3]
+        comm = toks[4]
+        args_str = toks[5] if len(toks) > 5 else comm
+
+        if "HERMES_FRAME_BEGIN" in args_str or "nvidia-smi --query" in args_str:
+            continue
+        if comm in _IGNORED_PROBE_COMMS and pid not in pid_vram_mb and cpu_pct < 1.0:
+            continue
+        if args_str.endswith("/job.sh") or "/repro/job.sh" in args_str:
+            continue
+
+        processes.append(
+            {
+                "pid": pid,
+                "cpu_pct": cpu_pct,
+                "rss_mb": rss_kb / 1024.0,
+                "vram_mb": pid_vram_mb.get(pid, 0.0),
+                "elapsed": etime,
+                "comm": comm,
+                "command": args_str,
+            }
+        )
+
+    # Sort processes: GPU VRAM users first, then highest CPU%, then highest RSS
+    processes.sort(key=lambda p: (-float(p["vram_mb"]), -float(p["cpu_pct"]), -float(p["rss_mb"])))
+
+    return {
+        "hostname": hostname,
+        "host": hostname.split(".")[0] if hostname else "unknown",
+        "load_avg": load_avg,
+        "gpus": gpus,
+        "processes": processes,
+    }
+
+
+def query_job_live_telemetry(job_target: str) -> Optional[Dict[str, Any]]:
+    """Runs a single-shot `condor_ssh_to_job` probe and returns parsed worker telemetry."""
+    if not shutil.which("condor_ssh_to_job"):
+        return None
+    probe_cmd = build_ssh_telemetry_probe(interval=None)
+    try:
+        res = subprocess.run(
+            ["condor_ssh_to_job", "-auto-retry", str(job_target), probe_cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        out = (res.stdout or "").strip()
+        if "===HERMES_FRAME_BEGIN===" not in out:
+            err_msg = (res.stderr or out or "").strip()
+            if err_msg:
+                raise RuntimeError(err_msg)
+            return None
+        return parse_ssh_telemetry_frame(out)
+    except RuntimeError:
+        raise
+    except Exception:
+        return None
+
+
+def stream_job_live_telemetry(job_target: str, interval: int = 2):
+    """
+    Opens a single persistent `condor_ssh_to_job` session and yields parsed
+    telemetry frames every `interval` seconds with zero SSH reconnect lag.
+    """
+    if not shutil.which("condor_ssh_to_job"):
+        return
+    probe_cmd = build_ssh_telemetry_probe(interval=max(1, int(interval)))
+    proc = subprocess.Popen(
+        ["condor_ssh_to_job", "-auto-retry", str(job_target), probe_cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    try:
+        buf: List[str] = []
+        in_frame = False
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            s = line.strip()
+            if s == "===HERMES_FRAME_BEGIN===":
+                buf = []
+                in_frame = True
+                continue
+            if s == "===HERMES_FRAME_END===":
+                if in_frame:
+                    yield parse_ssh_telemetry_frame("\n".join(buf))
+                in_frame = False
+                buf = []
+                continue
+            if in_frame:
+                buf.append(line)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass

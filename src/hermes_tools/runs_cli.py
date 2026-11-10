@@ -27,9 +27,11 @@ from hermes_tools.condor import (
     get_failed_or_missing_procs,
     query_condor_better_analyze,
     query_condor_nodes,
+    query_job_live_telemetry,
     query_live_condor_clusters,
     reconcile_run,
     run_needs_live_reconcile,
+    stream_job_live_telemetry,
     summarize_condor_pools,
 )
 from hermes_tools.core import (
@@ -1716,6 +1718,240 @@ def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommands: `runs top` (`gpu`) & `runs ssh` (`shell`)
+# ---------------------------------------------------------------------------
+def _resolve_running_job_context(
+    args: argparse.Namespace, runs_root: Path
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Resolves CLI target to `(job_target, run_name, arch)`.
+    Supports raw `ClusterId.ProcId`, raw `ClusterId`, run `#index`, tag, or
+    defaults to the most recent `RUNNING` run.
+    """
+    target = getattr(args, "run", None)
+    proc_idx = int(getattr(args, "proc", 0) or 0)
+
+    if target and re.match(r"^\d+\.\d+$", str(target).strip()):
+        return str(target).strip(), None, None
+
+    run_dir: Optional[Path] = None
+    live_clusters = query_live_condor_clusters()
+    if not target:
+        for rd in list_run_dirs(runs_root)[:25]:
+            d = load_run_json(rd)
+            if not d:
+                continue
+            if run_needs_live_reconcile(d):
+                d = reconcile_run(rd, d, live_clusters)
+            st = str(d.get("_live_badge") or d.get("status", ""))
+            if st.startswith("RUNNING"):
+                run_dir = rd
+                break
+        if run_dir is None:
+            run_dir = resolve_run_dir(runs_root, "latest")
+    else:
+        run_dir = resolve_run_dir(runs_root, target)
+        if run_dir is None and str(target).strip().isdigit():
+            return f"{str(target).strip()}.{proc_idx}", None, None
+
+    if not run_dir:
+        sys.exit(1)
+
+    data = load_run_json(run_dir)
+    if not data:
+        console.print(f"[red]✖ Could not read run.json in {run_dir.name}.[/red]")
+        sys.exit(1)
+
+    data = reconcile_run(run_dir, data, live_clusters)
+    status_str = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+    cids = get_all_cluster_ids(data)
+    if not cids:
+        console.print(f"[yellow]⚠ Run '{run_dir.name}' has no HTCondor cluster ID.[/yellow]")
+        sys.exit(1)
+
+    if status_str.startswith(("QUEUED", "HELD")):
+        console.print(
+            f"[yellow]⚠ Run '{run_dir.name}' is currently {status_str} (not executing on a worker node yet).[/yellow]\n"
+            f"[dim]Tip: run [bold white]runs why {run_dir.name}[/bold white] to diagnose queue wait time.[/dim]"
+        )
+        sys.exit(1)
+    if not status_str.startswith("RUNNING"):
+        console.print(
+            f"[yellow]⚠ Run '{run_dir.name}' is no longer running (status: {status_str}).[/yellow]\n"
+            f"[dim]Tip: run [bold white]runs inspect {run_dir.name}[/bold white] to view recorded telemetry.[/dim]"
+        )
+        sys.exit(1)
+
+    arch = str((data.get("resources_requested") or {}).get("architecture") or "—")
+    return f"{cids[-1]}.{proc_idx}", run_dir.name, arch
+
+
+def _build_live_telemetry_panel(
+    job_target: str,
+    frame: Dict[str, Any],
+    run_name: Optional[str] = None,
+    arch: Optional[str] = None,
+) -> Panel:
+    from rich.console import Group
+
+    host_short = str(frame.get("host") or "unknown")
+    host_fqdn = str(frame.get("hostname") or host_short)
+    load_avg = frame.get("load_avg")
+
+    info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
+    info_tbl.add_column("V", style="white")
+    if run_name:
+        info_tbl.add_row("Run", f"[bold white]{run_name}[/bold white] ({style_status('RUNNING')})")
+    pool_str = f" · Pool: [bold magenta]{arch}[/bold magenta]" if arch and arch != "—" else ""
+    load_str = f" · Load: [cyan]{load_avg:.2f}[/cyan]" if isinstance(load_avg, (int, float)) else ""
+    info_tbl.add_row("Worker Node", f"[bold white]{host_fqdn}[/bold white]{pool_str}{load_str}")
+
+    renderables: List[Any] = [info_tbl]
+
+    gpus = frame.get("gpus") or []
+    if gpus:
+        gpu_tbl = Table(
+            title="Allocated GPUs",
+            title_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+        )
+        gpu_tbl.add_column("GPU", style="dim", no_wrap=True)
+        gpu_tbl.add_column("Model", style="bold white", no_wrap=True)
+        gpu_tbl.add_column("Util", justify="right", no_wrap=True)
+        gpu_tbl.add_column("VRAM Used / Total", justify="right", no_wrap=True)
+        gpu_tbl.add_column("Temp", justify="right", no_wrap=True)
+        gpu_tbl.add_column("Power", justify="right", no_wrap=True)
+
+        for g in gpus:
+            util = float(g.get("util_pct", 0.0))
+            util_col = "bold green" if util >= 50 else ("yellow" if util >= 10 else "dim")
+            used_gb = float(g.get("mem_used_mb", 0.0)) / 1024.0
+            tot_gb = max(0.1, float(g.get("mem_total_mb", 0.0)) / 1024.0)
+            vram_pct = min(100, round((used_gb / tot_gb) * 100))
+            temp = g.get("temp_c")
+            temp_str = f"{temp:.0f}°C" if isinstance(temp, (int, float)) and temp > 0 else "—"
+            pw = g.get("power_w")
+            plim = g.get("power_limit_w")
+            if isinstance(pw, (int, float)) and pw > 0:
+                pw_str = (
+                    f"{pw:.0f} / {plim:.0f} W"
+                    if isinstance(plim, (int, float)) and plim > 0
+                    else f"{pw:.0f} W"
+                )
+            else:
+                pw_str = "—"
+
+            gpu_tbl.add_row(
+                str(g.get("index", "0")),
+                str(g.get("model", "GPU")),
+                f"[{util_col}]{util:.0f} %[/{util_col}]",
+                f"[cyan]{used_gb:.1f}[/cyan] / {tot_gb:.1f} GB ({vram_pct}%)",
+                temp_str,
+                pw_str,
+            )
+        renderables.append(gpu_tbl)
+
+    procs = frame.get("processes") or []
+    if procs:
+        proc_tbl = Table(
+            title="Active Job Processes",
+            title_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+        )
+        proc_tbl.add_column("PID", style="dim", justify="right", no_wrap=True)
+        proc_tbl.add_column("CPU %", justify="right", style="green", no_wrap=True)
+        proc_tbl.add_column("Host RAM", justify="right", no_wrap=True)
+        proc_tbl.add_column("GPU VRAM", justify="right", style="cyan", no_wrap=True)
+        proc_tbl.add_column("Elapsed", justify="right", no_wrap=True)
+        proc_tbl.add_column("Command", style="white")
+
+        for p in procs[:12]:
+            rss_mb = float(p.get("rss_mb", 0.0))
+            ram_str = f"{rss_mb / 1024.0:.1f} GB" if rss_mb >= 1024.0 else f"{rss_mb:.0f} MB"
+            vram_mb = float(p.get("vram_mb", 0.0))
+            if vram_mb >= 1024.0:
+                vram_str = f"{vram_mb / 1024.0:.1f} GB"
+            elif vram_mb > 0:
+                vram_str = f"{vram_mb:.0f} MB"
+            else:
+                vram_str = "[dim]—[/dim]"
+            cmd_text = str(p.get("command") or p.get("comm") or "—")
+            if len(cmd_text) > 56:
+                cmd_text = cmd_text[:53] + "..."
+
+            proc_tbl.add_row(
+                str(p.get("pid", "—")),
+                f"{float(p.get('cpu_pct', 0.0)):.1f}%",
+                ram_str,
+                vram_str,
+                str(p.get("elapsed", "—")),
+                cmd_text,
+            )
+        renderables.append(proc_tbl)
+
+    return Panel(
+        Group(*renderables),
+        title=f"[bold cyan]⚡ Live Worker Telemetry — {host_short} (Job {job_target})[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+
+
+def cmd_top(args: argparse.Namespace, runs_root: Path) -> None:
+    job_target, run_name, arch = _resolve_running_job_context(args, runs_root)
+    watch_mode = bool(getattr(args, "watch", False))
+    interval = max(1, int(getattr(args, "interval", 2) or 2))
+
+    if watch_mode:
+        from rich.live import Live
+
+        console.print(
+            f"[dim]Connecting live telemetry stream to Job {job_target} via condor_ssh_to_job (Ctrl-C to exit)...[/dim]"
+        )
+        try:
+            with Live(console=console, auto_refresh=False) as live:
+                got_any = False
+                for frame in stream_job_live_telemetry(job_target, interval=interval):
+                    got_any = True
+                    panel = _build_live_telemetry_panel(job_target, frame, run_name=run_name, arch=arch)
+                    live.update(panel, refresh=True)
+                if not got_any:
+                    console.print(
+                        f"[yellow]⚠ Could not establish telemetry stream to Job {job_target} (job may have finished).[/yellow]"
+                    )
+        except KeyboardInterrupt:
+            return
+    else:
+        try:
+            frame = query_job_live_telemetry(job_target)
+        except RuntimeError as exc:
+            console.print(
+                f"[bold red]✖ condor_ssh_to_job failed for Job {job_target}:[/bold red]\n[dim]{exc}[/dim]"
+            )
+            sys.exit(1)
+        if frame is None:
+            console.print(
+                "[yellow]⚠ 'condor_ssh_to_job' is not available or returned no telemetry (are you on hermes2?).[/yellow]"
+            )
+            sys.exit(1)
+        console.print(_build_live_telemetry_panel(job_target, frame, run_name=run_name, arch=arch))
+
+
+def cmd_ssh(args: argparse.Namespace, runs_root: Path) -> None:
+    if not shutil.which("condor_ssh_to_job"):
+        console.print("[yellow]⚠ 'condor_ssh_to_job' is not available in PATH.[/yellow]")
+        sys.exit(1)
+    job_target, run_name, _ = _resolve_running_job_context(args, runs_root)
+    label = f"{run_name} ({job_target})" if run_name else job_target
+    console.print(f"[cyan]Connecting interactive shell to {label} via condor_ssh_to_job...[/cyan]")
+    res = subprocess.run(["condor_ssh_to_job", "-auto-retry", job_target])
+    sys.exit(res.returncode)
+
+
+# ---------------------------------------------------------------------------
 # CLI Argument Parser & Entrypoint
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -1758,6 +1994,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_why.add_argument(
         "--raw", action="store_true", help="Show raw condor_q -better-analyze text output"
+    )
+
+    p_top = sub.add_parser(
+        "top",
+        aliases=["gpu"],
+        help="Show live GPU VRAM, utilization, and process telemetry on the worker node (condor_ssh_to_job)",
+    )
+    p_top.add_argument(
+        "run",
+        nargs="?",
+        help="Run ID, index (#), cluster ID, or defaults to latest RUNNING run",
+    )
+    p_top.add_argument(
+        "-p", "--proc", type=int, default=0, help="Process index for sweeps (default: 0)"
+    )
+    p_top.add_argument(
+        "-w", "--watch", action="store_true", help="Stream live worker telemetry continuously"
+    )
+    p_top.add_argument(
+        "-i", "--interval", type=int, default=2, help="Refresh interval in seconds for --watch (default: 2)"
+    )
+
+    p_ssh = sub.add_parser(
+        "ssh",
+        aliases=["shell"],
+        help="Open an interactive shell inside the running job's slot on the worker node (condor_ssh_to_job)",
+    )
+    p_ssh.add_argument(
+        "run",
+        nargs="?",
+        help="Run ID, index (#), cluster ID, or defaults to latest RUNNING run",
+    )
+    p_ssh.add_argument(
+        "-p", "--proc", type=int, default=0, help="Process index for sweeps (default: 0)"
     )
 
     p_log = sub.add_parser("logs", aliases=["tail"], help="View or follow stdout/stderr/condor logs")
@@ -1897,6 +2167,10 @@ def main() -> None:
         cmd_inspect(args, runs_root)
     elif cmd in ("why", "analyze", "q"):
         cmd_why(args, runs_root)
+    elif cmd in ("top", "gpu"):
+        cmd_top(args, runs_root)
+    elif cmd in ("ssh", "shell"):
+        cmd_ssh(args, runs_root)
     elif cmd in ("logs", "tail"):
         cmd_logs(args, runs_root)
     elif cmd in ("retry", "resume", "continue"):

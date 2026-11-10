@@ -423,6 +423,19 @@ runs nodes -d -w               # Flicker-free live cluster & slot claims dashboa
 ```
 > **Interactive `send` Integration**: When you run `send` interactively, the `+Architecture` selector automatically displays `[free/total GPUs free]` (or `[free/total CPUs free]`) next to each pool.
 
+### 6.10 `runs top` (`gpu`) & `runs ssh` (`shell`)
+
+Connects directly to the worker node slot executing your `RUNNING` job via `condor_ssh_to_job` to query live GPU utilization (`nvidia-smi`), VRAM usage, temperature, power draw, and active Python/workload processes (`ps`):
+
+```bash
+runs gpu                       # Live worker GPU & process snapshot for your most recent RUNNING run
+runs top                       # Alias for `runs gpu`
+runs gpu -w                    # Persistent live streaming dashboard (updates every 2s with zero SSH lag)
+runs gpu 1 -p 2                # Inspect process 2 of sweep run #1
+runs ssh                       # Open an interactive shell inside the running job's slot on the worker node
+runs ssh 1 -p 0                # Interactive shell into sweep process 0 of run #1
+```
+
 ---
 
 ## 7. Under the Hood: Telemetry, Locking & Status Lifecycle

@@ -869,3 +869,74 @@ Reason for last match failure: PREEMPTION_REQUIREMENTS == False
     assert "6 eligible" in ins_out
 
 
+def test_parse_ssh_telemetry_and_runs_top(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.condor import parse_ssh_telemetry_frame
+
+    raw_frame = """
+===HERMES_FRAME_BEGIN===
+---HOST---
+nv3090-02.i3a.es
+4.12 3.80 2.95 2/1024 149201
+---GPU---
+0, NVIDIA GeForce RTX 3090, 00000000:01:00.0, 96, 18841, 24576, 67, 312.4, 350.0
+---GPU_APPS---
+148920, 00000000:01:00.0, 18841
+---PS---
+148920 785.0 14889779 01:12:44 python python -u train.py --lr 0.001 --batch-size 64
+148900   0.0     3200 01:12:45 bash /bin/bash /home/diego/runs/r1/repro/job.sh
+149205   0.0     1800    00:00 ps ps -u diego -o pid=,pcpu=,rss=,etime=,comm=,args=
+===HERMES_FRAME_END===
+"""
+    frame = parse_ssh_telemetry_frame(raw_frame)
+    assert frame["host"] == "nv3090-02"
+    assert frame["hostname"] == "nv3090-02.i3a.es"
+    assert frame["load_avg"] == 4.12
+    assert len(frame["gpus"]) == 1
+    assert frame["gpus"][0]["model"] == "RTX 3090"
+    assert frame["gpus"][0]["util_pct"] == 96.0
+    assert frame["gpus"][0]["mem_used_mb"] == 18841.0
+    assert len(frame["processes"]) == 1
+    assert frame["processes"][0]["pid"] == 148920
+    assert frame["processes"][0]["vram_mb"] == 18841.0
+    assert "train.py" in frame["processes"][0]["command"]
+
+    runs_root = tmp_path / "runs"
+    rd = runs_root / "2026-11-10_12-00-00_train_GPU3090"
+    rd.mkdir(parents=True)
+    (rd / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": rd.name,
+                "status": "RUNNING",
+                "submission": {"cluster_id": 1074510, "target": "train.py"},
+                "resources_requested": {"architecture": "GPU3090", "cpus": 16, "memory_mb": 16384, "gpus": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        runs_cli,
+        "query_live_condor_clusters",
+        lambda: {1074510: {"total": 1, "running": 1, "idle": 0, "held": 0, "hold_reasons": []}},
+    )
+    monkeypatch.setattr(runs_cli, "query_job_live_telemetry", lambda jid: frame)
+
+    top_args = argparse.Namespace(run=None, proc=0, watch=False, interval=2)
+    runs_cli.cmd_top(top_args, runs_root)
+    top_out = capsys.readouterr().out
+    assert "Live Worker Telemetry" in top_out
+    assert "nv3090-02" in top_out
+    assert "Allocated GPUs" in top_out
+    assert "RTX 3090" in top_out
+    assert "96 %" in top_out
+    assert "Active Job Processes" in top_out
+    assert "148920" in top_out
+    assert "785.0%" in top_out
+
+
+
