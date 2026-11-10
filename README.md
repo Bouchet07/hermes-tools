@@ -42,12 +42,11 @@ Definitive HTCondor job submission (`send`), code provenance, live telemetry, an
 On `hermes2` (or locally):
 
 ```bash
-# Install globally as CLI tools (`send` and `runs`)
-uv tool install .
+# Install globally from GitHub as CLI tools (`send` and `runs`)
+uv tool install git+https://github.com/Bouchet07/hermes-tools.git
 
-# Update after pulling new changes
-git pull
-uv tool install --force .
+# Upgrade to the latest commit on main
+uv tool upgrade hermes-tools
 ```
 
 To run the test suite during development:
@@ -94,6 +93,8 @@ send train.py -a GPU3090 --dry-run                  # Generate capsule without s
 | `--exclude` | `str` (repeatable) | `[]` | Exclude specific worker node(s), e.g. `--exclude her07-100`. |
 | `--project` | `str` | `None` | Inject I3A institutional accounting directive `+Proyecto = "<code>"`. |
 | `--scratch` | `files...` | `[]` | Enable HTCondor file transfer (`should_transfer_files = YES`) and copy listed input files to worker scratch space. |
+| `-e`, `--env` | `KEY=VAL` (repeatable) | `[]` | Export custom environment variable(s) inside `repro/job.sh` (merges with `[env]` / `[tool.hermes.env]`). |
+| `-f`, `--follow` | `flag` | `False` | Wait for the submitted job to start and stream live stdout until completion. |
 | `-y`, `--yes` | `flag` | `False` | Skip the final `"Submit job to HTCondor queue now?"` confirmation prompt. |
 | `--dry-run` | `flag` | `False` | Materialize `runs/<run_id>/` (`job.sh`, `job.sub`, `run.json`, `repro/code/`) and print `job.sub` without calling `condor_submit`. |
 
@@ -273,6 +274,8 @@ Inside `job.sh`, the following variables are automatically exported before your 
 | :--- | :--- | :--- |
 | **`HERMES_RUN_DIR`** | `/abs/path/to/runs/<run_id>` | Save checkpoints, plots, and CSVs directly inside the run folder (`os.environ["HERMES_RUN_DIR"]`). |
 | **`HERMES_PROC_ID`** | `0` (or `0..N-1` in sweeps) | Process index within the sweep (`$(Process)` or original process ID on retry). |
+| **`PYTHONUNBUFFERED`** | `1` | Guarantees real-time line-by-line stdout/stderr flushing into `.out`/`.err` on CephFS. |
+| **`HOME`** | `<your_submit_home>` | Ensures tools (`torch.hub`, `huggingface`, `wandb`, `matplotlib`) find your CephFS home directory on worker nodes. |
 | **`PYTHONPATH`** | `.../repro/code:<project_cwd>:$PYTHONPATH` | Ensures Python imports resolve against the frozen `repro/code/` snapshot first. |
 | **`OMP_NUM_THREADS`** | `<requested_cpus>` | Caps OpenMP threads on CPU pools to prevent thread oversubscription (respects pre-existing env var). Also sets `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `NUMEXPR_NUM_THREADS`. |
 
@@ -281,10 +284,10 @@ Inside `job.sh`, the following variables are automatically exported before your 
 Why does `send` snapshot your code into `repro/code/`?
 When HTCondor queues are busy, your job may wait minutes or hours before starting. Because `job.sh` executes the copy inside `repro/code/` (and prepends `repro/code` to `PYTHONPATH`), you can freely edit your working tree or switch Git branches while jobs are queued without breaking them.
 
-To prevent accidental slowdowns or disk quota exhaustion from untracked datasets:
-- **Tracked files first**: Git-tracked files (`git ls-files --cached`) are copied before untracked files (`git ls-files --others --exclude-standard`).
-- **Per-file limit**: Regular files `<= 15 MB` are copied; symlinks are recreated without dereferencing.
-- **Total snapshot limit**: Capped at **`100 MB` total** or **`2500 files`** (prints a note if extra untracked files were skipped).
+To keep submissions instant on CephFS and prevent disk bloat while ensuring `Path(__file__).parent` relative lookups never break:
+- **Tracked files first**: Single-call `git ls-files -t --cached --others --exclude-standard` prioritizes tracked source files before untracked files.
+- **Source & config files copied**: Text/code files `<= 2 MB` (up to `50 MB` or `1500 files` total) are copied using fast `shutil.copyfile`.
+- **Binary, dataset & checkpoint files symlinked**: Files with data/checkpoint/archive/media extensions (`.pt`, `.pth`, `.ckpt`, `.safetensors`, `.onnx`, `.bin`, `.h5`, `.npy`, `.npz`, `.pkl`, `.parquet`, `.csv`, `.tar`, `.gz`, `.zip`, `.so`, etc.) or files `> 2 MB` are **automatically symlinked** into `repro/code/` at their exact relative paths—consuming 0 MB of disk space while keeping relative paths working.
 - **Ignored directories**: `.git`, `runs`, `.venv`, `venv`, `env`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `node_modules`, and `wandb` are always excluded.
 
 ---
@@ -302,13 +305,13 @@ runs ls                        # Show latest 25 runs (★ marks `runs/latest`)
 runs ls -n 50                  # Show latest 50 runs
 runs ls -s RUNNING             # Filter by status substring (RUNNING, FAILED, QUEUED, etc.)
 runs ls -t baseline            # Filter by run ID / tag substring
-runs watch                     # Live-updating dashboard (refreshes every 2s)
-runs watch -i 5 -s RUNNING     # Refresh every 5s, showing only running jobs
+runs watch                     # Flicker-free live dashboard (refreshes only when state changes)
+runs watch -i 5 -s RUNNING     # Poll every 5s, showing only running jobs
 ```
 
 ### 6.2 `runs inspect` (`info`, `show`)
 
-Displays full provenance metadata, per-process hardware/runtime/RAM/CPU breakdown, and the last 25 lines of any non-empty `.err` files:
+Displays full provenance metadata, HTCondor `HoldReason` (if a job is `HELD`), per-process hardware/runtime/RAM/CPU breakdown, and the last 25 lines of any non-empty `.err` files (or `.out` tail if a run failed with an empty `.err`):
 
 ```bash
 runs inspect latest            # Inspect most recent run
@@ -318,16 +321,18 @@ runs inspect 1071044           # Inspect run by HTCondor cluster ID
 
 ### 6.3 `runs logs` (`tail`)
 
-Views or follows `.out`, `.err`, or `repro/condor.log`:
+Views or follows `.out`, `.err`, or `repro/condor.log` in $O(1)$ memory:
 
 ```bash
 runs logs latest               # Last 60 lines of stdout (.out)
 runs logs latest -e            # Last 60 lines of stderr (.err)
 runs logs latest -e -p 3       # Stderr of process #3 in a sweep
 runs logs latest -c            # HTCondor scheduler log (repro/condor.log)
-runs logs latest -f -n 100     # Live `tail -f` starting with last 100 lines
+runs logs latest -f -n 100     # Wait if QUEUED, stream live output, and auto-exit when job finishes
 ```
-> **Smart Sweep Selection**: When you run `runs logs <run> -e` on a sweep without specifying `-p <proc>`, `runs` automatically selects the first process with a non-zero exit code (or the first non-empty `.err` file).
+> **Smart Sweep Selection & Live Follow**:
+> - When you run `runs logs <run> -e` on a sweep without specifying `-p <proc>`, `runs` automatically selects the first process with a non-zero exit code (or the first non-empty `.err` file).
+> - `runs logs -f` (and `send -f`) waits cleanly if the job is still `QUEUED` and exits automatically as soon as the job reaches a terminal state (`COMPLETED`, `FAILED`, `ABORTED`).
 
 ### 6.4 `runs sync`
 
@@ -367,11 +372,12 @@ runs diff 1 2
 
 ### 6.7 `runs stop` (`kill`, `rm`)
 
-Calls `condor_rm` on all active HTCondor cluster IDs associated with the run and marks `run.json` as `ABORTED`:
+Calls `condor_rm` on all active HTCondor cluster IDs associated with the run (or all active runs with `--all`) and marks `run.json` as `ABORTED`:
 
 ```bash
 runs stop latest
 runs stop 1071044 -y
+runs stop --all -y             # Abort all currently QUEUED / RUNNING / HELD runs
 ```
 
 ### 6.8 `runs clean` (`prune`)
