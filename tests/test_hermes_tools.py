@@ -1010,6 +1010,26 @@ nv3090-09.i3a.es
     assert dur_s == "12m 34s"
     assert ram_s == "2.00 GB"
 
+    # Verify `runs path` outputs clean unwrapped paths for run dir, --code, and --err
+    p_args = argparse.Namespace(
+        run="1", code=False, repro=False, out=False, err=False, condor=False, json=False, proc=None
+    )
+    runs_cli.cmd_path(p_args, runs_root)
+    assert capsys.readouterr().out.strip() == str(rd.resolve())
+
+    p_code_args = argparse.Namespace(
+        run="latest", code=True, repro=False, out=False, err=False, condor=False, json=False, proc=None
+    )
+    runs_cli.cmd_path(p_code_args, runs_root)
+    assert capsys.readouterr().out.strip() == str((rd / "repro" / "code").resolve())
+
+    p_err_args = argparse.Namespace(
+        run="latest", code=False, repro=False, out=False, err=True, condor=False, json=False, proc=None
+    )
+    runs_cli.cmd_path(p_err_args, runs_root)
+    assert capsys.readouterr().out.strip() == str((rd / "train.err").resolve())
+
+
 
 
 

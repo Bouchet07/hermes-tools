@@ -436,6 +436,19 @@ runs ssh                       # Open an interactive shell inside the running jo
 runs ssh 1 -p 0                # Interactive shell into sweep process 0 of run #1
 ```
 
+### 6.11 `runs path` (`dir`, `where`)
+
+Prints the raw, unwrapped filesystem path of a run directory or its sub-artifacts (designed for command substitution like `cd "$(runs path)"` or `vim "$(runs path -e)"`):
+
+```bash
+cd "$(runs path)"              # Jump into the latest run directory
+cd "$(runs path 2)"            # Jump into run #2 from `runs ls`
+cd "$(runs path -c)"           # Jump into `repro/code/` snapshot of the latest run
+vim "$(runs path -e)"          # Open the `.err` log file of the latest run (auto-selects failed sweep proc)
+less "$(runs path -o -p 1)"    # Open the `.out` log file of sweep process #1
+cat "$(runs path -j)"          # Print raw `run.json` via path
+```
+
 ---
 
 ## 7. Under the Hood: Telemetry, Locking & Status Lifecycle

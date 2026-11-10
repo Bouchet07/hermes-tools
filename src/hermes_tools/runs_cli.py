@@ -152,7 +152,7 @@ def resolve_run_dir(
             console.print(f"[bold red]✘ No run matching '{query}'.[/bold red]")
             sys.exit(1)
 
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
         return dirs[0]
 
     import questionary
@@ -639,41 +639,56 @@ def follow_run_log(run_dir: Path, log_file: Path, initial_lines: int = 60) -> No
         return
 
 
+def _resolve_run_log_file(
+    run_dir: Path,
+    data: Dict[str, Any],
+    err: bool = False,
+    condor: bool = False,
+    proc: Optional[int] = None,
+    quiet: bool = False,
+) -> Path:
+    target_stem = Path(data.get("submission", {}).get("target", "job")).stem
+    sweep_cnt = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
+    if condor:
+        return run_dir / "repro" / "condor.log"
+    ext = ".err" if err else ".out"
+    if sweep_cnt > 1:
+        resolved_proc = proc
+        if resolved_proc is None:
+            if err:
+                failed_execs = [
+                    int(x.get("process_id", 0))
+                    for x in get_execution_records(data)
+                    if int(x.get("exit_code", 0)) != 0
+                ]
+                if failed_execs:
+                    resolved_proc = failed_execs[0]
+                    if not quiet:
+                        console.print(
+                            f"[dim yellow]ℹ Auto-selected failing process #{resolved_proc} (use `-p <id>` to override)[/dim yellow]"
+                        )
+                else:
+                    for idx in range(sweep_cnt):
+                        cand = run_dir / f"{target_stem}_{idx}.err"
+                        if cand.is_file() and cand.stat().st_size > 0:
+                            resolved_proc = idx
+                            break
+            if resolved_proc is None:
+                resolved_proc = 0
+        return run_dir / f"{target_stem}_{resolved_proc}{ext}"
+    return run_dir / f"{target_stem}{ext}"
+
+
 def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(runs_root, args.run)
     data = load_run_json(run_dir)
-    target_stem = Path(data.get("submission", {}).get("target", "job")).stem
-    sweep_cnt = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
-
-    if args.condor:
-        log_file = run_dir / "repro" / "condor.log"
-    else:
-        ext = ".err" if args.err else ".out"
-        if sweep_cnt > 1:
-            proc = args.proc
-            if proc is None:
-                if args.err:
-                    failed_execs = [
-                        int(x.get("process_id", 0))
-                        for x in get_execution_records(data)
-                        if int(x.get("exit_code", 0)) != 0
-                    ]
-                    if failed_execs:
-                        proc = failed_execs[0]
-                        console.print(
-                            f"[dim yellow]ℹ Auto-selected failing process #{proc} (use `-p <id>` to override)[/dim yellow]"
-                        )
-                    else:
-                        for idx in range(sweep_cnt):
-                            cand = run_dir / f"{target_stem}_{idx}.err"
-                            if cand.is_file() and cand.stat().st_size > 0:
-                                proc = idx
-                                break
-                if proc is None:
-                    proc = 0
-            log_file = run_dir / f"{target_stem}_{proc}{ext}"
-        else:
-            log_file = run_dir / f"{target_stem}{ext}"
+    log_file = _resolve_run_log_file(
+        run_dir,
+        data,
+        err=bool(getattr(args, "err", False)),
+        condor=bool(getattr(args, "condor", False)),
+        proc=getattr(args, "proc", None),
+    )
 
     if args.follow:
         follow_run_log(run_dir, log_file, args.lines)
@@ -1968,6 +1983,30 @@ def cmd_ssh(args: argparse.Namespace, runs_root: Path) -> None:
     sys.exit(res.returncode)
 
 
+def cmd_path(args: argparse.Namespace, runs_root: Path) -> None:
+    run_dir = resolve_run_dir(runs_root, getattr(args, "run", None) or "latest")
+    if getattr(args, "code", False):
+        target_path = run_dir / "repro" / "code"
+    elif getattr(args, "repro", False):
+        target_path = run_dir / "repro"
+    elif getattr(args, "json", False):
+        target_path = run_dir / "run.json"
+    elif getattr(args, "out", False) or getattr(args, "err", False) or getattr(args, "condor", False):
+        data = load_run_json(run_dir)
+        target_path = _resolve_run_log_file(
+            run_dir,
+            data,
+            err=bool(getattr(args, "err", False)),
+            condor=bool(getattr(args, "condor", False)),
+            proc=getattr(args, "proc", None),
+            quiet=True,
+        )
+    else:
+        target_path = run_dir
+    sys.stdout.write(f"{target_path.resolve()}\n")
+    sys.stdout.flush()
+
+
 # ---------------------------------------------------------------------------
 # CLI Argument Parser & Entrypoint
 # ---------------------------------------------------------------------------
@@ -2046,6 +2085,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_ssh.add_argument(
         "-p", "--proc", type=int, default=0, help="Process index for sweeps (default: 0)"
     )
+
+    p_path = sub.add_parser(
+        "path",
+        aliases=["dir", "where"],
+        help="Print the resolved filesystem path of a run directory or its artifacts (for `cd $(runs path)`)",
+    )
+    p_path.add_argument(
+        "run", nargs="?", default="latest", help="Run ID, index (#), cluster ID, or 'latest' (default)"
+    )
+    p_path.add_argument("-c", "--code", action="store_true", help="Print path to repro/code/ snapshot directory")
+    p_path.add_argument("-r", "--repro", action="store_true", help="Print path to repro/ directory")
+    p_path.add_argument("-o", "--out", action="store_true", help="Print path to stdout (.out) log file")
+    p_path.add_argument("-e", "--err", action="store_true", help="Print path to stderr (.err) log file")
+    p_path.add_argument("--condor", action="store_true", help="Print path to repro/condor.log")
+    p_path.add_argument("-j", "--json", action="store_true", help="Print path to run.json")
+    p_path.add_argument("-p", "--proc", type=int, help="Process index for sweep log files")
 
     p_log = sub.add_parser("logs", aliases=["tail"], help="View or follow stdout/stderr/condor logs")
     p_log.add_argument("run", nargs="?", default="latest", help="Run ID, index (#), or 'latest'")
@@ -2188,6 +2243,8 @@ def main() -> None:
         cmd_top(args, runs_root)
     elif cmd in ("ssh", "shell"):
         cmd_ssh(args, runs_root)
+    elif cmd in ("path", "dir", "where"):
+        cmd_path(args, runs_root)
     elif cmd in ("logs", "tail"):
         cmd_logs(args, runs_root)
     elif cmd in ("retry", "resume", "continue"):
