@@ -118,6 +118,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Export custom environment variable(s) inside job.sh, e.g. -e WANDB_MODE=offline",
     )
     parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Wait for job to start and follow live stdout until completion",
+    )
+    parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation prompt and submit immediately"
     )
     parser.add_argument(
@@ -705,15 +711,10 @@ def main() -> None:
         locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
         update_latest_symlink(runs_root, run_dir)
 
-        first_out = (
-            f"runs/latest/{target_path.stem}_0.out"
+        first_out_file = (
+            run_dir / f"{target_path.stem}_0.out"
             if is_sweep
-            else f"runs/latest/{target_path.stem}.out"
-        )
-        first_err = (
-            f"runs/latest/{target_path.stem}_0.err"
-            if is_sweep
-            else f"runs/latest/{target_path.stem}.err"
+            else run_dir / f"{target_path.stem}.out"
         )
         condor_q_cmd = f"condor_q {cluster_id}" if cluster_id else "condor_q"
 
@@ -721,14 +722,19 @@ def main() -> None:
             Panel(
                 f"[bold green]✔ {condor_out}[/bold green]\n\n"
                 f"  • [bold]Manage Run    :[/bold] [cyan]runs inspect latest[/cyan]\n"
-                f"  • [bold]Monitor Queue :[/bold] [cyan]{condor_q_cmd}[/cyan]\n"
-                f"  • [bold]Live Stdout   :[/bold] [cyan]tail -f {first_out}[/cyan]\n"
-                f"  • [bold]Live Stderr   :[/bold] [cyan]tail -f {first_err}[/cyan]",
+                f"  • [bold]Live Table    :[/bold] [cyan]runs watch[/cyan]  [dim](or {condor_q_cmd})[/dim]\n"
+                f"  • [bold]Follow Stdout :[/bold] [cyan]runs logs -f[/cyan]\n"
+                f"  • [bold]Follow Stderr :[/bold] [cyan]runs logs -e -f[/cyan]",
                 title="[bold green]🎉 Job Submitted to Hermes 2[/bold green]",
                 border_style="green",
                 expand=False,
             )
         )
+
+        if args.follow:
+            from hermes_tools.runs_cli import follow_run_log
+
+            follow_run_log(run_dir, first_out_file, initial_lines=60)
 
     except FileNotFoundError:
         locked_mutate_run_json(

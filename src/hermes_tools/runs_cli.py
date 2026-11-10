@@ -530,21 +530,97 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs logs`
 # ---------------------------------------------------------------------------
-def _follow_file_python(log_file: Path, initial_lines: int) -> None:
+def follow_run_log(run_dir: Path, log_file: Path, initial_lines: int = 60) -> None:
+    """
+    Waits if the job is still QUEUED, prints the last `initial_lines` in O(1) memory,
+    streams live output, and exits automatically once the run reaches a terminal status.
+    """
     try:
-        tail = tail_file_lines(log_file, initial_lines)
-        if tail:
-            sys.stdout.write("\n".join(tail) + "\n")
-            sys.stdout.flush()
+        if not log_file.is_file():
+            raw_rj = load_run_json(run_dir)
+            if not run_needs_live_reconcile(raw_rj):
+                console.print(f"[bold red]✘ Log file not found:[/bold red] {log_file}")
+                sys.exit(1)
+
+            console.print(
+                f"[dim yellow]⏳ Waiting for job to start and create {log_file.name} (Ctrl+C to detach)...[/dim yellow]"
+            )
+            wait_ticks = 0
+            while not log_file.is_file():
+                time.sleep(0.4)
+                wait_ticks += 1
+                if wait_ticks % 8 == 0:
+                    raw_rj = load_run_json(run_dir)
+                    rec = reconcile_run(run_dir, raw_rj, query_live_condor_clusters())
+                    st = str(rec.get("_live_badge") or rec.get("status", "UNKNOWN"))
+                    if st.startswith("HELD"):
+                        reasons = rec.get("_hold_reasons") or []
+                        r_str = f": {' ; '.join(reasons)}" if reasons else ""
+                        console.print(
+                            f"[bold magenta]⚠ Job entered HELD state{r_str}[/bold magenta]"
+                        )
+                        return
+                    if not run_needs_live_reconcile(rec) and "_live_badge" not in rec:
+                        if log_file.is_file():
+                            break
+                        console.print(
+                            f"[yellow]ℹ Job finished ({style_status(st)}) without creating {log_file.name}.[/yellow]"
+                        )
+                        return
+
+        console.print(
+            f"[dim cyan]Following {log_file.name} (auto-exits when job finishes, Ctrl+C to detach)...[/dim cyan]"
+        )
         with open(log_file, "r", encoding="utf-8", errors="replace") as f:
             f.seek(0, os.SEEK_END)
+            end_offset = f.tell()
+            tail = tail_file_lines(log_file, initial_lines)
+            if tail:
+                sys.stdout.write("\n".join(tail) + "\n")
+                sys.stdout.flush()
+            f.seek(end_offset, os.SEEK_SET)
+
+            idle_ticks = 0
             while True:
                 line = f.readline()
                 if line:
                     sys.stdout.write(line)
                     sys.stdout.flush()
-                else:
-                    time.sleep(0.25)
+                    idle_ticks = 0
+                    continue
+
+                time.sleep(0.25)
+                idle_ticks += 1
+                if idle_ticks >= 4:
+                    raw_rj = load_run_json(run_dir)
+                    if not run_needs_live_reconcile(raw_rj):
+                        time.sleep(0.15)
+                        rem = f.read()
+                        if rem:
+                            sys.stdout.write(rem)
+                            sys.stdout.flush()
+                        st = str(raw_rj.get("status", "COMPLETED"))
+                        console.rule(
+                            f"[dim]Run finished:[/dim] {style_status(st)}",
+                            style="dim cyan",
+                        )
+                        return
+                    if idle_ticks % 16 == 0:
+                        rec = reconcile_run(
+                            run_dir, raw_rj, query_live_condor_clusters()
+                        )
+                        if not run_needs_live_reconcile(rec) and "_live_badge" not in rec:
+                            time.sleep(0.15)
+                            rem = f.read()
+                            if rem:
+                                sys.stdout.write(rem)
+                                sys.stdout.flush()
+                            st = str(rec.get("status", "UNKNOWN"))
+                            console.rule(
+                                f"[dim]Run finished:[/dim] {style_status(st)}",
+                                style="dim cyan",
+                            )
+                            return
     except KeyboardInterrupt:
         return
 
@@ -585,28 +661,32 @@ def cmd_logs(args: argparse.Namespace, runs_root: Path) -> None:
         else:
             log_file = run_dir / f"{target_stem}{ext}"
 
+    if args.follow:
+        follow_run_log(run_dir, log_file, args.lines)
+        return
+
     if not log_file.is_file():
+        st = str(data.get("status", "UNKNOWN"))
+        if st.startswith("QUEUED"):
+            console.print(
+                f"[yellow]⏳ Run [bold]{run_dir.name}[/bold] is currently {st} ({log_file.name} not created yet).[/yellow]\n"
+                f"  [dim]Tip: Use [bold]runs logs -f[/bold] to wait for start and stream live.[/dim]"
+            )
+            return
         console.print(f"[bold red]✘ Log file not found:[/bold red] {log_file}")
         sys.exit(1)
 
-    if args.follow:
-        console.print(f"[dim cyan]Following {log_file} (Ctrl+C to exit)...[/dim cyan]")
-        if os.name == "posix" and shutil.which("tail"):
-            os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(log_file)])
-        else:
-            _follow_file_python(log_file, args.lines)
-    else:
-        snippet = "\n".join(tail_file_lines(log_file, args.lines))
-        rel_title = (
-            log_file.relative_to(runs_root.parent)
-            if log_file.is_relative_to(runs_root.parent)
-            else log_file
-        )
-        console.rule(f"[bold cyan]{rel_title}[/bold cyan]", style="cyan")
-        if snippet:
-            sys.stdout.write(snippet + "\n")
-            sys.stdout.flush()
-        console.rule(style="dim cyan")
+    snippet = "\n".join(tail_file_lines(log_file, args.lines))
+    rel_title = (
+        log_file.relative_to(runs_root.parent)
+        if log_file.is_relative_to(runs_root.parent)
+        else log_file
+    )
+    console.rule(f"[bold cyan]{rel_title}[/bold cyan]", style="cyan")
+    if snippet:
+        sys.stdout.write(snippet + "\n")
+        sys.stdout.flush()
+    console.rule(style="dim cyan")
 
 
 # ---------------------------------------------------------------------------

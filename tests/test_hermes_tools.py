@@ -513,3 +513,57 @@ def test_hold_reason_surfacing_and_batch_stop_all(tmp_path: Path, monkeypatch: p
     runs_cli.cmd_stop(args, tmp_path / "runs")
     assert load_run_json(run_dir)["status"] == "ABORTED"
 
+
+def test_follow_run_log_waits_for_start_and_auto_exits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import hermes_tools.runs_cli as runs_cli
+
+    run_dir = tmp_path / "runs" / "2026-11-05_18-00-00_train_GPU3090"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+    log_file = run_dir / "train.out"
+
+    atomic_write_json(
+        run_dir / "run.json",
+        {
+            "run_id": run_dir.name,
+            "status": "QUEUED",
+            "submission": {"cluster_id": 600, "target": "train.py"},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [],
+        },
+        repro_dir,
+    )
+
+    sleep_calls = 0
+
+    def fake_sleep(sec: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            # Job starts and writes initial output
+            log_file.write_text("epoch 1\n", encoding="utf-8")
+        elif sleep_calls == 4:
+            # Job writes more output and completes
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("epoch 2\n")
+            atomic_write_json(
+                run_dir / "run.json",
+                {
+                    "run_id": run_dir.name,
+                    "status": "COMPLETED",
+                    "submission": {"cluster_id": 600, "target": "train.py"},
+                    "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+                    "executions": [{"process_id": 0, "exit_code": 0}],
+                },
+                repro_dir,
+            )
+
+    monkeypatch.setattr(runs_cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+
+    runs_cli.follow_run_log(run_dir, log_file, initial_lines=10)
+    captured = capsys.readouterr().out
+    assert "epoch 1" in captured
+    assert "epoch 2" in captured
+    assert "COMPLETED" in captured
+
