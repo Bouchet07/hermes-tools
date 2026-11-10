@@ -824,14 +824,14 @@ Reason for last match failure: PREEMPTION_REQUIREMENTS == False
     assert parsed["attributes"]["RequestMemory"] == "16384"
     assert len(parsed["steps"]) == 6
     assert parsed["steps"][4]["slots"] == 28
-    assert parsed["steps"][4]["hint"] == "RequestCpus=16"
-    assert parsed["steps"][3]["hint"] == "16384 MB / 16 GB"
+    assert parsed["steps"][4]["hint"] == "16 CPUs"
+    assert parsed["steps"][3]["hint"] == "16 GB (16384 MB)"
     assert parsed["machines_total"] == 55
     assert parsed["summary"]["able_to_run"] == 6
     assert parsed["summary"]["rejected_by_job"] == 35
     assert parsed["summary"]["rejected_by_node"] == 14
-    assert "6 of 55 machines match all requirements" in parsed["verdict"]
-    assert "PREEMPTION_REQUIREMENTS == False" in parsed["verdict"]
+    assert "● ELIGIBLE — 6 of 55 machines match all requirements" in parsed["verdict"]
+    assert "PREEMPTION_REQUIREMENTS == False" in parsed["scheduler_note"]
 
     runs_root = tmp_path / "runs"
     rd = runs_root / "2026-11-10_11-45-00_train_GPU3090"

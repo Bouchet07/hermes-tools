@@ -1578,18 +1578,19 @@ def _render_queue_analysis_panel(
     summary = analysis.get("summary") or {}
     verdict = str(analysis.get("verdict") or "")
     v_style = str(analysis.get("verdict_style") or "white")
+    sched_note = str(analysis.get("scheduler_note") or "")
     jid_label = str(analysis.get("job_id") or job_target)
 
     info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
     info_tbl.add_column("V", style="white")
-    info_tbl.add_row("Diagnosis", f"[{v_style}]{verdict}[/{v_style}]")
+    info_tbl.add_row("Verdict", f"[{v_style}]{verdict}[/{v_style}]")
+    if sched_note:
+        info_tbl.add_row("Scheduler Note", f"[dim]{sched_note}[/dim]")
 
     last_fail = str(analysis.get("last_failed_match") or "")
-    fail_reason = str(analysis.get("failure_reason") or "")
-    if last_fail or fail_reason:
-        reason_sfx = f"  [dim](Reason: {fail_reason})[/dim]" if fail_reason else ""
-        info_tbl.add_row("Last Match Check", f"{last_fail or '—'}{reason_sfx}")
+    if last_fail:
+        info_tbl.add_row("Last Match Check", last_fail)
 
     if machines_total > 0:
         able = int(summary.get("able_to_run", 0))
@@ -1603,12 +1604,19 @@ def _render_queue_analysis_panel(
                 f"[bold green]{able} eligible[/bold green] · "
                 f"[cyan]{others} busy (others)[/cyan] · "
                 f"[cyan]{yours} busy (yours)[/cyan] · "
-                f"[yellow]{rej_job} rejected by job reqs[/yellow] · "
-                f"[dim]{rej_node} rejected by node policy[/dim]"
+                f"[yellow]{rej_job} job-rejected[/yellow] · "
+                f"[dim]{rej_node} node-policy[/dim]"
             ),
         )
 
-    renderables: List[Any] = [info_tbl]
+    console.print(
+        Panel(
+            info_tbl,
+            title=f"[bold cyan]🔍 Queue Match Analysis — Job {jid_label}[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
 
     if steps:
         max_slots = max(int(s["slots"]) for s in steps)
@@ -1616,42 +1624,37 @@ def _render_queue_analysis_panel(
         min_nonzero = min(non_zero) if non_zero else 0
 
         step_tbl = Table(
-            title="Requirements Slot Funnel",
+            title=f"🎯 Requirements Slot Funnel (Job {jid_label})",
             title_style="bold cyan",
-            box=box.SIMPLE_HEAVY,
+            box=box.ROUNDED,
             header_style="bold cyan",
         )
         step_tbl.add_column("Step", style="dim", no_wrap=True)
         step_tbl.add_column("Slots", justify="right", no_wrap=True)
-        step_tbl.add_column("Condition", style="white")
+        step_tbl.add_column("Requirement", style="white")
         step_tbl.add_column("Requested", style="cyan", no_wrap=True)
 
         for s in steps:
             cnt = int(s["slots"])
+            cond_str = str(s["condition"])
             if cnt == 0:
-                cnt_cell = "[bold red]0[/bold red]"
+                cnt_cell = "[bold red]● 0[/bold red]"
+                cond_str = f"[bold red]{cond_str}[/bold red] [red](blocking)[/red]"
             elif cnt == min_nonzero and min_nonzero < max_slots:
-                cnt_cell = f"[bold yellow]{cnt}[/bold yellow]"
+                cnt_cell = f"[bold yellow]● {cnt}[/bold yellow]"
+                cond_str = f"{cond_str} [yellow](tightest)[/yellow]"
             else:
-                cnt_cell = f"[green]{cnt}[/green]"
+                cnt_cell = f"[green]● {cnt}[/green]"
             step_tbl.add_row(
                 str(s["step"]),
                 cnt_cell,
-                str(s["condition"]),
+                cond_str,
                 str(s.get("hint") or "—"),
             )
-        renderables.append(step_tbl)
+        console.print(step_tbl)
     elif analysis.get("raw"):
-        renderables.append(f"[dim]{analysis['raw']}[/dim]")
+        console.print(f"[dim]{analysis['raw']}[/dim]")
 
-    console.print(
-        Panel(
-            Group(*renderables),
-            title=f"[bold cyan]⏳ Queue Match Analysis — Job {jid_label}[/bold cyan]",
-            border_style="cyan",
-            expand=False,
-        )
-    )
     return True
 
 

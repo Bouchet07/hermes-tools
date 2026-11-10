@@ -1421,24 +1421,34 @@ def parse_condor_better_analyze(raw_text: str) -> Dict[str, Any]:
         slots = int(m_step.group(2))
         cond = m_step.group(3).strip()
         hint = ""
-        if "RequestMemory" in cond and "RequestMemory" in attributes:
+        m_lit = re.search(r'==\s*"([^"]+)"', cond)
+        if m_lit:
+            hint = m_lit.group(1)
+        elif "RequestMemory" in cond and "RequestMemory" in attributes:
             rm_val = attributes["RequestMemory"]
             if rm_val.isdigit():
                 mb = int(rm_val)
-                gb_str = f"{mb / 1024:g} GB" if mb >= 1024 else f"{mb} MB"
-                hint = f"{mb} MB / {gb_str}" if mb >= 1024 else f"{mb} MB"
+                hint = f"{mb / 1024:g} GB ({mb} MB)" if mb >= 1024 else f"{mb} MB"
+        elif "RequestCpus" in cond and "RequestCpus" in attributes:
+            rc_val = attributes["RequestCpus"]
+            hint = f"{rc_val} CPUs" if rc_val.isdigit() else rc_val
+        elif "RequestGPUs" in cond and "RequestGPUs" in attributes:
+            rg_val = attributes["RequestGPUs"]
+            hint = f"{rg_val} GPUs" if rg_val.isdigit() else rg_val
         elif "RequestDisk" in cond:
             rd_val = attributes.get("RequestDisk", "")
             if rd_val in attributes:
                 rd_val = attributes[rd_val]
             if rd_val:
                 hint = f"{rd_val} KB" if rd_val.isdigit() else rd_val
+        elif "FileSystemDomain" in cond and "FileSystemDomain" in attributes:
+            hint = attributes["FileSystemDomain"]
         else:
             for k, v in attributes.items():
                 if k in ("FileSystemDomain", "DiskUsage"):
                     continue
                 if re.search(rf"\b{re.escape(k)}\b", cond):
-                    hint = f"{k}={v}"
+                    hint = v
                     break
         steps.append(
             {
@@ -1467,42 +1477,36 @@ def parse_condor_better_analyze(raw_text: str) -> Dict[str, Any]:
     able_to_run = _extract_int(r"(\d+)\s+are able to run your job")
 
     zero_steps = [s for s in steps if s["slots"] == 0]
+    scheduler_note = ""
     if able_to_run > 0:
-        if "PREEMPTION_REQUIREMENTS" in failure_reason:
-            verdict = (
-                f"✔ {able_to_run} of {machines_total} machines match all requirements. "
-                f"Waiting for the next negotiator cycle (or busy slots have preemption disabled: {failure_reason})."
-            )
-        else:
-            verdict = (
-                f"✔ {able_to_run} of {machines_total} machines are eligible to run this job — "
-                "waiting for the next HTCondor negotiator dispatch cycle."
-            )
+        verdict = f"● ELIGIBLE — {able_to_run} of {machines_total} machines match all requirements"
         verdict_style = "bold green"
+        if "PREEMPTION_REQUIREMENTS" in failure_reason:
+            scheduler_note = f"Waiting for next negotiator cycle (busy slots cannot be preempted: {failure_reason})"
+        elif failure_reason:
+            scheduler_note = f"Waiting for next negotiator cycle ({failure_reason})"
+        else:
+            scheduler_note = "Waiting for next HTCondor negotiator dispatch cycle"
     elif zero_steps:
         zero_conds = ", ".join(s["condition"] for s in zero_steps)
-        verdict = (
-            f"✖ Bottleneck: 0 slots matched [{zero_conds}]. "
-            "Your job's resource request exceeds available cluster hardware."
-        )
+        verdict = f"● BLOCKED — 0 slots matched [{zero_conds}]"
         verdict_style = "bold red"
+        scheduler_note = "Requested resources exceed available cluster hardware"
     elif serving_others > 0 or running_your_jobs > 0:
         verdict = (
-            f"⏳ Hardware request is valid, but all {serving_others + running_your_jobs} compatible "
-            f"machines are currently busy ({serving_others} serving other users, {running_your_jobs} running your jobs)."
+            f"● WAITING — All {serving_others + running_your_jobs} compatible machines are currently busy"
         )
         verdict_style = "bold yellow"
+        scheduler_note = f"{serving_others} serving other users · {running_your_jobs} running your jobs"
     elif machines_total > 0:
-        verdict = (
-            f"⏳ 0 machines immediately available out of {machines_total} "
-            f"({rejected_by_job} lacked requested resources, {rejected_by_node} rejected by node/pool policy)."
-        )
+        verdict = f"● WAITING — 0 of {machines_total} machines immediately available"
         verdict_style = "bold yellow"
+        scheduler_note = f"{rejected_by_job} lacked requested resources · {rejected_by_node} rejected by node/pool policy"
     elif failure_reason:
-        verdict = f"⏳ Last match failure: {failure_reason}"
+        verdict = f"● WAITING — {failure_reason}"
         verdict_style = "bold yellow"
     else:
-        verdict = "No structured match analysis available (job may already be running or finished)."
+        verdict = "○ No structured match analysis available (job may already be running or finished)"
         verdict_style = "dim"
 
     return {
@@ -1521,6 +1525,7 @@ def parse_condor_better_analyze(raw_text: str) -> Dict[str, Any]:
         },
         "verdict": verdict,
         "verdict_style": verdict_style,
+        "scheduler_note": scheduler_note,
         "raw": text,
     }
 
