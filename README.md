@@ -310,14 +310,23 @@ runs watch                     # Flicker-free live dashboard (refreshes only whe
 runs watch -i 5 -s RUNNING     # Poll every 5s, showing only running jobs
 ```
 
-### 6.2 `runs inspect` (`info`, `show`)
+### 6.2 `runs inspect` (`info`, `show`) & `runs why` (`analyze`, `q`)
 
-Displays full provenance metadata, HTCondor `HoldReason` (if a job is `HELD`), per-process hardware/runtime/RAM/CPU breakdown, and the last 25 lines of any non-empty `.err` files (or `.out` tail if a run failed with an empty `.err`):
+`runs inspect` displays full provenance metadata, HTCondor `HoldReason` (if `HELD`), **live Queue Match Analysis (`condor_q -better-analyze`) whenever the run is `QUEUED` or `HELD`**, per-process hardware/runtime/RAM/CPU breakdown, and the last 25 lines of any non-empty `.err` files (or `.out` tail if a run failed with an empty `.err`):
 
 ```bash
-runs inspect latest            # Inspect most recent run
+runs inspect latest            # Inspect most recent run (includes Queue Match Analysis if QUEUED)
 runs inspect 1                 # Inspect run #1 from `runs ls`
 runs inspect 1071044           # Inspect run by HTCondor cluster ID
+```
+
+To specifically diagnose why a queued job is waiting (`condor_q -better-analyze`), use **`runs why`** (aliases: `runs analyze`, `runs q`), which translates HTCondor's slot requirement funnel, `PREEMPTION_REQUIREMENTS`, and machine rejection counts into a plain-English diagnosis:
+
+```bash
+runs why                       # Automatically analyzes your most recent QUEUED/HELD run
+runs why 1                     # Analyze run #1 from `runs ls`
+runs why 1074510.0             # Analyze any raw HTCondor ClusterId.ProcId directly
+runs why --raw                 # Show verbatim `condor_q -better-analyze` text output
 ```
 
 ### 6.3 `runs logs` (`tail`)

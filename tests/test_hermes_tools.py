@@ -770,3 +770,102 @@ def test_parse_condor_status_ads_and_runs_nodes(
     err_out = capsys.readouterr().out
     assert "Can't parse constraint: GPUs ==" in err_out
 
+
+def test_parse_condor_better_analyze_and_runs_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.condor import parse_condor_better_analyze
+
+    sample_output = """
+-- Schedd: hermes2.i3a.es : <172.16.1.122:9618?...
+The Requirements expression for job 1074510.000 is
+
+    (TARGET.Arch == "X86_64") && (TARGET.OpSys == "LINUX") && (TARGET.Disk >= RequestDisk) && (TARGET.Memory >= RequestMemory) &&
+    (TARGET.Cpus >= RequestCpus) && ((TARGET.FileSystemDomain == MY.FileSystemDomain) || (TARGET.HasFileTransfer))
+
+Job 1074510.000 defines the following attributes:
+
+    DiskUsage = 15
+    FileSystemDomain = "i3a.es"
+    RequestCpus = 16
+    RequestDisk = DiskUsage
+    RequestMemory = 16384
+
+The Requirements expression for job 1074510.000 reduces to these conditions:
+
+         Slots
+Step    Matched  Condition
+-----  --------  ---------
+[0]         392  TARGET.Arch == "X86_64"
+[1]         392  TARGET.OpSys == "LINUX"
+[3]         392  TARGET.Disk >= RequestDisk
+[5]          71  TARGET.Memory >= RequestMemory
+[7]          28  TARGET.Cpus >= RequestCpus
+[9]         392  TARGET.FileSystemDomain == MY.FileSystemDomain
+
+No successful match recorded.
+Last failed match: Tue Nov 10 11:45:46 2026
+
+Reason for last match failure: PREEMPTION_REQUIREMENTS == False
+
+1074510.000:  Run analysis summary ignoring user priority.  Of 55 machines,
+     35 are rejected by your job's requirements
+     14 reject your job because of their own requirements
+      0 match and are already running your jobs
+      0 match but are serving other users
+      6 are able to run your job
+"""
+
+    parsed = parse_condor_better_analyze(sample_output)
+    assert parsed["job_id"] == "1074510.0"
+    assert parsed["attributes"]["RequestCpus"] == "16"
+    assert parsed["attributes"]["RequestMemory"] == "16384"
+    assert len(parsed["steps"]) == 6
+    assert parsed["steps"][4]["slots"] == 28
+    assert parsed["steps"][4]["hint"] == "RequestCpus=16"
+    assert parsed["steps"][3]["hint"] == "16384 MB / 16 GB"
+    assert parsed["machines_total"] == 55
+    assert parsed["summary"]["able_to_run"] == 6
+    assert parsed["summary"]["rejected_by_job"] == 35
+    assert parsed["summary"]["rejected_by_node"] == 14
+    assert "6 of 55 machines match all requirements" in parsed["verdict"]
+    assert "PREEMPTION_REQUIREMENTS == False" in parsed["verdict"]
+
+    runs_root = tmp_path / "runs"
+    rd = runs_root / "2026-11-10_11-45-00_train_GPU3090"
+    rd.mkdir(parents=True)
+    (rd / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": rd.name,
+                "status": "QUEUED",
+                "submission": {"cluster_id": 1074510, "target": "train.py"},
+                "resources_requested": {"architecture": "GPU3090", "cpus": 16, "memory_mb": 16384, "gpus": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {1074510: {"total": 1, "running": 0, "idle": 1, "held": 0, "hold_reasons": []}})
+    monkeypatch.setattr(runs_cli, "query_condor_better_analyze", lambda jid: parsed)
+
+    # 1. Test `runs why` auto-selecting the QUEUED run
+    why_args = argparse.Namespace(run=None, proc=0, raw=False)
+    runs_cli.cmd_why(why_args, runs_root)
+    why_out = capsys.readouterr().out
+    assert "Queue Match Analysis" in why_out
+    assert "1074510.0" in why_out
+    assert "6 eligible" in why_out
+    assert "TARGET.Cpus >= RequestCpus" in why_out
+
+    # 2. Test `runs inspect` automatically embedding the Queue Match Analysis panel when QUEUED
+    ins_args = argparse.Namespace(run=rd.name)
+    runs_cli.cmd_inspect(ins_args, runs_root)
+    ins_out = capsys.readouterr().out
+    assert "Run Provenance & Telemetry" in ins_out
+    assert "Queue Match Analysis" in ins_out
+    assert "6 eligible" in ins_out
+
+

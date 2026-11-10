@@ -5,6 +5,7 @@ condor.py — Hermes 2 architecture specs, job.sh/job.sub generators, and live c
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -1375,3 +1376,173 @@ def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
         for u, cnt in (n.get("users") or {}).items():
             p["users"][u] = p["users"].get(u, 0) + int(cnt)
     return pools
+
+
+# ---------------------------------------------------------------------------
+# Queue Match Analysis (`condor_q -better-analyze`)
+# ---------------------------------------------------------------------------
+def parse_condor_better_analyze(raw_text: str) -> Dict[str, Any]:
+    """
+    Parses `condor_q -better-analyze` output into structured requirement steps,
+    attribute definitions, machine summary counts, and a plain-English verdict.
+    """
+    text = (raw_text or "").strip()
+    job_id = ""
+    m_job = re.search(r"Requirements expression for job (\d+\.\d+)", text) or re.search(
+        r"^(\d+\.\d+):", text, re.MULTILINE
+    )
+    if m_job:
+        raw_jid = m_job.group(1)
+        parts = raw_jid.split(".", 1)
+        job_id = f"{parts[0]}.{int(parts[1])}" if len(parts) == 2 and parts[1].isdigit() else raw_jid
+
+    attributes: Dict[str, str] = {}
+    in_attrs = False
+    for line in text.splitlines():
+        s = line.strip()
+        if "defines the following attributes:" in s:
+            in_attrs = True
+            continue
+        if in_attrs:
+            if not s:
+                if attributes:
+                    in_attrs = False
+                continue
+            if s.startswith("The Requirements expression") or s.startswith("Slots"):
+                in_attrs = False
+                continue
+            if "=" in s:
+                k, v = s.split("=", 1)
+                attributes[k.strip()] = v.strip().strip('"')
+
+    steps: List[Dict[str, Any]] = []
+    for m_step in re.finditer(r"^\s*(\[\d+\])\s+(\d+)\s+(.+?)\s*$", text, re.MULTILINE):
+        step_id = m_step.group(1)
+        slots = int(m_step.group(2))
+        cond = m_step.group(3).strip()
+        hint = ""
+        if "RequestMemory" in cond and "RequestMemory" in attributes:
+            rm_val = attributes["RequestMemory"]
+            if rm_val.isdigit():
+                mb = int(rm_val)
+                gb_str = f"{mb / 1024:g} GB" if mb >= 1024 else f"{mb} MB"
+                hint = f"{mb} MB / {gb_str}" if mb >= 1024 else f"{mb} MB"
+        elif "RequestDisk" in cond:
+            rd_val = attributes.get("RequestDisk", "")
+            if rd_val in attributes:
+                rd_val = attributes[rd_val]
+            if rd_val:
+                hint = f"{rd_val} KB" if rd_val.isdigit() else rd_val
+        else:
+            for k, v in attributes.items():
+                if k in ("FileSystemDomain", "DiskUsage"):
+                    continue
+                if re.search(rf"\b{re.escape(k)}\b", cond):
+                    hint = f"{k}={v}"
+                    break
+        steps.append(
+            {
+                "step": step_id,
+                "slots": slots,
+                "condition": cond,
+                "hint": hint,
+            }
+        )
+
+    m_last = re.search(r"Last failed match:\s*(.+)", text)
+    last_failed_match = m_last.group(1).strip() if m_last else ""
+
+    m_reason = re.search(r"Reason for last match failure:\s*(.+)", text)
+    failure_reason = m_reason.group(1).strip() if m_reason else ""
+
+    def _extract_int(pattern: str) -> int:
+        m = re.search(pattern, text)
+        return int(m.group(1)) if m else 0
+
+    machines_total = _extract_int(r"Of\s+(\d+)\s+machines")
+    rejected_by_job = _extract_int(r"(\d+)\s+are rejected by your job's requirements")
+    rejected_by_node = _extract_int(r"(\d+)\s+reject your job because of their own requirements")
+    running_your_jobs = _extract_int(r"(\d+)\s+match and are already running your jobs")
+    serving_others = _extract_int(r"(\d+)\s+match but are serving other users")
+    able_to_run = _extract_int(r"(\d+)\s+are able to run your job")
+
+    zero_steps = [s for s in steps if s["slots"] == 0]
+    if able_to_run > 0:
+        if "PREEMPTION_REQUIREMENTS" in failure_reason:
+            verdict = (
+                f"✔ {able_to_run} of {machines_total} machines match all requirements. "
+                f"Waiting for the next negotiator cycle (or busy slots have preemption disabled: {failure_reason})."
+            )
+        else:
+            verdict = (
+                f"✔ {able_to_run} of {machines_total} machines are eligible to run this job — "
+                "waiting for the next HTCondor negotiator dispatch cycle."
+            )
+        verdict_style = "bold green"
+    elif zero_steps:
+        zero_conds = ", ".join(s["condition"] for s in zero_steps)
+        verdict = (
+            f"✖ Bottleneck: 0 slots matched [{zero_conds}]. "
+            "Your job's resource request exceeds available cluster hardware."
+        )
+        verdict_style = "bold red"
+    elif serving_others > 0 or running_your_jobs > 0:
+        verdict = (
+            f"⏳ Hardware request is valid, but all {serving_others + running_your_jobs} compatible "
+            f"machines are currently busy ({serving_others} serving other users, {running_your_jobs} running your jobs)."
+        )
+        verdict_style = "bold yellow"
+    elif machines_total > 0:
+        verdict = (
+            f"⏳ 0 machines immediately available out of {machines_total} "
+            f"({rejected_by_job} lacked requested resources, {rejected_by_node} rejected by node/pool policy)."
+        )
+        verdict_style = "bold yellow"
+    elif failure_reason:
+        verdict = f"⏳ Last match failure: {failure_reason}"
+        verdict_style = "bold yellow"
+    else:
+        verdict = "No structured match analysis available (job may already be running or finished)."
+        verdict_style = "dim"
+
+    return {
+        "job_id": job_id,
+        "attributes": attributes,
+        "steps": steps,
+        "last_failed_match": last_failed_match,
+        "failure_reason": failure_reason,
+        "machines_total": machines_total,
+        "summary": {
+            "rejected_by_job": rejected_by_job,
+            "rejected_by_node": rejected_by_node,
+            "running_your_jobs": running_your_jobs,
+            "serving_others": serving_others,
+            "able_to_run": able_to_run,
+        },
+        "verdict": verdict,
+        "verdict_style": verdict_style,
+        "raw": text,
+    }
+
+
+def query_condor_better_analyze(job_target: str) -> Optional[Dict[str, Any]]:
+    """Runs `condor_q -better-analyze <job_target>` and returns parsed diagnosis."""
+    if not shutil.which("condor_q"):
+        return None
+    try:
+        res = subprocess.run(
+            ["condor_q", "-better-analyze", str(job_target)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=12,
+        )
+        combined = (res.stdout or "").strip()
+        if not combined:
+            combined = (res.stderr or "").strip()
+        if not combined:
+            return None
+        return parse_condor_better_analyze(combined)
+    except Exception:
+        return None

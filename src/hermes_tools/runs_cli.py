@@ -25,6 +25,7 @@ from hermes_tools.condor import (
     generate_retry_sub_file,
     get_all_cluster_ids,
     get_failed_or_missing_procs,
+    query_condor_better_analyze,
     query_condor_nodes,
     query_live_condor_clusters,
     reconcile_run,
@@ -443,6 +444,9 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
             expand=False,
         )
     )
+
+    if cids and display_status.startswith(("QUEUED", "HELD")):
+        _render_queue_analysis_panel(f"{cids[-1]}.0", quiet_if_empty=True)
 
     records = get_execution_records(data)
 
@@ -1539,6 +1543,175 @@ def cmd_nodes(args: argparse.Namespace, runs_root: Optional[Path] = None) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: `runs why` (`analyze`, `q`) — Queue Match Analysis
+# ---------------------------------------------------------------------------
+def _render_queue_analysis_panel(
+    job_target: str,
+    raw_mode: bool = False,
+    quiet_if_empty: bool = False,
+) -> bool:
+    from rich.console import Group
+
+    analysis = query_condor_better_analyze(job_target)
+    if analysis is None:
+        if not quiet_if_empty:
+            console.print(
+                "[yellow]⚠ 'condor_q -better-analyze' is not available or returned no output (are you on hermes2?).[/yellow]"
+            )
+        return False
+
+    if raw_mode:
+        console.print(
+            Panel(
+                analysis["raw"],
+                title=f"[bold cyan]⏳ Raw Queue Match Analysis — Job {analysis.get('job_id') or job_target}[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        return True
+
+    steps = analysis.get("steps") or []
+    machines_total = int(analysis.get("machines_total") or 0)
+    if not steps and machines_total == 0 and quiet_if_empty:
+        return False
+
+    summary = analysis.get("summary") or {}
+    verdict = str(analysis.get("verdict") or "")
+    v_style = str(analysis.get("verdict_style") or "white")
+    jid_label = str(analysis.get("job_id") or job_target)
+
+    info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
+    info_tbl.add_column("V", style="white")
+    info_tbl.add_row("Diagnosis", f"[{v_style}]{verdict}[/{v_style}]")
+
+    last_fail = str(analysis.get("last_failed_match") or "")
+    fail_reason = str(analysis.get("failure_reason") or "")
+    if last_fail or fail_reason:
+        reason_sfx = f"  [dim](Reason: {fail_reason})[/dim]" if fail_reason else ""
+        info_tbl.add_row("Last Match Check", f"{last_fail or '—'}{reason_sfx}")
+
+    if machines_total > 0:
+        able = int(summary.get("able_to_run", 0))
+        others = int(summary.get("serving_others", 0))
+        yours = int(summary.get("running_your_jobs", 0))
+        rej_job = int(summary.get("rejected_by_job", 0))
+        rej_node = int(summary.get("rejected_by_node", 0))
+        info_tbl.add_row(
+            f"Machines ({machines_total} tot)",
+            (
+                f"[bold green]{able} eligible[/bold green] · "
+                f"[cyan]{others} busy (others)[/cyan] · "
+                f"[cyan]{yours} busy (yours)[/cyan] · "
+                f"[yellow]{rej_job} rejected by job reqs[/yellow] · "
+                f"[dim]{rej_node} rejected by node policy[/dim]"
+            ),
+        )
+
+    renderables: List[Any] = [info_tbl]
+
+    if steps:
+        max_slots = max(int(s["slots"]) for s in steps)
+        non_zero = [int(s["slots"]) for s in steps if int(s["slots"]) > 0]
+        min_nonzero = min(non_zero) if non_zero else 0
+
+        step_tbl = Table(
+            title="Requirements Slot Funnel",
+            title_style="bold cyan",
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+        )
+        step_tbl.add_column("Step", style="dim", no_wrap=True)
+        step_tbl.add_column("Slots", justify="right", no_wrap=True)
+        step_tbl.add_column("Condition", style="white")
+        step_tbl.add_column("Requested", style="cyan", no_wrap=True)
+
+        for s in steps:
+            cnt = int(s["slots"])
+            if cnt == 0:
+                cnt_cell = "[bold red]0[/bold red]"
+            elif cnt == min_nonzero and min_nonzero < max_slots:
+                cnt_cell = f"[bold yellow]{cnt}[/bold yellow]"
+            else:
+                cnt_cell = f"[green]{cnt}[/green]"
+            step_tbl.add_row(
+                str(s["step"]),
+                cnt_cell,
+                str(s["condition"]),
+                str(s.get("hint") or "—"),
+            )
+        renderables.append(step_tbl)
+    elif analysis.get("raw"):
+        renderables.append(f"[dim]{analysis['raw']}[/dim]")
+
+    console.print(
+        Panel(
+            Group(*renderables),
+            title=f"[bold cyan]⏳ Queue Match Analysis — Job {jid_label}[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    return True
+
+
+def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
+    target = getattr(args, "run", None)
+    proc_idx = int(getattr(args, "proc", 0) or 0)
+    raw_mode = bool(getattr(args, "raw", False))
+
+    # Allow passing a raw cluster.proc ID directly (e.g. `runs why 1074510.0`)
+    if target and re.match(r"^\d+\.\d+$", str(target).strip()):
+        _render_queue_analysis_panel(str(target).strip(), raw_mode=raw_mode)
+        return
+
+    # If no target specified, prefer the most recent QUEUED/HELD run, falling back to `latest`
+    run_dir: Optional[Path] = None
+    if not target:
+        live_clusters = query_live_condor_clusters()
+        for rd in list_run_dirs(runs_root)[:25]:
+            d = load_run_json(rd)
+            if not d:
+                continue
+            if run_needs_live_reconcile(d):
+                d = reconcile_run(rd, d, live_clusters)
+            st = str(d.get("_live_badge") or d.get("status", ""))
+            if st.startswith(("QUEUED", "HELD")):
+                run_dir = rd
+                break
+        if run_dir is None:
+            run_dir = resolve_run_dir(runs_root, "latest")
+    else:
+        # Check if target is a raw cluster ID that doesn't match a local run
+        run_dir = resolve_run_dir(runs_root, target)
+        if run_dir is None and str(target).strip().isdigit():
+            _render_queue_analysis_panel(f"{str(target).strip()}.{proc_idx}", raw_mode=raw_mode)
+            return
+
+    if not run_dir:
+        sys.exit(1)
+
+    data = load_run_json(run_dir)
+    if not data:
+        console.print(f"[red]✖ Could not read run.json in {run_dir.name}.[/red]")
+        sys.exit(1)
+
+    live_clusters = query_live_condor_clusters()
+    data = reconcile_run(run_dir, data, live_clusters)
+    cids = get_all_cluster_ids(data)
+    if not cids:
+        console.print(f"[yellow]⚠ Run '{run_dir.name}' has no HTCondor cluster ID.[/yellow]")
+        sys.exit(1)
+
+    job_target = f"{cids[-1]}.{proc_idx}"
+    console.print(
+        f"[dim]Analyzing run[/dim] [bold white]{run_dir.name}[/bold white] "
+        f"[dim](Job {job_target}, Status:[/dim] {style_status(str(data.get('_live_badge') or data.get('status', 'UNKNOWN')))}[dim])[/dim]"
+    )
+    _render_queue_analysis_panel(job_target, raw_mode=raw_mode)
+
+
+# ---------------------------------------------------------------------------
 # CLI Argument Parser & Entrypoint
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -1562,9 +1735,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("-i", "--interval", type=int, default=2, help="Refresh interval in seconds (default: 2)")
 
     p_ins = sub.add_parser(
-        "inspect", aliases=["info", "show"], help="Inspect run telemetry and stderr tails"
+        "inspect", aliases=["info", "show"], help="Inspect run telemetry, queue match analysis, and stderr tails"
     )
     p_ins.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
+
+    p_why = sub.add_parser(
+        "why",
+        aliases=["analyze", "q"],
+        help="Analyze why a queued job is waiting (condor_q -better-analyze)",
+    )
+    p_why.add_argument(
+        "run",
+        nargs="?",
+        help="Run ID, index (#), cluster ID (e.g. 1074510.0), or defaults to latest queued run",
+    )
+    p_why.add_argument(
+        "-p", "--proc", type=int, default=0, help="Process index for sweeps (default: 0)"
+    )
+    p_why.add_argument(
+        "--raw", action="store_true", help="Show raw condor_q -better-analyze text output"
+    )
 
     p_log = sub.add_parser("logs", aliases=["tail"], help="View or follow stdout/stderr/condor logs")
     p_log.add_argument("run", nargs="?", default="latest", help="Run ID, index (#), or 'latest'")
@@ -1701,6 +1891,8 @@ def main() -> None:
         cmd_ls(args, runs_root)
     elif cmd in ("inspect", "info", "show"):
         cmd_inspect(args, runs_root)
+    elif cmd in ("why", "analyze", "q"):
+        cmd_why(args, runs_root)
     elif cmd in ("logs", "tail"):
         cmd_logs(args, runs_root)
     elif cmd in ("retry", "resume", "continue"):
