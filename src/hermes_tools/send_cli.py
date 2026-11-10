@@ -20,6 +20,7 @@ from rich.table import Table
 
 from hermes_tools.condor import (
     ARCH_SPECS,
+    build_send_command_tokens,
     format_condor_arg_line,
     generate_bash_wrapper,
     generate_sub_file,
@@ -455,35 +456,25 @@ def main() -> None:
         if target_path.is_relative_to(cwd)
         else target_path.as_posix()
     )
-    cli_parts = ["send", shlex.quote(rel_target), "-a", arch]
-    if cpus:
-        cli_parts.extend(["-c", str(cpus)])
-    if mem_mb:
-        mem_flag = f"{mem_mb // 1024}G" if mem_mb % 1024 == 0 else f"{mem_mb}M"
-        cli_parts.extend(["-m", mem_flag])
-    if gpus:
-        cli_parts.extend(["-g", str(gpus)])
-    if tag:
-        cli_parts.extend(["-t", shlex.quote(tag)])
-    if no_venv_flag:
-        cli_parts.append("--no-venv")
-    elif explicit_venv_used and venv_path:
-        cli_parts.extend(["--venv", shlex.quote(venv_path.as_posix())])
-    for n in nodes_include:
-        cli_parts.extend(["--node", shlex.quote(n)])
-    for ex in nodes_exclude:
-        cli_parts.extend(["--exclude", shlex.quote(ex)])
-    if project_code:
-        cli_parts.extend(["--project", shlex.quote(str(project_code))])
-    if scratch_files:
-        cli_parts.append("--scratch")
-        cli_parts.extend(shlex.quote(sf) for sf in scratch_files)
-    for item in args.env:
-        cli_parts.extend(["-e", shlex.quote(item)])
-    if args.sweep_file:
-        cli_parts.extend(["--sweep-file", shlex.quote(str(args.sweep_file))])
-    for s in cli_sweep_specs:
-        cli_parts.extend(["-s", shlex.quote(s)])
+    base_tokens = build_send_command_tokens(
+        send_bin="send",
+        target=rel_target,
+        arch=arch,
+        cpus=cpus,
+        mem_mb=mem_mb,
+        gpus=gpus,
+        tag=tag or None,
+        no_venv=no_venv_flag,
+        venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
+        nodes_include=nodes_include,
+        nodes_exclude=nodes_exclude,
+        project_code=str(project_code) if project_code else None,
+        scratch_files=scratch_files,
+        env_items=list(args.env),
+        sweep_file=str(args.sweep_file) if args.sweep_file else None,
+        sweep_specs=cli_sweep_specs,
+    )
+    cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
     if len(sweep_list) > 1:
         if combined_single_args:
             cli_parts.extend(["--", combined_single_args])

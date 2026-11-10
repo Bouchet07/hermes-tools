@@ -107,6 +107,20 @@ def test_generate_sub_and_retry_preserves_directives(tmp_path: Path) -> None:
         is_sweep=True,
         targets=[(1, "--fold 1"), (2, "--fold 2")],
         retry_epoch=1700000000,
+        run_data={
+            "submission": {"working_directory": str(tmp_path)},
+            "resources_requested": {
+                "architecture": "A100",
+                "cpus": None,
+                "memory_mb": 131072,
+                "gpus": 2,
+                "sweep_arguments": ["--fold 0", "--fold 1", "--fold 2"],
+                "node_include": ["nv-a100-01"],
+                "node_exclude": ["her07-100.i3a.es"],
+                "project_code": "100-100",
+                "scratch_files": ["dataset.tar"],
+            },
+        },
     )
 
     assert '+Architecture           = "A100"' in retry_text

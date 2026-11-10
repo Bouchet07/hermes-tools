@@ -21,6 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from hermes_tools.condor import (
+    build_send_command_tokens,
     generate_retry_sub_file,
     get_all_cluster_ids,
     query_live_condor_clusters,
@@ -935,37 +936,25 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         send_bin = shutil.which("send") or str(Path(sys.executable).parent / "send")
         cwd = Path(data.get("submission", {}).get("working_directory", Path.cwd()))
         sub_meta = data.get("submission", {})
-        cmd = [send_bin, str(sub_meta.get("target")), "-a", str(req.get("architecture"))]
-        if req.get("cpus"):
-            cmd.extend(["-c", str(req["cpus"])])
-        if req.get("memory_mb"):
-            cmd.extend(["-m", f"{req['memory_mb']}M"])
-        if req.get("gpus") and req.get("architecture") != "GPU3090":
-            cmd.extend(["-g", str(req["gpus"])])
-        if sub_meta.get("tag"):
-            cmd.extend(["-t", str(sub_meta["tag"])])
-        if sub_meta.get("no_venv"):
-            cmd.append("--no-venv")
-        elif sub_meta.get("venv"):
-            cmd.extend(["--venv", str(sub_meta["venv"])])
-        for n in req.get("node_include") or []:
-            cmd.extend(["--node", n])
-        for ex in req.get("node_exclude") or []:
-            cmd.extend(["--exclude", ex])
-        if req.get("project_code"):
-            cmd.extend(["--project", str(req["project_code"])])
-        if req.get("scratch_files"):
-            cmd.append("--scratch")
-            cmd.extend(str(sf) for sf in req["scratch_files"])
-        for ek, ev in (req.get("env") or {}).items():
-            cmd.extend(["-e", f"{ek}={ev}"])
-        if is_sweep:
-            for _, arg_line in targets:
-                cmd.extend(["-s", arg_line])
-        elif targets[0][1]:
-            cmd.append(f"--args={targets[0][1]}")
-        if args.yes:
-            cmd.append("-y")
+        cmd = build_send_command_tokens(
+            send_bin=send_bin,
+            target=str(sub_meta.get("target")),
+            arch=str(req.get("architecture")),
+            cpus=req.get("cpus"),
+            mem_mb=req.get("memory_mb"),
+            gpus=req.get("gpus"),
+            tag=str(sub_meta["tag"]) if sub_meta.get("tag") else None,
+            no_venv=bool(sub_meta.get("no_venv")),
+            venv=str(sub_meta["venv"]) if sub_meta.get("venv") else None,
+            nodes_include=list(req.get("node_include") or []),
+            nodes_exclude=list(req.get("node_exclude") or []),
+            project_code=str(req["project_code"]) if req.get("project_code") else None,
+            scratch_files=[str(sf) for sf in (req.get("scratch_files") or [])],
+            env_items=[f"{ek}={ev}" for ek, ev in (req.get("env") or {}).items()],
+            sweep_specs=[arg_line for _, arg_line in targets] if is_sweep else None,
+            args_flag_val=targets[0][1] if (not is_sweep and targets[0][1]) else None,
+            yes=bool(args.yes),
+        )
 
         console.print(
             f"[bold cyan]▶ Relaunching via send:[/bold cyan] {' '.join(shlex.quote(c) for c in cmd)}"

@@ -687,8 +687,67 @@ def _format_retry_queue_section(
     return out
 
 
+def build_send_command_tokens(
+    *,
+    send_bin: str = "send",
+    target: str,
+    arch: str,
+    cpus: Optional[int] = None,
+    mem_mb: Optional[int] = None,
+    gpus: Optional[int] = None,
+    tag: Optional[str] = None,
+    no_venv: bool = False,
+    venv: Optional[str] = None,
+    nodes_include: Optional[List[str]] = None,
+    nodes_exclude: Optional[List[str]] = None,
+    project_code: Optional[str] = None,
+    scratch_files: Optional[List[str]] = None,
+    env_items: Optional[List[str]] = None,
+    sweep_file: Optional[str] = None,
+    sweep_specs: Optional[List[str]] = None,
+    args_flag_val: Optional[str] = None,
+    yes: bool = False,
+) -> List[str]:
+    """Builds the canonical list of CLI tokens for `send` (used by both `send` and `runs retry --new-run`)."""
+    cmd: List[str] = [send_bin, str(target), "-a", str(arch)]
+    if cpus:
+        cmd.extend(["-c", str(cpus)])
+    if mem_mb:
+        mem_str = f"{mem_mb // 1024}G" if mem_mb % 1024 == 0 else f"{mem_mb}M"
+        cmd.extend(["-m", mem_str])
+    if gpus and arch != "GPU3090":
+        cmd.extend(["-g", str(gpus)])
+    if tag:
+        cmd.extend(["-t", str(tag)])
+    if no_venv:
+        cmd.append("--no-venv")
+    elif venv:
+        cmd.extend(["--venv", str(venv)])
+    for n in nodes_include or []:
+        cmd.extend(["--node", str(n)])
+    for ex in nodes_exclude or []:
+        cmd.extend(["--exclude", str(ex)])
+    if project_code:
+        cmd.extend(["--project", str(project_code)])
+    if scratch_files:
+        cmd.append("--scratch")
+        cmd.extend(str(sf) for sf in scratch_files)
+    for item in env_items or []:
+        cmd.extend(["-e", str(item)])
+    if sweep_file:
+        cmd.extend(["--sweep-file", str(sweep_file)])
+    for s in sweep_specs or []:
+        cmd.extend(["-s", str(s)])
+    if args_flag_val:
+        cmd.append(f"--args={args_flag_val}")
+    if yes:
+        cmd.append("-y")
+    return cmd
+
+
 def generate_retry_sub_file(
-    orig_sub_path: Path,
+    orig_sub_path: Optional[Path] = None,
+    *,
     run_dir: Path,
     repro_dir: Path,
     script_stem: str,
@@ -697,57 +756,30 @@ def generate_retry_sub_file(
     retry_epoch: int,
     run_data: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    Builds `repro/job_retry.sub` directly from structured `run.json` metadata via `generate_sub_file`,
-    falling back to `orig_sub_path` header extraction only if `run.json` is not present.
-    """
+    """Builds `repro/job_retry.sub` directly from structured `run.json` metadata via `generate_sub_file`."""
     data = run_data if run_data is not None else load_run_json(run_dir)
     req = data.get("resources_requested", {})
     sub = data.get("submission", {})
-    if req.get("architecture"):
-        project_cwd = Path(sub.get("working_directory") or run_dir.parent.parent)
-        sweep_args = list(req.get("sweep_arguments") or ([""] * (2 if is_sweep else 1)))
-        return generate_sub_file(
-            sh_path=repro_dir / "job.sh",
-            project_cwd=project_cwd,
-            run_dir=run_dir,
-            repro_dir=repro_dir,
-            script_stem=script_stem,
-            arch=str(req["architecture"]),
-            cpus=req.get("cpus"),
-            mem_mb=req.get("memory_mb"),
-            gpus=req.get("gpus"),
-            sweep_args=sweep_args,
-            nodes_include=list(req.get("node_include") or []),
-            nodes_exclude=list(req.get("node_exclude") or []),
-            project_code=req.get("project_code"),
-            scratch_files=list(req.get("scratch_files") or []),
-            retry_targets=targets,
-            retry_epoch=retry_epoch,
-        )
-
-    orig_sub = orig_sub_path.read_text(encoding="utf-8")
-    header_lines: List[str] = []
-    for line in orig_sub.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("environment", "Arguments", "queue", "# --- Job Queue")):
-            break
-        if stripped.startswith(("Output", "Error", "Log", "# --- Top-Level Logs")):
-            continue
-        header_lines.append(line)
-
-    while header_lines and not header_lines[-1].strip():
-        header_lines.pop()
-
-    retry_lines = header_lines + _format_retry_queue_section(
+    project_cwd = Path(sub.get("working_directory") or run_dir.parent.parent)
+    sweep_args = list(req.get("sweep_arguments") or ([""] * (2 if is_sweep else 1)))
+    return generate_sub_file(
+        sh_path=repro_dir / "job.sh",
+        project_cwd=project_cwd,
         run_dir=run_dir,
         repro_dir=repro_dir,
         script_stem=script_stem,
-        is_sweep=is_sweep,
-        targets=targets,
+        arch=str(req.get("architecture", "AMD")),
+        cpus=req.get("cpus"),
+        mem_mb=req.get("memory_mb"),
+        gpus=req.get("gpus"),
+        sweep_args=sweep_args,
+        nodes_include=list(req.get("node_include") or []),
+        nodes_exclude=list(req.get("node_exclude") or []),
+        project_code=req.get("project_code"),
+        scratch_files=list(req.get("scratch_files") or []),
+        retry_targets=targets,
         retry_epoch=retry_epoch,
     )
-    return "\n".join(retry_lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
