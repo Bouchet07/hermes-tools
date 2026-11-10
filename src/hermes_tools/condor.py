@@ -899,6 +899,19 @@ def inspect_condor_log_fate(condor_log: Path, is_sweep: bool = False) -> Optiona
     return None
 
 
+def get_failed_or_missing_procs(data: Dict[str, Any]) -> List[Tuple[int, str]]:
+    """Returns `[(process_id, arg_line), ...]` for any sweep/job process that did not complete with exit_code 0."""
+    req = data.get("resources_requested", {})
+    sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
+    execs = {int(x.get("process_id", 0)): x for x in get_execution_records(data)}
+    failed: List[Tuple[int, str]] = []
+    for pid, arg_line in enumerate(sweep_args):
+        rec = execs.get(pid)
+        if rec is None or int(rec.get("exit_code", -1)) != 0 or rec.get("signal"):
+            failed.append((pid, arg_line))
+    return failed
+
+
 def run_needs_live_reconcile(data: Dict[str, Any]) -> bool:
     """Returns True if a run is active or has incomplete execution records that may need reconciliation."""
     status = str(data.get("status", "UNKNOWN"))

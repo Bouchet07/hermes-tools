@@ -24,6 +24,7 @@ from hermes_tools.condor import (
     build_send_command_tokens,
     generate_retry_sub_file,
     get_all_cluster_ids,
+    get_failed_or_missing_procs,
     query_live_condor_clusters,
     reconcile_run,
     run_needs_live_reconcile,
@@ -46,7 +47,10 @@ from hermes_tools.core import (
     update_latest_symlink,
     write_text_lf,
 )
-from hermes_tools.snapshot import create_code_snapshot, freeze_python_env, get_git_info
+from hermes_tools.snapshot import (
+    diff_directories as _diff_directories,
+    refresh_code_snapshot,
+)
 
 
 def _extract_run_display_parts(
@@ -805,57 +809,8 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: `runs sync` & Code Snapshot Refreshing
+# Subcommand: `runs sync`
 # ---------------------------------------------------------------------------
-def refresh_code_snapshot(run_dir: Path, data: Dict[str, Any]) -> None:
-    """
-    Refreshes `repro/code/`, updates `repro/uncommitted.patch`, re-freezes `repro/env.txt`,
-    and updates `run.json["git"]` so provenance stays 100% accurate.
-    """
-    cwd = Path(data.get("submission", {}).get("working_directory", Path.cwd()))
-    target_rel = data.get("submission", {}).get("target", "")
-    target_path = (cwd / target_rel).resolve()
-    repro_dir = run_dir / "repro"
-    rj_path = run_dir / "run.json"
-
-    if not target_path.is_file():
-        console.print(f"[bold red]✘ Source file not found at {target_path}[/bold red]")
-        sys.exit(1)
-
-    git_info = get_git_info(cwd)
-    create_code_snapshot(target_path, cwd, repro_dir, git_info)
-
-    patch_file = repro_dir / "uncommitted.patch"
-    patch_rel_path: Optional[str] = None
-    if git_info.get("is_git") and git_info.get("diff"):
-        write_text_lf(patch_file, str(git_info["diff"]))
-        patch_rel_path = "repro/uncommitted.patch"
-    elif patch_file.is_file():
-        patch_file.unlink()
-
-    venv_str = data.get("submission", {}).get("venv")
-    if venv_str:
-        freeze_python_env(Path(venv_str), repro_dir)
-
-    sync_iso = datetime.datetime.now().isoformat(timespec="seconds")
-
-    def _update_git_record(d: Dict[str, Any]) -> None:
-        g = d.setdefault("git", {})
-        if g.get("commit") and "initial_commit" not in g:
-            g["initial_commit"] = g.get("commit")
-        g["is_git"] = git_info["is_git"]
-        g["branch"] = git_info["branch"]
-        g["commit"] = git_info["commit"]
-        g["dirty"] = git_info["dirty"]
-        g["patch_file"] = patch_rel_path
-        g["synced_at"] = sync_iso
-
-    locked_mutate_run_json(rj_path, repro_dir, _update_git_record)
-    console.print(
-        f"[bold green]✔ Synchronized working tree & git provenance into {run_dir.name}/repro/[/bold green]"
-    )
-
-
 def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to sync code snapshot into:"
@@ -867,18 +822,6 @@ def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs retry`
 # ---------------------------------------------------------------------------
-def get_failed_or_missing_procs(data: Dict[str, Any]) -> List[Tuple[int, str]]:
-    req = data.get("resources_requested", {})
-    sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
-    execs = {int(x.get("process_id", 0)): x for x in get_execution_records(data)}
-    failed: List[Tuple[int, str]] = []
-    for pid, arg_line in enumerate(sweep_args):
-        rec = execs.get(pid)
-        if rec is None or int(rec.get("exit_code", -1)) != 0 or rec.get("signal"):
-            failed.append((pid, arg_line))
-    return failed
-
-
 def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to retry/continue:"
@@ -1177,73 +1120,6 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs diff`
 # ---------------------------------------------------------------------------
-def _collect_snapshot_entries(root: Path) -> Dict[str, Path]:
-    """Collects relative POSIX paths of regular files and symlinks without following directory symlinks."""
-    entries: Dict[str, Path] = {}
-    for cur_root, dirs, files in os.walk(root, followlinks=False):
-        cur_path = Path(cur_root)
-        # Keep directory symlinks as leaf entries without descending into them
-        kept_dirs: List[str] = []
-        for d in dirs:
-            dp = cur_path / d
-            if dp.is_symlink():
-                entries[dp.relative_to(root).as_posix()] = dp
-            else:
-                kept_dirs.append(d)
-        dirs[:] = kept_dirs
-        for f in files:
-            fp = cur_path / f
-            entries[fp.relative_to(root).as_posix()] = fp
-    return entries
-
-
-def _read_diffable_lines(path: Optional[Path]) -> List[str]:
-    """Returns diffable lines for a snapshot entry without reading symlink targets or large binary files."""
-    if path is None:
-        return []
-    try:
-        if path.is_symlink():
-            return [f"symlink -> {os.readlink(path)}\n"]
-        st = path.stat()
-        if st.st_size > 2 * 1024 * 1024:
-            return [f"[large file: {st.st_size} bytes]\n"]
-        with open(path, "rb") as f:
-            head = f.read(4096)
-            if b"\x00" in head:
-                return [f"[binary file: {st.st_size} bytes]\n"]
-            rest = f.read()
-        return (head + rest).decode("utf-8", errors="replace").splitlines(keepends=True)
-    except OSError:
-        return []
-
-
-def _diff_directories(dir_a: Path, dir_b: Path) -> str:
-    """Computes a unified diff across all text files and symlinks in two directories."""
-    import difflib
-
-    map_a = _collect_snapshot_entries(dir_a)
-    map_b = _collect_snapshot_entries(dir_b)
-    all_rel = sorted(map_a.keys() | map_b.keys())
-    chunks: List[str] = []
-
-    for rel in all_rel:
-        lines_a = _read_diffable_lines(map_a.get(rel))
-        lines_b = _read_diffable_lines(map_b.get(rel))
-        if lines_a == lines_b:
-            continue
-        diff_lines = list(
-            difflib.unified_diff(
-                lines_a,
-                lines_b,
-                fromfile=f"a/{rel}",
-                tofile=f"b/{rel}",
-            )
-        )
-        if diff_lines:
-            chunks.append("".join(diff_lines))
-    return "\n".join(chunks)
-
-
 def _format_env_summary(data: Dict[str, Any]) -> str:
     env_map = data.get("resources_requested", {}).get("env")
     if isinstance(env_map, dict) and env_map:
