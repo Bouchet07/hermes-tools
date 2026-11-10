@@ -961,6 +961,31 @@ her09-27.i3a.es
     assert proc_grp["state"] == "DISK I/O (2)"
     assert proc_grp["cpu_pct"] == 12.5
 
+    # Test kernel `/proc/<pid>/stat` fallback when container/lxcfs `/proc/uptime` zeroes out `ps` etime/pcpu,
+    # and verify `condor_ssh_to_job` helper processes are filtered out
+    lxc_frame_raw = """
+===HERMES_FRAME_BEGIN===
+---HOST---
+nv3090-09.i3a.es
+0.99 1.00 1.00 1/1024 2935500
+---GPU---
+---GPU_APPS---
+---PS---
+2935294 2935200 D   0.0  647168    00:00 python python train_all.py --config_file configs/task.yaml
+2935455 2935400 S   0.0    3072    00:00 condor_ssh_to_j /bin/bash /usr/lib/condor/libexec/condor_ssh_to_job_shell_setup
+---PROC_STAT---
+2935501 (cat) R 2935455 2935455 2935455 0 -1 4194304 90 0 0 0 0 0 0 0 20 0 1 0 10050000 8000000 200 18446744073709551615
+2935294 (python) D 2935200 2935200 2935200 0 -1 4194304 1000 0 0 0 9000 3000 0 0 20 0 8 0 10026000 900000000 161792 18446744073709551615
+===HERMES_FRAME_END===
+"""
+    lxc_frame = parse_ssh_telemetry_frame(lxc_frame_raw)
+    assert len(lxc_frame["processes"]) == 1  # condor_ssh_to_job helper filtered out
+    p_lxc = lxc_frame["processes"][0]
+    assert p_lxc["pid"] == 2935294
+    assert p_lxc["elapsed"] == "04:00"  # (10050000 - 10026000) / 100 = 240s = 04:00
+    assert p_lxc["cpu_pct"] == 50.0  # (9000 + 3000) / 24000 * 100 = 50.0%
+
+
 
 
 

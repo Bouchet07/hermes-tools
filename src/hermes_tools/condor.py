@@ -1596,6 +1596,9 @@ def build_ssh_telemetry_probe(interval: Optional[int] = None) -> str:
         "fi; "
         "echo '---PS---'; "
         "ps -u \"$(id -un)\" -o pid=,ppid=,stat=,pcpu=,rss=,etime=,comm=,args= --sort=-pcpu 2>/dev/null || true; "
+        "echo '---PROC_STAT---'; "
+        "cat /proc/self/stat 2>/dev/null || true; "
+        "for _p in $(ps -u \"$(id -un)\" -o pid= 2>/dev/null); do cat \"/proc/$_p/stat\" 2>/dev/null || true; done; "
         "echo '===HERMES_FRAME_END==='; "
         "}; "
     )
@@ -1628,7 +1631,45 @@ def _parse_ps_etime_seconds(etime_str: str) -> int:
     return days * 86400
 
 
-def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
+def _format_etime_seconds(total_sec: int) -> str:
+    sec = max(0, int(total_sec))
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}-{hours:02d}:{mins:02d}:{secs:02d}"
+    if hours > 0:
+        return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _parse_proc_stat_line(line: str) -> Optional[Tuple[int, int, int]]:
+    """
+    Parses a Linux `/proc/<pid>/stat` line into `(pid, utime_plus_stime_ticks, starttime_ticks)`.
+    """
+    s = (line or "").strip()
+    if not s or ")" not in s:
+        return None
+    head, _, tail = s.rpartition(")")
+    pid_str = head.partition("(")[0].strip()
+    if not pid_str.isdigit():
+        return None
+    rest = tail.split()
+    if len(rest) <= 19:
+        return None
+    try:
+        pid = int(pid_str)
+        cpu_ticks = int(rest[11]) + int(rest[12])
+        start_ticks = int(rest[19])
+        return pid, cpu_ticks, start_ticks
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_ssh_telemetry_frame(
+    raw_frame: str,
+    prev_proc_ticks: Optional[Dict[int, Tuple[int, int]]] = None,
+) -> Dict[str, Any]:
     """
     Parses a single telemetry frame emitted by `build_ssh_telemetry_probe` into
     host metadata, GPU telemetry records, and active user workload processes.
@@ -1638,6 +1679,7 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
     gpu_lines: List[str] = []
     app_lines: List[str] = []
     ps_lines: List[str] = []
+    stat_lines: List[str] = []
 
     for line in (raw_frame or "").splitlines():
         s = line.strip()
@@ -1655,6 +1697,9 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
         if s == "---PS---":
             section = "PS"
             continue
+        if s == "---PROC_STAT---":
+            section = "PROC_STAT"
+            continue
 
         if section == "HOST" and s:
             host_lines.append(s)
@@ -1664,6 +1709,22 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
             app_lines.append(s)
         elif section == "PS" and s:
             ps_lines.append(s)
+        elif section == "PROC_STAT" and s:
+            stat_lines.append(s)
+
+    now_ticks: Optional[int] = None
+    proc_kernel_stat: Dict[int, Tuple[int, int]] = {}
+    for idx, st_line in enumerate(stat_lines):
+        parsed_st = _parse_proc_stat_line(st_line)
+        if parsed_st is None:
+            continue
+        st_pid, cpu_t, start_t = parsed_st
+        if idx == 0:
+            now_ticks = start_t
+        else:
+            proc_kernel_stat[st_pid] = (cpu_t, start_t)
+            if now_ticks is not None and start_t > now_ticks:
+                now_ticks = start_t
 
     hostname = host_lines[0] if host_lines else "unknown"
     load_avg: Optional[float] = None
@@ -1737,10 +1798,29 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
 
         if "HERMES_FRAME_BEGIN" in args_str or "nvidia-smi --query" in args_str:
             continue
+        if "condor_ssh_to_job" in args_str or "condor_ssh_to_j" in comm:
+            continue
         if comm in _IGNORED_PROBE_COMMS and pid not in pid_vram_mb and cpu_pct < 1.0:
             continue
         if args_str.endswith("/job.sh") or "/repro/job.sh" in args_str:
             continue
+
+        etime_sec = _parse_ps_etime_seconds(etime)
+        # Fallback to kernel `/proc/<pid>/stat` ticks when lxcfs/container uptime zeroes out `ps`
+        if pid in proc_kernel_stat and now_ticks is not None:
+            cpu_ticks, start_ticks = proc_kernel_stat[pid]
+            kern_elapsed_ticks = max(0, now_ticks - start_ticks)
+            kern_elapsed_sec = kern_elapsed_ticks // 100
+            if etime_sec == 0 and kern_elapsed_sec > 0:
+                etime_sec = kern_elapsed_sec
+                etime = _format_etime_seconds(kern_elapsed_sec)
+            if prev_proc_ticks and pid in prev_proc_ticks:
+                prev_cpu_t, prev_now_t = prev_proc_ticks[pid]
+                dt_ticks = now_ticks - prev_now_t
+                if dt_ticks > 0:
+                    cpu_pct = max(0.0, ((cpu_ticks - prev_cpu_t) / float(dt_ticks)) * 100.0)
+            elif cpu_pct == 0.0 and kern_elapsed_ticks > 0:
+                cpu_pct = max(0.0, (cpu_ticks / float(kern_elapsed_ticks)) * 100.0)
 
         state_char = stat_str[0].upper() if stat_str else "S"
         raw_procs.append(
@@ -1752,7 +1832,7 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
                 "rss_mb": rss_kb / 1024.0,
                 "vram_mb": pid_vram_mb.get(pid, 0.0),
                 "elapsed": etime,
-                "etime_sec": _parse_ps_etime_seconds(etime),
+                "etime_sec": etime_sec,
                 "comm": comm,
                 "command": args_str,
             }
@@ -1817,6 +1897,11 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
         "load_avg": load_avg,
         "gpus": gpus,
         "processes": processes,
+        "_proc_ticks": (
+            {pid: (cpu_t, now_ticks) for pid, (cpu_t, _) in proc_kernel_stat.items()}
+            if now_ticks is not None
+            else {}
+        ),
     }
 
 
@@ -1867,6 +1952,7 @@ def stream_job_live_telemetry(job_target: str, interval: int = 2):
     try:
         buf: List[str] = []
         in_frame = False
+        prev_ticks: Optional[Dict[int, Tuple[int, int]]] = None
         assert proc.stdout is not None
         for line in proc.stdout:
             s = line.strip()
@@ -1876,7 +1962,10 @@ def stream_job_live_telemetry(job_target: str, interval: int = 2):
                 continue
             if s == "===HERMES_FRAME_END===":
                 if in_frame:
-                    yield parse_ssh_telemetry_frame("\n".join(buf))
+                    parsed = parse_ssh_telemetry_frame("\n".join(buf), prev_proc_ticks=prev_ticks)
+                    if parsed.get("_proc_ticks"):
+                        prev_ticks = parsed["_proc_ticks"]
+                    yield parsed
                 in_frame = False
                 buf = []
                 continue
