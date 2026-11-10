@@ -1609,14 +1609,7 @@ def _render_queue_analysis_panel(
             ),
         )
 
-    console.print(
-        Panel(
-            info_tbl,
-            title=f"[bold cyan]🔍 Queue Match Analysis — Job {jid_label}[/bold cyan]",
-            border_style="cyan",
-            expand=False,
-        )
-    )
+    renderables: List[Any] = [info_tbl]
 
     if steps:
         max_slots = max(int(s["slots"]) for s in steps)
@@ -1624,37 +1617,45 @@ def _render_queue_analysis_panel(
         min_nonzero = min(non_zero) if non_zero else 0
 
         step_tbl = Table(
-            title=f"🎯 Requirements Slot Funnel (Job {jid_label})",
+            title="Requirements Slot Funnel",
             title_style="bold cyan",
-            box=box.ROUNDED,
+            box=box.SIMPLE_HEAVY,
             header_style="bold cyan",
         )
         step_tbl.add_column("Step", style="dim", no_wrap=True)
         step_tbl.add_column("Slots", justify="right", no_wrap=True)
-        step_tbl.add_column("Requirement", style="white")
+        step_tbl.add_column("Condition", style="white")
         step_tbl.add_column("Requested", style="cyan", no_wrap=True)
 
         for s in steps:
             cnt = int(s["slots"])
             cond_str = str(s["condition"])
             if cnt == 0:
-                cnt_cell = "[bold red]● 0[/bold red]"
+                cnt_cell = "[bold red]0[/bold red]"
                 cond_str = f"[bold red]{cond_str}[/bold red] [red](blocking)[/red]"
             elif cnt == min_nonzero and min_nonzero < max_slots:
-                cnt_cell = f"[bold yellow]● {cnt}[/bold yellow]"
+                cnt_cell = f"[bold yellow]{cnt}[/bold yellow]"
                 cond_str = f"{cond_str} [yellow](tightest)[/yellow]"
             else:
-                cnt_cell = f"[green]● {cnt}[/green]"
+                cnt_cell = f"[green]{cnt}[/green]"
             step_tbl.add_row(
                 str(s["step"]),
                 cnt_cell,
                 cond_str,
                 str(s.get("hint") or "—"),
             )
-        console.print(step_tbl)
+        renderables.append(step_tbl)
     elif analysis.get("raw"):
-        console.print(f"[dim]{analysis['raw']}[/dim]")
+        renderables.append(f"[dim]{analysis['raw']}[/dim]")
 
+    console.print(
+        Panel(
+            Group(*renderables),
+            title=f"[bold cyan]⏳ Queue Match Analysis — Job {jid_label}[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
     return True
 
 
