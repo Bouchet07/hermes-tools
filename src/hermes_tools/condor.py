@@ -1202,6 +1202,10 @@ def parse_condor_status_ads(
                 cpus_rep_total = max(cpus_rep_total, tc)
                 mem_rep_total = max(mem_rep_total, tm)
                 gpus_rep_total = max(gpus_rep_total, tg)
+            else:
+                cpus_rep_total = max(cpus_rep_total, int(ad.get("TotalCpus") or 0))
+                mem_rep_total = max(mem_rep_total, int(ad.get("TotalMemory") or 0))
+                gpus_rep_total = max(gpus_rep_total, int(ad.get("TotalGPUs") or 0))
             disk_free_kb = max(disk_free_kb, int(ad.get("Disk") or 0))
 
             tot_load = ad.get("TotalLoadAvg") or ad.get("TotalCondorLoadAvg")
@@ -1305,7 +1309,8 @@ def query_condor_nodes(constraint: Optional[str] = None) -> Optional[List[Dict[s
         "Memory,TotalSlotMemory,TotalMemory,GPUs,TotalSlotGPUs,TotalGPUs,AssignedGPUs,Draining,"
         "RemoteUser,RemoteOwner,JobId,EnteredCurrentActivity,MyCurrentTime,"
         "TotalLoadAvg,TotalCondorLoadAvg,LoadAvg,Disk,"
-        "CUDADeviceName,GPUs_DeviceName,CUDAGlobalMemoryMb,GPUs_GlobalMemoryMb"
+        "CUDADeviceName,GPUs_DeviceName,CUDA0DeviceName,"
+        "CUDAGlobalMemoryMb,GPUs_GlobalMemoryMb,CUDA0GlobalMemoryMb"
     )
     cmd = ["condor_status", "-json", "-attributes", attrs]
     if constraint and constraint.strip():
@@ -1320,6 +1325,9 @@ def query_condor_nodes(constraint: Optional[str] = None) -> Optional[List[Dict[s
             timeout=6,
         )
         if res.returncode != 0:
+            err_detail = (res.stderr or res.stdout or "").strip()
+            if constraint and constraint.strip() and err_detail:
+                raise ValueError(err_detail)
             return None
         raw = res.stdout.strip()
         if not raw:
@@ -1328,6 +1336,8 @@ def query_condor_nodes(constraint: Optional[str] = None) -> Optional[List[Dict[s
         if not isinstance(items, list):
             return None
         return parse_condor_status_ads(items)
+    except ValueError:
+        raise
     except Exception:
         return None
 

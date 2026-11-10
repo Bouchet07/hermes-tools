@@ -583,7 +583,7 @@ def test_follow_run_log_waits_for_start_and_auto_exits(tmp_path: Path, monkeypat
 
 
 def test_parse_condor_status_ads_and_runs_nodes(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import argparse
     import hermes_tools.runs_cli as runs_cli
@@ -713,7 +713,21 @@ def test_parse_condor_status_ads_and_runs_nodes(
     assert "diego" in out
     assert "alice" in out
 
-    # Detail mode + user filter
+    # Detail mode + user filter + local run tag cross-linking
+    runs_root = tmp_path / "runs"
+    rd = runs_root / "20261110_100000_ecg_train"
+    rd.mkdir(parents=True)
+    (rd / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": rd.name,
+                "status": "RUNNING",
+                "submission": {"cluster_id": 1402, "target": "train.py", "tag": "ecg_train"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
     detail_args = argparse.Namespace(
         arch=None,
         node=None,
@@ -726,10 +740,33 @@ def test_parse_condor_status_ads_and_runs_nodes(
         watch=False,
         interval=2,
     )
-    runs_cli.cmd_nodes(detail_args)
+    runs_cli.cmd_nodes(detail_args, runs_root=runs_root)
     detail_out = capsys.readouterr().out
     assert "Active Slot Claims" in detail_out
     assert "1402.0" in detail_out
-    assert "1h 01m" in detail_out
+    assert "(ecg_train)" in detail_out
+    assert "1h 01m 00s" in detail_out
     assert "nv-a100-01" not in detail_out
+
+    # Invalid --where constraint error surfacing
+    def _fail_query(constraint=None):
+        raise ValueError("Can't parse constraint: GPUs ==")
+
+    monkeypatch.setattr(runs_cli, "query_condor_nodes", _fail_query)
+    bad_args = argparse.Namespace(
+        arch=None,
+        node=None,
+        user=None,
+        mine=False,
+        free=False,
+        busy=False,
+        detail=False,
+        where="GPUs ==",
+        watch=False,
+        interval=2,
+    )
+    with pytest.raises(SystemExit):
+        runs_cli.cmd_nodes(bad_args)
+    err_out = capsys.readouterr().out
+    assert "Can't parse constraint: GPUs ==" in err_out
 

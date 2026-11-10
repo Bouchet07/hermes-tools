@@ -1263,9 +1263,39 @@ def _node_matches_user(node: Dict[str, Any], target_user: str) -> bool:
     return any(needle in u.lower() for u in users_map)
 
 
+def _format_jobs_cell(count: int) -> str:
+    if count <= 0:
+        return "[dim]0[/dim]"
+    return f"[bold cyan]{count}[/bold cyan]"
+
+
+def _build_local_cluster_map(runs_root: Optional[Path]) -> Dict[str, str]:
+    if runs_root is None or not runs_root.is_dir():
+        return {}
+    mapping: Dict[str, str] = {}
+    for rd in list_run_dirs(runs_root)[:60]:
+        data = load_run_json(rd)
+        if not data:
+            continue
+        sub = data.get("submission", {})
+        tag_str = str(sub.get("tag") or "").strip()
+        target_str = str(sub.get("target") or "").strip()
+        if tag_str:
+            label = tag_str
+        elif target_str:
+            label = Path(target_str).stem
+        else:
+            plain_label, _, _ = _extract_run_display_parts(rd, data)
+            label = plain_label or rd.name
+        for cid in get_all_cluster_ids(data):
+            mapping[str(cid)] = label
+    return mapping
+
+
 def _build_nodes_view(
     args: argparse.Namespace,
     nodes: List[Dict[str, Any]],
+    cluster_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Any, Tuple[Tuple[str, ...], ...]]:
     from rich.console import Group
 
@@ -1309,8 +1339,8 @@ def _build_nodes_view(
     pool_table.add_column("Nodes", justify="right", no_wrap=True)
     pool_table.add_column("GPUs", justify="right", no_wrap=True)
     pool_table.add_column("CPUs", justify="right", no_wrap=True)
-    pool_table.add_column("RAM (GB)", justify="right", no_wrap=True)
-    pool_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+    pool_table.add_column("RAM", justify="right", no_wrap=True)
+    pool_table.add_column("Jobs", justify="right", no_wrap=True)
     pool_table.add_column("Users")
 
     sig_rows: List[Tuple[str, ...]] = []
@@ -1336,10 +1366,11 @@ def _build_nodes_view(
             _format_free_total(
                 round(p["mem_free_mb"] / 1024),
                 max(1, round(p["mem_total_mb"] / 1024)),
+                "G",
             )
             if p["mem_total_mb"] > 0
             else "[dim]—[/dim]",
-            str(p["active_jobs"]),
+            _format_jobs_cell(int(p["active_jobs"])),
             _format_users_cell(p.get("users", {}), current_user),
         )
         pool_table.add_row(*p_row)
@@ -1356,26 +1387,32 @@ def _build_nodes_view(
     node_table.add_column("State", no_wrap=True)
     node_table.add_column("GPUs", justify="right", no_wrap=True)
     node_table.add_column("CPUs", justify="right", no_wrap=True)
-    node_table.add_column("RAM (GB)", justify="right", no_wrap=True)
-    node_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+    node_table.add_column("RAM", justify="right", no_wrap=True)
+    node_table.add_column("Jobs", justify="right", no_wrap=True)
     node_table.add_column("Users", no_wrap=True)
     if detail_mode:
         node_table.add_column("Load", justify="right", no_wrap=True)
-        node_table.add_column("GPU / Disk", style="dim", no_wrap=True)
+        node_table.add_column("GPU / Disk", style="dim")
 
+    prev_arch: Optional[str] = None
     for n in filtered:
+        cur_arch = str(n["arch"])
+        if prev_arch is not None and cur_arch != prev_arch:
+            node_table.add_section()
+        prev_arch = cur_arch
+
         mem_tot_gb = round(int(n["mem_total_mb"]) / 1024)
         mem_free_gb = round(int(n["mem_free_mb"]) / 1024)
         base_cols: List[str] = [
             str(n["host"]),
-            str(n["arch"]),
+            cur_arch,
             _style_node_state(str(n["state"])),
             _format_free_total(int(n["gpus_free"]), int(n["gpus_total"])),
             _format_free_total(int(n["cpus_free"]), int(n["cpus_total"])),
-            _format_free_total(mem_free_gb, max(1, mem_tot_gb))
+            _format_free_total(mem_free_gb, max(1, mem_tot_gb), "G")
             if int(n["mem_total_mb"]) > 0
             else "[dim]—[/dim]",
-            str(n["active_jobs"]),
+            _format_jobs_cell(int(n["active_jobs"])),
             _format_users_cell(n.get("users", {}), current_user),
         ]
         if detail_mode:
@@ -1415,14 +1452,14 @@ def _build_nodes_view(
             )
             claims_table.add_column("Node", style="bold white", no_wrap=True)
             claims_table.add_column("Pool", style="magenta", no_wrap=True)
-            claims_table.add_column("Slot", style="dim", no_wrap=True)
             claims_table.add_column("User", no_wrap=True)
-            claims_table.add_column("Job", style="cyan", no_wrap=True)
+            claims_table.add_column("Job", style="cyan")
             claims_table.add_column("GPUs", justify="right", no_wrap=True)
             claims_table.add_column("CPUs", justify="right", no_wrap=True)
             claims_table.add_column("RAM", justify="right", no_wrap=True)
             claims_table.add_column("Runtime", justify="right", style="green", no_wrap=True)
 
+            cmap = cluster_map or {}
             for c in claims_list:
                 u_str = str(c.get("user") or "—")
                 if current_user and u_str.lower() == current_user.lower():
@@ -1432,15 +1469,15 @@ def _build_nodes_view(
                 rt_sec = c.get("runtime_seconds")
                 rt_str = format_duration(rt_sec) if isinstance(rt_sec, (int, float)) else "[dim]—[/dim]"
                 mem_gb = round(int(c.get("mem_mb", 0)) / 1024, 1)
-                slot_str = str(c.get("slot", "—"))
-                if slot_str.startswith("slot"):
-                    slot_str = slot_str[4:] or slot_str
+                raw_jid = str(c.get("job_id") or "—")
+                cid_key = raw_jid.split(".")[0]
+                run_tag = cmap.get(cid_key)
+                job_cell = f"{raw_jid} [dim]({run_tag})[/dim]" if run_tag else raw_jid
                 c_row = (
                     str(c.get("host", "—")),
                     str(c.get("arch", "—")),
-                    slot_str,
                     u_cell,
-                    str(c.get("job_id") or "—"),
+                    job_cell,
                     str(c.get("gpus", 0)),
                     str(c.get("cpus", 0)),
                     f"{mem_gb:g}G" if mem_gb > 0 else "[dim]—[/dim]",
@@ -1454,9 +1491,15 @@ def _build_nodes_view(
     return Group(*renderables), tuple(sig_rows)
 
 
-def cmd_nodes(args: argparse.Namespace) -> None:
+def cmd_nodes(args: argparse.Namespace, runs_root: Optional[Path] = None) -> None:
     constraint = getattr(args, "where", None)
-    nodes = query_condor_nodes(constraint=constraint)
+    try:
+        nodes = query_condor_nodes(constraint=constraint)
+    except ValueError as exc:
+        console.print(
+            f"[bold red]✖ Invalid --where constraint or condor_status error:[/bold red]\n[dim]{exc}[/dim]"
+        )
+        sys.exit(1)
     if nodes is None:
         console.print(
             "[yellow]⚠ 'condor_status' is not available or returned an error (are you on hermes2?).[/yellow]"
@@ -1466,26 +1509,32 @@ def cmd_nodes(args: argparse.Namespace) -> None:
         console.print("[dim]No worker nodes matched the query in condor_status.[/dim]")
         return
 
+    cluster_map = _build_local_cluster_map(runs_root)
+
     if getattr(args, "watch", False):
         from rich.live import Live
 
         interval = max(1, int(getattr(args, "interval", 2) or 2))
-        initial_view, last_sig = _build_nodes_view(args, nodes)
+        initial_view, last_sig = _build_nodes_view(args, nodes, cluster_map=cluster_map)
         try:
             with Live(initial_view, console=console, auto_refresh=False) as live:
                 while True:
                     time.sleep(interval)
-                    fresh_nodes = query_condor_nodes(constraint=constraint)
+                    try:
+                        fresh_nodes = query_condor_nodes(constraint=constraint)
+                    except ValueError:
+                        continue
                     if fresh_nodes is None:
                         continue
-                    new_view, new_sig = _build_nodes_view(args, fresh_nodes)
+                    cluster_map = _build_local_cluster_map(runs_root)
+                    new_view, new_sig = _build_nodes_view(args, fresh_nodes, cluster_map=cluster_map)
                     if new_sig != last_sig:
                         last_sig = new_sig
                         live.update(new_view, refresh=True)
         except KeyboardInterrupt:
             return
     else:
-        view, _ = _build_nodes_view(args, nodes)
+        view, _ = _build_nodes_view(args, nodes, cluster_map=cluster_map)
         console.print(view)
 
 
@@ -1665,7 +1714,7 @@ def main() -> None:
     elif cmd == "diff":
         cmd_diff(args, runs_root)
     elif cmd in ("nodes", "cluster", "pools"):
-        cmd_nodes(args)
+        cmd_nodes(args, runs_root)
 
 
 if __name__ == "__main__":
