@@ -938,5 +938,29 @@ nv3090-02.i3a.es
     assert "148920" in top_out
     assert "785.0%" in top_out
 
+    # Test multiprocessing worker collapsing, parent Elapsed preservation, and DISK I/O state
+    mp_frame_raw = """
+===HERMES_FRAME_BEGIN===
+---HOST---
+her09-27.i3a.es
+49.01 42.10 30.00 12/2048 1125000
+---GPU---
+---GPU_APPS---
+---PS---
+1124936 1124749 D   0.0  470016    00:00 python python prepare_dataset.py --dataset code15
+1124914 1124749 D   0.0  470016    00:00 python python prepare_dataset.py --dataset code15
+1124749 1124700 S  12.5  602112    16:42 python python prepare_dataset.py --dataset code15
+===HERMES_FRAME_END===
+"""
+    mp_frame = parse_ssh_telemetry_frame(mp_frame_raw)
+    assert len(mp_frame["processes"]) == 1
+    proc_grp = mp_frame["processes"][0]
+    assert proc_grp["pid"] == 1124749
+    assert proc_grp["workers"] == 2
+    assert proc_grp["elapsed"] == "16:42"
+    assert proc_grp["state"] == "DISK I/O (2)"
+    assert proc_grp["cpu_pct"] == 12.5
+
+
 
 

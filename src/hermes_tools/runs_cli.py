@@ -1803,7 +1803,11 @@ def _build_live_telemetry_panel(
     info_tbl.add_column("V", style="white")
     if run_name:
         info_tbl.add_row("Run", f"[bold white]{run_name}[/bold white] ({style_status('RUNNING')})")
-    pool_str = f" · Pool: [bold magenta]{arch}[/bold magenta]" if arch and arch != "—" else ""
+    clean_arch = str(arch or "").strip()
+    if clean_arch.upper() in ("", "—", "UNDEFINED", "NONE", "ANY"):
+        pool_str = ""
+    else:
+        pool_str = f" · Pool: [bold magenta]{clean_arch}[/bold magenta]"
     load_str = f" · Load: [cyan]{load_avg:.2f}[/cyan]" if isinstance(load_avg, (int, float)) else ""
     info_tbl.add_row("Worker Node", f"[bold white]{host_fqdn}[/bold white]{pool_str}{load_str}")
 
@@ -1862,6 +1866,7 @@ def _build_live_telemetry_panel(
             header_style="bold cyan",
         )
         proc_tbl.add_column("PID", style="dim", justify="right", no_wrap=True)
+        proc_tbl.add_column("State", no_wrap=True)
         proc_tbl.add_column("CPU %", justify="right", style="green", no_wrap=True)
         proc_tbl.add_column("Host RAM", justify="right", no_wrap=True)
         proc_tbl.add_column("GPU VRAM", justify="right", style="cyan", no_wrap=True)
@@ -1869,6 +1874,14 @@ def _build_live_telemetry_panel(
         proc_tbl.add_column("Command", style="white")
 
         for p in procs[:12]:
+            st_raw = str(p.get("state") or "RUN")
+            if "I/O" in st_raw:
+                st_cell = f"[bold yellow]{st_raw}[/bold yellow]"
+            elif st_raw.startswith("RUN"):
+                st_cell = f"[bold green]{st_raw}[/bold green]"
+            else:
+                st_cell = f"[dim]{st_raw}[/dim]"
+
             rss_mb = float(p.get("rss_mb", 0.0))
             ram_str = f"{rss_mb / 1024.0:.1f} GB" if rss_mb >= 1024.0 else f"{rss_mb:.0f} MB"
             vram_mb = float(p.get("vram_mb", 0.0))
@@ -1879,11 +1892,15 @@ def _build_live_telemetry_panel(
             else:
                 vram_str = "[dim]—[/dim]"
             cmd_text = str(p.get("command") or p.get("comm") or "—")
-            if len(cmd_text) > 56:
-                cmd_text = cmd_text[:53] + "..."
+            if len(cmd_text) > 52:
+                cmd_text = cmd_text[:49] + "..."
+            workers = int(p.get("workers") or 0)
+            if workers > 0:
+                cmd_text = f"[bold cyan][+{workers} workers][/bold cyan] {cmd_text}"
 
             proc_tbl.add_row(
                 str(p.get("pid", "—")),
+                st_cell,
                 f"{float(p.get('cpu_pct', 0.0)):.1f}%",
                 ram_str,
                 vram_str,

@@ -1595,7 +1595,7 @@ def build_ssh_telemetry_probe(interval: Optional[int] = None) -> str:
         "nvidia-smi --query-compute-apps=pid,gpu_bus_id,used_memory --format=csv,noheader,nounits 2>/dev/null || true; "
         "fi; "
         "echo '---PS---'; "
-        "ps -u \"$(id -un)\" -o pid=,pcpu=,rss=,etime=,comm=,args= --sort=-pcpu 2>/dev/null || true; "
+        "ps -u \"$(id -un)\" -o pid=,ppid=,stat=,pcpu=,rss=,etime=,comm=,args= --sort=-pcpu 2>/dev/null || true; "
         "echo '===HERMES_FRAME_END==='; "
         "}; "
     )
@@ -1609,6 +1609,23 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return float(str(val).strip())
     except (ValueError, TypeError):
         return default
+
+
+def _parse_ps_etime_seconds(etime_str: str) -> int:
+    s = (etime_str or "").strip()
+    if not s:
+        return 0
+    days = 0
+    if "-" in s:
+        d_part, s = s.split("-", 1)
+        if d_part.isdigit():
+            days = int(d_part)
+    parts = [int(p) if p.isdigit() else 0 for p in s.split(":")]
+    if len(parts) == 3:
+        return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return days * 86400 + parts[0] * 60 + parts[1]
+    return days * 86400
 
 
 def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
@@ -1691,18 +1708,32 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
             pid = int(parts[0])
             pid_vram_mb[pid] = pid_vram_mb.get(pid, 0.0) + _safe_float(parts[2])
 
-    processes: List[Dict[str, Any]] = []
+    raw_procs: List[Dict[str, Any]] = []
     for p_line in ps_lines:
-        # Format: pid pcpu rss etime comm args
-        toks = p_line.split(None, 5)
-        if len(toks) < 5 or not toks[0].isdigit():
+        # Supports both 8-col (pid ppid stat pcpu rss etime comm args)
+        # and legacy 6-col (pid pcpu rss etime comm args)
+        toks8 = p_line.split(None, 7)
+        if len(toks8) < 5 or not toks8[0].isdigit():
             continue
-        pid = int(toks[0])
-        cpu_pct = _safe_float(toks[1])
-        rss_kb = _safe_float(toks[2])
-        etime = toks[3]
-        comm = toks[4]
-        args_str = toks[5] if len(toks) > 5 else comm
+        if len(toks8) >= 7 and toks8[1].isdigit() and not ("." in toks8[2]):
+            pid = int(toks8[0])
+            ppid = int(toks8[1])
+            stat_str = toks8[2]
+            cpu_pct = _safe_float(toks8[3])
+            rss_kb = _safe_float(toks8[4])
+            etime = toks8[5]
+            comm = toks8[6]
+            args_str = toks8[7] if len(toks8) > 7 else comm
+        else:
+            toks6 = p_line.split(None, 5)
+            pid = int(toks6[0])
+            ppid = 0
+            stat_str = "R" if _safe_float(toks6[1]) > 0 else "S"
+            cpu_pct = _safe_float(toks6[1])
+            rss_kb = _safe_float(toks6[2])
+            etime = toks6[3]
+            comm = toks6[4]
+            args_str = toks6[5] if len(toks6) > 5 else comm
 
         if "HERMES_FRAME_BEGIN" in args_str or "nvidia-smi --query" in args_str:
             continue
@@ -1711,15 +1742,69 @@ def parse_ssh_telemetry_frame(raw_frame: str) -> Dict[str, Any]:
         if args_str.endswith("/job.sh") or "/repro/job.sh" in args_str:
             continue
 
-        processes.append(
+        state_char = stat_str[0].upper() if stat_str else "S"
+        raw_procs.append(
             {
                 "pid": pid,
+                "ppid": ppid,
+                "state_char": state_char,
                 "cpu_pct": cpu_pct,
                 "rss_mb": rss_kb / 1024.0,
                 "vram_mb": pid_vram_mb.get(pid, 0.0),
                 "elapsed": etime,
+                "etime_sec": _parse_ps_etime_seconds(etime),
                 "comm": comm,
                 "command": args_str,
+            }
+        )
+
+    # Group multiprocessing / DataLoader workers under their root command / parent PID
+    by_pid: Dict[int, Dict[str, Any]] = {p["pid"]: p for p in raw_procs}
+
+    def _find_root_key(p: Dict[str, Any]) -> str:
+        cmd = str(p["command"])
+        # If this is a Python multiprocessing helper child, attach to its parent PID if present
+        if "multiprocessing." in cmd and p["ppid"] in by_pid:
+            parent = by_pid[p["ppid"]]
+            return str(parent["command"])
+        return cmd
+
+    grouped_map: Dict[str, List[Dict[str, Any]]] = {}
+    for p in raw_procs:
+        key = _find_root_key(p)
+        grouped_map.setdefault(key, []).append(p)
+
+    processes: List[Dict[str, Any]] = []
+    for cmd_key, members in grouped_map.items():
+        # Root representative is the longest-running (oldest) process, tie-broken by lowest PID
+        root = max(members, key=lambda m: (int(m["etime_sec"]), -int(m["pid"])))
+        workers = len(members) - 1
+        tot_cpu = sum(float(m["cpu_pct"]) for m in members)
+        tot_vram = sum(float(m["vram_mb"]) for m in members)
+        max_rss = max(float(m["rss_mb"]) for m in members)
+
+        n_run = sum(1 for m in members if m["state_char"] == "R")
+        n_io = sum(1 for m in members if m["state_char"] == "D")
+        if n_io > 0 and n_run > 0:
+            state_label = f"RUN({n_run})·I/O({n_io})"
+        elif n_io > 0:
+            state_label = f"DISK I/O ({n_io})" if len(members) > 1 else "DISK I/O"
+        elif n_run > 0 or tot_cpu >= 5.0:
+            state_label = f"RUN ({n_run})" if (len(members) > 1 and n_run > 0) else "RUN"
+        else:
+            state_label = "IDLE"
+
+        processes.append(
+            {
+                "pid": root["pid"],
+                "workers": workers,
+                "state": state_label,
+                "cpu_pct": tot_cpu,
+                "rss_mb": max_rss,
+                "vram_mb": tot_vram,
+                "elapsed": root["elapsed"],
+                "comm": root["comm"],
+                "command": cmd_key,
             }
         )
 
