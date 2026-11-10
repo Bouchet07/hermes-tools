@@ -33,6 +33,7 @@ Definitive HTCondor job submission (`send`), code provenance, live telemetry, an
    - [`runs diff`](#66-runs-diff)
    - [`runs stop` (`kill`, `rm`)](#67-runs-stop-kill-rm)
    - [`runs clean` (`prune`)](#68-runs-clean-prune)
+   - [`runs nodes` (`cluster`, `pools`)](#69-runs-nodes-cluster-pools)
 7. [Under the Hood: Telemetry, Locking & Status Lifecycle](#7-under-the-hood-telemetry-locking--status-lifecycle)
 
 ---
@@ -391,6 +392,19 @@ runs clean --aborted -y        # Delete ABORTED and INTERRUPTED runs
 runs clean --dry -y            # Delete DRY_RUN capsules
 runs clean --older-than 7d -y  # Delete inactive runs older than 7 days (supports d, h, m)
 ```
+
+### 6.9 `runs nodes` (`cluster`, `pools`)
+
+Queries live `condor_status` across Hermes 2 and renders both an **Architecture Pools Summary** (`GPU3090`, `A100`, `EPYC7662`, `AMD`, `INTEL`) and a **Worker Nodes Breakdown** (`FREE`, `MIXED`, `BUSY`, `DRAINING`, free/total GPUs, CPUs, RAM, and active jobs):
+
+```bash
+runs nodes                     # Show all Hermes 2 pools and worker nodes
+runs cluster                   # Alias for `runs nodes`
+runs nodes -a GPU3090          # Filter to a specific architecture pool
+runs nodes -f                  # Show only nodes with free GPUs/CPUs
+runs nodes -w                  # Flicker-free live cluster availability dashboard
+```
+> **Interactive `send` Integration**: When you run `send` interactively, the `+Architecture` selector automatically displays `[free/total GPUs free]` (or `[free/total CPUs free]`) next to each pool.
 
 ---
 

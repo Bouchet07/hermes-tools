@@ -581,3 +581,98 @@ def test_follow_run_log_waits_for_start_and_auto_exits(tmp_path: Path, monkeypat
     assert "epoch 2" in captured
     assert "COMPLETED" in captured
 
+
+def test_parse_condor_status_ads_and_runs_nodes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.condor import parse_condor_status_ads, summarize_condor_pools
+
+    fake_ads = [
+        # Node 1: Free GPU3090
+        {
+            "Machine": "nv3090-01.i3a.es",
+            "SlotType": "Partitionable",
+            "State": "Unclaimed",
+            "Architecture": "GPU3090",
+            "Cpus": 32,
+            "TotalSlotCpus": 32,
+            "Memory": 128000,
+            "TotalSlotMemory": 128000,
+            "GPUs": 1,
+            "TotalSlotGPUs": 1,
+        },
+        # Node 2: Busy GPU3090 (1 Dynamic slot claimed, Partitionable slot has 0 GPUs left)
+        {
+            "Machine": "nv3090-02.i3a.es",
+            "SlotType": "Partitionable",
+            "State": "Unclaimed",
+            "Architecture": "GPU3090",
+            "Cpus": 31,
+            "TotalSlotCpus": 32,
+            "Memory": 120000,
+            "TotalSlotMemory": 128000,
+            "GPUs": 0,
+            "TotalSlotGPUs": 1,
+        },
+        {
+            "Machine": "nv3090-02.i3a.es",
+            "SlotType": "Dynamic",
+            "State": "Claimed",
+            "Architecture": "GPU3090",
+            "Cpus": 1,
+            "Memory": 8000,
+            "GPUs": 1,
+        },
+        # Node 3: Mixed A100 (2 GPUs free, 2 GPUs claimed)
+        {
+            "Machine": "nv-a100-01.i3a.es",
+            "SlotType": "Partitionable",
+            "State": "Unclaimed",
+            "Architecture": "A100",
+            "Cpus": 64,
+            "TotalSlotCpus": 128,
+            "Memory": 256000,
+            "TotalSlotMemory": 512000,
+            "GPUs": 2,
+            "TotalSlotGPUs": 4,
+        },
+        {
+            "Machine": "nv-a100-01.i3a.es",
+            "SlotType": "Dynamic",
+            "State": "Claimed",
+            "Architecture": "A100",
+            "Cpus": 64,
+            "Memory": 256000,
+            "GPUs": 2,
+        },
+    ]
+
+    nodes = parse_condor_status_ads(fake_ads)
+    assert len(nodes) == 3
+    by_host = {n["host"]: n for n in nodes}
+    assert by_host["nv3090-01"]["state"] == "FREE"
+    assert by_host["nv3090-01"]["gpus_free"] == 1
+    assert by_host["nv3090-02"]["state"] == "BUSY"
+    assert by_host["nv3090-02"]["gpus_free"] == 0
+    assert by_host["nv3090-02"]["cpus_free"] == 0  # GPU3090 full-node lock zeroes free CPUs when busy
+    assert by_host["nv-a100-01"]["state"] == "MIXED"
+    assert by_host["nv-a100-01"]["gpus_free"] == 2
+    assert by_host["nv-a100-01"]["gpus_total"] == 4
+
+    pools = summarize_condor_pools(nodes)
+    assert pools["GPU3090"]["gpus_free"] == 1
+    assert pools["GPU3090"]["gpus_total"] == 2
+    assert pools["A100"]["gpus_free"] == 2
+    assert pools["A100"]["gpus_total"] == 4
+
+    monkeypatch.setattr(runs_cli, "query_condor_nodes", lambda: nodes)
+    args = argparse.Namespace(arch=None, free=False, watch=False, interval=2)
+    runs_cli.cmd_nodes(args)
+    out = capsys.readouterr().out
+    assert "GPU3090" in out
+    assert "A100" in out
+    assert "nv3090-01" in out
+    assert "nv-a100-01" in out
+

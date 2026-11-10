@@ -24,6 +24,8 @@ from hermes_tools.condor import (
     format_condor_arg_line,
     generate_bash_wrapper,
     generate_sub_file,
+    query_condor_nodes,
+    summarize_condor_pools,
 )
 from hermes_tools.core import (
     atomic_write_json,
@@ -249,10 +251,22 @@ def _resolve_hardware_resources(
         import questionary
 
         interactive_mode = True
-        arch_choices = [
-            questionary.Choice(title=str(spec["title"]), value=k)
-            for k, spec in ARCH_SPECS.items()
-        ]
+        nodes = query_condor_nodes()
+        pool_map = summarize_condor_pools(nodes) if nodes else {}
+        arch_choices = []
+        for k, spec in ARCH_SPECS.items():
+            base_title = str(spec["title"])
+            p_info = pool_map.get(k)
+            if p_info:
+                if k in ("GPU3090", "A100"):
+                    badge = f" [{p_info['gpus_free']}/{p_info['gpus_total']} GPUs free]"
+                else:
+                    badge = f" [{p_info['cpus_free']}/{p_info['cpus_total']} CPUs free]"
+                title = f"{base_title}{badge}"
+            else:
+                title = base_title
+            arch_choices.append(questionary.Choice(title=title, value=k))
+
         arch = questionary.select(
             "Select Hermes 2 Target Architecture (+Architecture):",
             choices=arch_choices,

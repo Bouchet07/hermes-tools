@@ -25,9 +25,11 @@ from hermes_tools.condor import (
     generate_retry_sub_file,
     get_all_cluster_ids,
     get_failed_or_missing_procs,
+    query_condor_nodes,
     query_live_condor_clusters,
     reconcile_run,
     run_needs_live_reconcile,
+    summarize_condor_pools,
 )
 from hermes_tools.core import (
     console,
@@ -1207,6 +1209,163 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: `runs nodes` (`cluster`, `pools`)
+# ---------------------------------------------------------------------------
+def _style_node_state(state: str) -> str:
+    styles = {
+        "FREE": "bold green",
+        "MIXED": "bold cyan",
+        "BUSY": "bold yellow",
+        "DRAINING": "bold magenta",
+        "OFFLINE": "bold red",
+    }
+    col = styles.get(state, "white")
+    return f"[{col}]{state}[/{col}]"
+
+
+def _format_free_total(free: int, total: int, unit: str = "") -> str:
+    if total <= 0:
+        return "[dim]—[/dim]"
+    sfx = f" {unit}" if unit else ""
+    if free > 0:
+        return f"[bold green]{free}[/bold green]/{total}{sfx}"
+    return f"[dim]0/{total}{sfx}[/dim]"
+
+
+def _build_nodes_view(
+    args: argparse.Namespace,
+    nodes: List[Dict[str, Any]],
+) -> Tuple[Any, Tuple[Tuple[str, ...], ...]]:
+    from rich.console import Group
+
+    arch_filter = (getattr(args, "arch", None) or "").strip().upper()
+    free_only = bool(getattr(args, "free", False))
+
+    filtered = [
+        n
+        for n in nodes
+        if (not arch_filter or str(n["arch"]).upper() == arch_filter)
+        and (not free_only or n["state"] in ("FREE", "MIXED"))
+    ]
+
+    pool_map = summarize_condor_pools(
+        [n for n in nodes if not arch_filter or str(n["arch"]).upper() == arch_filter]
+    )
+
+    pool_table = Table(
+        title="🖥️  Hermes 2 Architecture Pools (Free / Total)",
+        title_style="bold cyan",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    pool_table.add_column("Pool", style="bold magenta", no_wrap=True)
+    pool_table.add_column("Status", no_wrap=True)
+    pool_table.add_column("Nodes", justify="right", no_wrap=True)
+    pool_table.add_column("GPUs", justify="right", no_wrap=True)
+    pool_table.add_column("CPUs", justify="right", no_wrap=True)
+    pool_table.add_column("RAM (GB)", justify="right", no_wrap=True)
+    pool_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+
+    sig_rows: List[Tuple[str, ...]] = []
+    for arch, p in pool_map.items():
+        if p["gpus_total"] > 0:
+            avail_badge = (
+                f"[bold green]● {p['gpus_free']} GPU free[/bold green]"
+                if p["gpus_free"] > 0
+                else "[bold yellow]○ All GPUs busy[/bold yellow]"
+            )
+        else:
+            avail_badge = (
+                f"[bold green]● {p['cpus_free']} CPU free[/bold green]"
+                if p["cpus_free"] > 0
+                else "[bold yellow]○ All CPUs busy[/bold yellow]"
+            )
+        p_row = (
+            arch,
+            avail_badge,
+            _format_free_total(p["nodes_avail"], p["nodes_total"]),
+            _format_free_total(p["gpus_free"], p["gpus_total"]),
+            _format_free_total(p["cpus_free"], p["cpus_total"]),
+            _format_free_total(
+                round(p["mem_free_mb"] / 1024),
+                max(1, round(p["mem_total_mb"] / 1024)),
+            )
+            if p["mem_total_mb"] > 0
+            else "[dim]—[/dim]",
+            str(p["active_jobs"]),
+        )
+        pool_table.add_row(*p_row)
+        sig_rows.append(p_row)
+
+    node_table = Table(
+        title="🖧  Hermes 2 Worker Nodes (Free / Total)",
+        title_style="bold cyan",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    node_table.add_column("Node", style="bold white", no_wrap=True)
+    node_table.add_column("Pool", style="magenta", no_wrap=True)
+    node_table.add_column("State", no_wrap=True)
+    node_table.add_column("GPUs", justify="right", no_wrap=True)
+    node_table.add_column("CPUs", justify="right", no_wrap=True)
+    node_table.add_column("RAM (GB)", justify="right", no_wrap=True)
+    node_table.add_column("Jobs", justify="right", style="cyan", no_wrap=True)
+
+    for n in filtered:
+        mem_tot_gb = round(int(n["mem_total_mb"]) / 1024)
+        mem_free_gb = round(int(n["mem_free_mb"]) / 1024)
+        n_row = (
+            str(n["host"]),
+            str(n["arch"]),
+            _style_node_state(str(n["state"])),
+            _format_free_total(int(n["gpus_free"]), int(n["gpus_total"])),
+            _format_free_total(int(n["cpus_free"]), int(n["cpus_total"])),
+            _format_free_total(mem_free_gb, max(1, mem_tot_gb))
+            if int(n["mem_total_mb"]) > 0
+            else "[dim]—[/dim]",
+            str(n["active_jobs"]),
+        )
+        node_table.add_row(*n_row)
+        sig_rows.append(n_row)
+
+    return Group(pool_table, node_table), tuple(sig_rows)
+
+
+def cmd_nodes(args: argparse.Namespace) -> None:
+    nodes = query_condor_nodes()
+    if nodes is None:
+        console.print(
+            "[yellow]⚠ 'condor_status' is not available or returned an error (are you on hermes2?).[/yellow]"
+        )
+        sys.exit(1)
+    if not nodes:
+        console.print("[dim]No worker nodes reported by condor_status.[/dim]")
+        return
+
+    if getattr(args, "watch", False):
+        from rich.live import Live
+
+        interval = max(1, int(getattr(args, "interval", 2) or 2))
+        initial_view, last_sig = _build_nodes_view(args, nodes)
+        try:
+            with Live(initial_view, console=console, auto_refresh=False) as live:
+                while True:
+                    time.sleep(interval)
+                    fresh_nodes = query_condor_nodes()
+                    if fresh_nodes is None:
+                        continue
+                    new_view, new_sig = _build_nodes_view(args, fresh_nodes)
+                    if new_sig != last_sig:
+                        last_sig = new_sig
+                        live.update(new_view, refresh=True)
+        except KeyboardInterrupt:
+            return
+    else:
+        view, _ = _build_nodes_view(args, nodes)
+        console.print(view)
+
+
+# ---------------------------------------------------------------------------
 # CLI Argument Parser & Entrypoint
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
@@ -1304,6 +1463,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("run_a", nargs="?", help="First run ID or index")
     p_diff.add_argument("run_b", nargs="?", help="Second run ID or index")
 
+    p_nodes = sub.add_parser(
+        "nodes",
+        aliases=["cluster", "pools"],
+        help="Show live Hermes 2 architecture pool and worker node availability (condor_status)",
+    )
+    p_nodes.add_argument(
+        "-a", "--arch", type=str, help="Filter by architecture pool (e.g. GPU3090, A100, AMD)"
+    )
+    p_nodes.add_argument(
+        "-f", "--free", action="store_true", help="Show only nodes with free GPUs/CPUs"
+    )
+    p_nodes.add_argument(
+        "-w", "--watch", action="store_true", help="Live-refresh cluster availability"
+    )
+    p_nodes.add_argument(
+        "-i", "--interval", type=int, default=2, help="Refresh interval in seconds for --watch"
+    )
+
     return p
 
 
@@ -1334,6 +1511,8 @@ def main() -> None:
         cmd_clean(args, runs_root)
     elif cmd == "diff":
         cmd_diff(args, runs_root)
+    elif cmd in ("nodes", "cluster", "pools"):
+        cmd_nodes(args)
 
 
 if __name__ == "__main__":

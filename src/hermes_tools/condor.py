@@ -1047,3 +1047,221 @@ def reconcile_run(
         )
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# Live Cluster Node & Pool Availability (`condor_status`)
+# ---------------------------------------------------------------------------
+_POOL_ORDER: Dict[str, int] = {
+    "GPU3090": 0,
+    "A100": 1,
+    "EPYC7662": 2,
+    "AMD": 3,
+    "INTEL": 4,
+}
+
+
+def _infer_node_arch(ad: Dict[str, Any], host: str) -> str:
+    raw = str(ad.get("Architecture") or "").strip()
+    if raw and raw.upper() not in ("X86_64", "INTEL/LINUX", "UNDEFINED", "NONE"):
+        return raw.upper() if raw.upper() in ARCH_SPECS else raw
+    h_low = host.lower()
+    if "3090" in h_low:
+        return "GPU3090"
+    if "a100" in h_low:
+        return "A100"
+    if "7662" in h_low:
+        return "EPYC7662"
+    return "AMD"
+
+
+def _count_assigned_gpus(val: Any) -> int:
+    if isinstance(val, int):
+        return max(0, val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s or s.lower() == "none":
+            return 0
+        if s.isdigit():
+            return int(s)
+        return len([tok for tok in s.split(",") if tok.strip()])
+    return 0
+
+
+def parse_condor_status_ads(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Aggregates raw `condor_status -json` slot ClassAds into per-machine hardware
+    availability records, handling both Partitionable+Dynamic slots and Static slots.
+    """
+    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    for ad in items:
+        if not isinstance(ad, dict):
+            continue
+        machine = str(ad.get("Machine") or "").strip()
+        if not machine:
+            name_val = str(ad.get("Name") or "").strip()
+            machine = name_val.split("@")[-1] if "@" in name_val else name_val
+        if machine:
+            by_machine.setdefault(machine, []).append(ad)
+
+    nodes: List[Dict[str, Any]] = []
+    for machine, ads in by_machine.items():
+        host = machine.split(".")[0]
+        arch = "AMD"
+        for ad in ads:
+            cand = _infer_node_arch(ad, host)
+            if cand != "AMD" or arch == "AMD":
+                arch = cand
+
+        cpus_free = 0
+        cpus_used = 0
+        cpus_rep_total = 0
+
+        mem_free = 0
+        mem_used = 0
+        mem_rep_total = 0
+
+        gpus_free = 0
+        gpus_used = 0
+        gpus_rep_total = 0
+
+        active_jobs = 0
+        draining = False
+
+        for ad in ads:
+            state = str(ad.get("State") or "").strip()
+            slot_type = str(ad.get("SlotType") or "").strip()
+            is_draining = bool(ad.get("Draining")) or state == "Drained"
+            if is_draining:
+                draining = True
+
+            c = int(ad.get("Cpus") or 0)
+            m = int(ad.get("Memory") or 0)
+            g = int(ad.get("GPUs") or 0)
+
+            tc = int(ad.get("TotalSlotCpus") or ad.get("TotalCpus") or 0)
+            tm = int(ad.get("TotalSlotMemory") or ad.get("TotalMemory") or 0)
+            tg = int(
+                ad.get("TotalSlotGPUs")
+                or ad.get("TotalGPUs")
+                or _count_assigned_gpus(ad.get("AssignedGPUs"))
+                or 0
+            )
+            if slot_type != "Dynamic":
+                cpus_rep_total = max(cpus_rep_total, tc)
+                mem_rep_total = max(mem_rep_total, tm)
+                gpus_rep_total = max(gpus_rep_total, tg)
+
+            if state == "Claimed":
+                active_jobs += 1
+                cpus_used += c
+                mem_used += m
+                gpus_used += g
+            elif state == "Unclaimed" and not is_draining:
+                cpus_free += c
+                mem_free += m
+                gpus_free += g
+
+        cpus_total = max(cpus_free + cpus_used, cpus_rep_total)
+        mem_total = max(mem_free + mem_used, mem_rep_total)
+        gpus_total = max(gpus_free + gpus_used, gpus_rep_total)
+        if arch == "GPU3090" and gpus_total == 0:
+            gpus_total = 1
+            if active_jobs == 0 and not draining:
+                gpus_free = 1
+
+        # GPU3090 locks the entire node when claimed by a job
+        if arch == "GPU3090" and (active_jobs > 0 or gpus_free == 0) and not draining:
+            node_state = "BUSY"
+            gpus_free = 0
+            cpus_free = 0
+            mem_free = 0
+        elif draining:
+            node_state = "DRAINING"
+        elif active_jobs == 0 and (cpus_free > 0 or gpus_free > 0):
+            node_state = "FREE"
+        elif (gpus_total > 0 and gpus_free == 0) or (gpus_total == 0 and cpus_free == 0):
+            node_state = "BUSY"
+        else:
+            node_state = "MIXED"
+
+        nodes.append(
+            {
+                "machine": machine,
+                "host": host,
+                "arch": arch,
+                "state": node_state,
+                "active_jobs": active_jobs,
+                "gpus_free": gpus_free,
+                "gpus_total": gpus_total,
+                "cpus_free": cpus_free,
+                "cpus_total": cpus_total,
+                "mem_free_mb": mem_free,
+                "mem_total_mb": mem_total,
+            }
+        )
+
+    nodes.sort(key=lambda n: (_POOL_ORDER.get(str(n["arch"]), 99), str(n["host"])))
+    return nodes
+
+
+def query_condor_nodes() -> Optional[List[Dict[str, Any]]]:
+    """Queries `condor_status -json` and returns per-node hardware availability."""
+    if not shutil.which("condor_status"):
+        return None
+    attrs = (
+        "Machine,Name,SlotType,State,Activity,Architecture,Cpus,TotalSlotCpus,TotalCpus,"
+        "Memory,TotalSlotMemory,TotalMemory,GPUs,TotalSlotGPUs,TotalGPUs,AssignedGPUs,Draining"
+    )
+    try:
+        res = subprocess.run(
+            ["condor_status", "-json", "-attributes", attrs],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=6,
+        )
+        if res.returncode != 0:
+            return None
+        raw = res.stdout.strip()
+        if not raw:
+            return []
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            return None
+        return parse_condor_status_ads(items)
+    except Exception:
+        return None
+
+
+def summarize_condor_pools(nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """Aggregates per-node availability into per-architecture pool totals."""
+    pools: Dict[str, Dict[str, int]] = {}
+    for n in nodes:
+        arch = str(n["arch"])
+        p = pools.setdefault(
+            arch,
+            {
+                "nodes_total": 0,
+                "nodes_avail": 0,
+                "gpus_free": 0,
+                "gpus_total": 0,
+                "cpus_free": 0,
+                "cpus_total": 0,
+                "mem_free_mb": 0,
+                "mem_total_mb": 0,
+                "active_jobs": 0,
+            },
+        )
+        p["nodes_total"] += 1
+        if n["state"] in ("FREE", "MIXED"):
+            p["nodes_avail"] += 1
+        p["gpus_free"] += int(n["gpus_free"])
+        p["gpus_total"] += int(n["gpus_total"])
+        p["cpus_free"] += int(n["cpus_free"])
+        p["cpus_total"] += int(n["cpus_total"])
+        p["mem_free_mb"] += int(n["mem_free_mb"])
+        p["mem_total_mb"] += int(n["mem_total_mb"])
+        p["active_jobs"] += int(n["active_jobs"])
+    return pools
