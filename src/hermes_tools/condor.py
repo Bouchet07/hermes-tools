@@ -1660,6 +1660,8 @@ def reconcile_run(
                             parent_ok = True
                     except Exception:
                         pass
+                if parent_cid is not None and live_clusters and parent_cid in live_clusters:
+                    parent_active = True
                 if parent_active:
                     parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
                     data["_live_badge"] = f"WAITING ({parent_tag})"

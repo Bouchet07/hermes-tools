@@ -1192,10 +1192,27 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
 
     # 2. Test live DAGMan submission
     submitted_dag_calls = []
+    submitted_sub_calls = []
 
     def mock_subprocess_run(cmd, **kwargs):
         if cmd[0] == "condor_submit_dag":
             submitted_dag_calls.append(cmd)
+            # Simulate condor_submit_dag -no_submit creating the .condor.sub file
+            dag_sub = Path(kwargs.get("cwd", ".")) / f"{cmd[-1]}.condor.sub"
+            dag_sub.write_text(
+                "arguments = broken_version_syntax\nqueue\n",
+                encoding="utf-8",
+            )
+            import subprocess
+
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="File for submitting this DAG to HTCondor: ...\n",
+                stderr="",
+            )
+        if cmd[0] == "condor_submit":
+            submitted_sub_calls.append(cmd)
             import subprocess
 
             return subprocess.CompletedProcess(
@@ -1229,9 +1246,20 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
     send_cli.main()
     assert len(submitted_dag_calls) == 1
     assert "-f" in submitted_dag_calls[0]
+    assert "-no_submit" in submitted_dag_calls[0]
     assert "-import_env" not in submitted_dag_calls[0]
     assert not Path(submitted_dag_calls[0][-1]).is_absolute()
     assert "job.dag" in submitted_dag_calls[0][-1]
+
+    assert len(submitted_sub_calls) == 1
+    assert "job.dag.condor.sub" in submitted_sub_calls[0][-1]
+
+    # Verify that .condor.sub arguments were sanitized and injected with AllowVersionMismatch
+    created_sub = Path(submitted_dag_calls[0][-1] + ".condor.sub")
+    assert created_sub.is_file()
+    sub_content = created_sub.read_text(encoding="utf-8")
+    assert "-AllowVersionMismatch" in sub_content
+    assert "broken_version_syntax" not in sub_content
 
     # Find the created dependent run directory
     child_run_dirs = [d for d in runs_cli.list_run_dirs(runs_root) if "step2" in d.name]

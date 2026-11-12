@@ -926,8 +926,10 @@ def main() -> None:
                 dag_submit_arg = str(dag_path.relative_to(cwd))
             except ValueError:
                 dag_submit_arg = str(dag_path)
-            res = subprocess.run(
-                ["condor_submit_dag", "-f", dag_submit_arg],
+
+            # Step 1: Generate .condor.sub file with condor_submit_dag -no_submit
+            subprocess.run(
+                ["condor_submit_dag", "-f", "-no_submit", dag_submit_arg],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
@@ -935,7 +937,48 @@ def main() -> None:
                 errors="replace",
                 check=True,
             )
-            condor_out = res.stdout.strip()
+
+            # Step 2: Ensure clean, uncorrupted arguments in .condor.sub (workaround for HTCondor 9.0 quoting bugs)
+            condor_sub_path = Path(f"{dag_path}.condor.sub")
+            if condor_sub_path.is_file():
+                lock_file = dag_path.with_name(f"{dag_path.name}.lock")
+                try:
+                    rel_lock = str(lock_file.relative_to(cwd).as_posix())
+                except ValueError:
+                    rel_lock = str(lock_file.as_posix())
+                try:
+                    rel_dag = str(dag_path.relative_to(cwd).as_posix())
+                except ValueError:
+                    rel_dag = str(dag_path.as_posix())
+
+                clean_arg_line = (
+                    f"arguments       = -p 0 -f -l . -Lockfile {rel_lock} "
+                    f"-AutoRescue 1 -DoRescueFrom 0 -Dag {rel_dag} "
+                    f"-Suppress_notification -CsdVersion 9.0.9 -AllowVersionMismatch -Force"
+                )
+                sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
+                if re.search(r"^arguments\s*=.*", sub_txt, re.MULTILINE):
+                    sub_txt = re.sub(r"^arguments\s*=.*", clean_arg_line, sub_txt, flags=re.MULTILINE)
+                else:
+                    sub_txt = re.sub(r"^queue\b", f"{clean_arg_line}\nqueue", sub_txt, flags=re.MULTILINE)
+                write_text_lf(condor_sub_path, sub_txt)
+
+            # Step 3: Submit the validated .condor.sub via condor_submit
+            try:
+                sub_submit_arg = str(condor_sub_path.relative_to(cwd))
+            except ValueError:
+                sub_submit_arg = str(condor_sub_path)
+
+            sub_res = subprocess.run(
+                ["condor_submit", sub_submit_arg],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
+            condor_out = sub_res.stdout.strip()
             cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
             dagman_cluster_id = int(cluster_match.group(1)) if cluster_match else None
 
