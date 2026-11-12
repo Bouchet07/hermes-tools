@@ -111,12 +111,17 @@ def _extract_run_display_parts(
 
 
 def resolve_run_dir(
-    runs_root: Path, query: Optional[str], prompt_title: str = "Select a run:"
-) -> Path:
+    runs_root: Path,
+    query: Optional[str],
+    prompt_title: str = "Select a run:",
+    exit_on_fail: bool = True,
+) -> Optional[Path]:
     dirs = list_run_dirs(runs_root)
     if not dirs:
-        console.print(f"[yellow]No runs found in {runs_root}[/yellow]")
-        sys.exit(1)
+        if exit_on_fail:
+            console.print(f"[yellow]No runs found in {runs_root}[/yellow]")
+            sys.exit(1)
+        return None
 
     if query:
         q = query.strip()
@@ -147,10 +152,14 @@ def resolve_run_dir(
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
+            if not exit_on_fail:
+                return matches[0]
             dirs = matches
         else:
-            console.print(f"[bold red]✘ No run matching '{query}'.[/bold red]")
-            sys.exit(1)
+            if exit_on_fail:
+                console.print(f"[bold red]✘ No run matching '{query}'.[/bold red]")
+                sys.exit(1)
+            return None
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return dirs[0]
@@ -561,13 +570,29 @@ def follow_run_log(run_dir: Path, log_file: Path, initial_lines: int = 60) -> No
         if not log_file.is_file():
             raw_rj = load_run_json(run_dir)
             if not run_needs_live_reconcile(raw_rj):
+                st = str(raw_rj.get("status", "UNKNOWN"))
+                if st.startswith("CANCELLED"):
+                    reason = raw_rj.get("cancelled_reason", "")
+                    r_str = f" ({reason})" if reason else ""
+                    console.print(f"[yellow]ℹ Run was cancelled{r_str}. Log file was not created.[/yellow]")
+                    return
                 console.print(f"[bold red]✘ Log file not found:[/bold red] {log_file}")
                 sys.exit(1)
 
-            console.print(
-                f"[dim yellow]⏳ Waiting for job to start and create {log_file.name} (Ctrl+C to detach)...[/dim yellow]"
-            )
+            st = str(raw_rj.get("status", "QUEUED"))
+            if st.startswith("WAITING"):
+                dep = raw_rj.get("dependency", {})
+                p_label = dep.get("parent_run_id") or dep.get("parent_cluster_id") or "parent"
+                console.print(
+                    f"[dim yellow]⏳ Run is WAITING on {p_label} to finish (Ctrl+C to detach)...[/dim yellow]"
+                )
+            else:
+                console.print(
+                    f"[dim yellow]⏳ Waiting for job to start and create {log_file.name} (Ctrl+C to detach)...[/dim yellow]"
+                )
+
             wait_ticks = 0
+            last_waiting = st.startswith("WAITING")
             while not log_file.is_file():
                 time.sleep(0.4)
                 wait_ticks += 1
@@ -585,10 +610,24 @@ def follow_run_log(run_dir: Path, log_file: Path, initial_lines: int = 60) -> No
                     if not run_needs_live_reconcile(rec) and "_live_badge" not in rec:
                         if log_file.is_file():
                             break
-                        console.print(
-                            f"[yellow]ℹ Job finished ({style_status(st)}) without creating {log_file.name}.[/yellow]"
-                        )
+                        term_st = str(rec.get("status", st))
+                        if term_st.startswith("CANCELLED"):
+                            reason = rec.get("cancelled_reason", "")
+                            r_str = f": {reason}" if reason else ""
+                            console.print(
+                                f"[yellow]ℹ Run {style_status(term_st)}{r_str}. Log file was not created.[/yellow]"
+                            )
+                        else:
+                            console.print(
+                                f"[yellow]ℹ Job finished ({style_status(term_st)}) without creating {log_file.name}.[/yellow]"
+                            )
                         return
+                    is_waiting = st.startswith("WAITING")
+                    if last_waiting and not is_waiting:
+                        console.print(
+                            f"[dim green]✔ Parent job finished! Starting log stream for {log_file.name}...[/dim green]"
+                        )
+                        last_waiting = False
 
         console.print(
             f"[dim cyan]Following {log_file.name} (auto-exits when job finishes, Ctrl+C to detach)...[/dim cyan]"
@@ -733,6 +772,7 @@ def _stop_single_run(
     run_dir: Path,
     target_cids: List[int],
     is_active_status: bool,
+    was_waiting: bool = False,
 ) -> None:
     repro_dir = run_dir / "repro"
     rj_path = run_dir / "run.json"
@@ -754,8 +794,9 @@ def _stop_single_run(
             )
 
     if any_removed or is_active_status:
-        locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": "ABORTED"}))
-        console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
+        new_status = "CANCELLED" if was_waiting else "ABORTED"
+        locked_mutate_run_json(rj_path, repro_dir, lambda d: d.update({"status": new_status}))
+        console.print(f"[cyan]Updated {run_dir.name}/run.json status -> {new_status}[/cyan]")
 
 
 def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
@@ -798,8 +839,8 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             ).ask():
                 return
 
-        for d, tcids, is_act, _ in active_targets:
-            _stop_single_run(d, tcids, is_act)
+        for d, tcids, is_act, st in active_targets:
+            _stop_single_run(d, tcids, is_act, was_waiting=st.startswith("WAITING"))
         return
 
     run_dir = resolve_run_dir(
@@ -818,6 +859,11 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
     active_cids = [c for c in cids if live_clusters is None or c in live_clusters]
 
     if not active_cids and not is_active_status:
+        if status.startswith("CANCELLED"):
+            console.print(
+                f"[dim cyan]ℹ Run [bold]{run_dir.name}[/bold] is already {style_status(status)}.[/dim cyan]"
+            )
+            return
         console.print(
             f"[dim cyan]ℹ Run [bold]{run_dir.name}[/bold] has already finished ({style_status(status)}) "
             f"and has no active jobs in condor_q.[/dim cyan]\n"
@@ -837,7 +883,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
         ).ask():
             return
 
-    _stop_single_run(run_dir, target_cids, is_active_status)
+    _stop_single_run(run_dir, target_cids, is_active_status, was_waiting=status.startswith("WAITING"))
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +894,12 @@ def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
         runs_root, args.run, prompt_title="Select run to sync code snapshot into:"
     )
     data = load_run_json(run_dir)
+    status = str(data.get("status", "UNKNOWN"))
+    if status.startswith("CANCELLED"):
+        console.print(
+            f"[yellow]⚠ Run {run_dir.name} is {style_status(status)}. Cannot sync code snapshot to cancelled runs.[/yellow]"
+        )
+        return
     refresh_code_snapshot(run_dir, data)
 
 
@@ -860,6 +912,12 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     )
     live_clusters = query_live_condor_clusters()
     data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
+    status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+    if status.startswith("WAITING"):
+        console.print(
+            f"[yellow]⚠ Run '{run_dir.name}' is currently {style_status(status)}. Cannot retry a waiting run. Use `runs stop {run_dir.name}` to cancel it.[/yellow]"
+        )
+        return
     repro_dir = run_dir / "repro"
     rj_path = run_dir / "run.json"
 

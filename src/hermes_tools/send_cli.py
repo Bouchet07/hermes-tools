@@ -40,6 +40,7 @@ from hermes_tools.core import (
     expand_arg_sweeps,
     get_hostname,
     get_prompt_style,
+    get_runs_root,
     get_username,
     is_valid_memory_input,
     load_project_config,
@@ -577,7 +578,7 @@ def main() -> None:
         sys.exit(1)
 
     cwd = Path.cwd()
-    runs_root = (cwd / "runs").resolve()
+    runs_root = get_runs_root(cwd).resolve()
     proj_cfg = load_project_config(cwd)
 
     parent_run_dir: Optional[Path] = None
@@ -588,48 +589,66 @@ def main() -> None:
     if args.after:
         from hermes_tools.runs_cli import resolve_run_dir
 
-        parent_run_dir = resolve_run_dir(runs_root, args.after)
-        if not parent_run_dir or not parent_run_dir.is_dir():
-            console.print(f"[bold red]✘ Error:[/bold red] Parent run '{args.after}' could not be resolved.")
-            sys.exit(1)
-        parent_data = load_run_json(parent_run_dir)
-        if not parent_data:
-            console.print(
-                f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
-            )
-            sys.exit(1)
-
-        live_clusters = query_live_condor_clusters()
-        if run_needs_live_reconcile(parent_data):
-            parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
-        p_cids = get_all_cluster_ids(parent_data)
-        parent_cid = p_cids[-1] if p_cids else None
-        parent_status = str(parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN"))
-        is_parent_active = parent_status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or (
-            live_clusters is not None and parent_cid is not None and parent_cid in live_clusters
-        )
-
-        if not is_parent_active:
-            if parent_status == "COMPLETED":
+        parent_run_dir = resolve_run_dir(runs_root, args.after, exit_on_fail=False)
+        if parent_run_dir and parent_run_dir.is_dir():
+            parent_data = load_run_json(parent_run_dir)
+            if not parent_data:
                 console.print(
-                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
-                    f"Submitting directly without DAGMan delay...[/dim]"
-                )
-                submit_via_dag = False
-            elif args.after_ok:
-                console.print(
-                    f"[bold red]✘ Cannot submit:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
-                    f"with status '{parent_status}'. Aborting because --after-ok was specified."
+                    f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
                 )
                 sys.exit(1)
+
+            live_clusters = query_live_condor_clusters()
+            if run_needs_live_reconcile(parent_data):
+                parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
+            p_cids = get_all_cluster_ids(parent_data)
+            parent_cid = p_cids[-1] if p_cids else None
+            parent_status = str(parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN"))
+            is_parent_active = parent_status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or (
+                live_clusters is not None and parent_cid is not None and parent_cid in live_clusters
+            )
+
+            if not is_parent_active:
+                if parent_status == "COMPLETED":
+                    console.print(
+                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
+                        f"Submitting directly without DAGMan delay...[/dim]"
+                    )
+                    submit_via_dag = False
+                elif args.after_ok:
+                    console.print(
+                        f"[bold red]✘ Cannot submit:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
+                        f"with status '{parent_status}'. Aborting because --after-ok was specified."
+                    )
+                    sys.exit(1)
+                else:
+                    console.print(
+                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
+                        f"Proceeding with direct submission...[/dim]"
+                    )
+                    submit_via_dag = False
+            else:
+                submit_via_dag = True
+        elif args.after.strip().isdigit():
+            raw_cid = int(args.after.strip())
+            live_clusters = query_live_condor_clusters()
+            if args.dry_run or (live_clusters is not None and raw_cid in live_clusters):
+                parent_cid = raw_cid
+                parent_run_dir = None
+                parent_data = None
+                submit_via_dag = True
+                if not args.dry_run:
+                    console.print(
+                        f"[dim]Parent job [bold]#{parent_cid}[/bold] detected as active raw HTCondor cluster in condor_q.[/dim]"
+                    )
             else:
                 console.print(
-                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
-                    f"Proceeding with direct submission...[/dim]"
+                    f"[bold red]✘ Error:[/bold red] Cluster ID #{raw_cid} is not active in HTCondor (condor_q) and does not match any local run in {runs_root}."
                 )
-                submit_via_dag = False
+                sys.exit(1)
         else:
-            submit_via_dag = True
+            console.print(f"[bold red]✘ Error:[/bold red] Parent run '{args.after}' could not be resolved.")
+            sys.exit(1)
 
     project_code = args.project if args.project is not None else proj_cfg.get("project")
     nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
@@ -673,6 +692,14 @@ def main() -> None:
         if target_path.is_relative_to(cwd)
         else target_path.as_posix()
     )
+    resolved_after_id: Optional[str] = None
+    if parent_run_dir is not None:
+        resolved_after_id = parent_run_dir.name
+    elif parent_cid is not None:
+        resolved_after_id = str(parent_cid)
+    elif args.after:
+        resolved_after_id = str(args.after)
+
     base_tokens = build_send_command_tokens(
         send_bin="send",
         target=rel_target,
@@ -690,7 +717,7 @@ def main() -> None:
         env_items=list(args.env),
         sweep_file=str(args.sweep_file) if args.sweep_file else None,
         sweep_specs=cli_sweep_specs,
-        after=str(args.after) if args.after else None,
+        after=resolved_after_id,
         after_ok=bool(args.after_ok),
     )
     cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
@@ -719,6 +746,9 @@ def main() -> None:
         dep_info = f"Starts after [bold]{parent_run_dir.name}[/bold]{cid_part}{ok_part}"
         if not submit_via_dag:
             dep_info += " [dim](parent completed; direct submit)[/dim]"
+    elif parent_cid is not None:
+        ok_part = " [bold yellow][exit 0 required][/bold yellow]" if args.after_ok else ""
+        dep_info = f"Starts after external cluster [bold]#{parent_cid}[/bold]{ok_part}"
 
     _render_submission_summary(
         rel_target=rel_target,
@@ -811,14 +841,13 @@ def main() -> None:
 
         dag_path = repro_dir / "job.dag"
         submit_py = resolve_submit_python()
-        parent_condor_log = (parent_run_dir / "repro" / "condor.log") if parent_run_dir else None
         dag_content = generate_dag_file(
             sub_path=sub_path,
             wait_script_path=wait_script_path,
             python_bin=submit_py,
-            parent_dir=parent_run_dir if parent_run_dir else run_dir,
+            child_dir=run_dir,
+            parent_dir=parent_run_dir,
             parent_cluster_id=parent_cid,
-            parent_log_path=parent_condor_log if parent_condor_log and parent_condor_log.is_file() else None,
             require_ok=bool(args.after_ok),
         )
         write_text_lf(dag_path, dag_content)
@@ -865,7 +894,7 @@ def main() -> None:
     }
     if submit_via_dag or (args.dry_run and args.after):
         run_json_data["dependency"] = {
-            "parent_run_id": parent_run_dir.name if parent_run_dir else str(args.after),
+            "parent_run_id": resolved_after_id or (parent_run_dir.name if parent_run_dir else (str(parent_cid) if parent_cid else str(args.after))),
             "parent_run_dir": str(parent_run_dir) if parent_run_dir else None,
             "parent_cluster_id": parent_cid,
             "require_ok": bool(args.after_ok),
@@ -936,6 +965,16 @@ def main() -> None:
                     expand=False,
                 )
             )
+
+            if args.follow:
+                from hermes_tools.runs_cli import follow_run_log
+
+                first_out_file = (
+                    run_dir / f"{target_path.stem}_0.out"
+                    if is_sweep
+                    else run_dir / f"{target_path.stem}.out"
+                )
+                follow_run_log(run_dir, first_out_file, initial_lines=60)
 
         except FileNotFoundError:
             locked_mutate_run_json(

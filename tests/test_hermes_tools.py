@@ -1268,6 +1268,7 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
         return subprocess.CompletedProcess(cmd, 0, stdout="Cluster 2000 was removed.\n", stderr="")
 
     monkeypatch.setattr(runs_cli.subprocess, "run", mock_condor_rm)
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_dispatched)
     stop_args = argparse.Namespace(run=child_dir.name, yes=True, all=False)
     runs_cli.cmd_stop(stop_args, runs_root)
     assert any("2000" in cmd for cmd in rm_calls)
@@ -1390,6 +1391,490 @@ def test_send_after_parent_failure_cancelled(tmp_path: Path, monkeypatch: pytest
     assert exc.value.code == 1
     err_out = capsys.readouterr().out
     assert "Aborting because --after-ok was specified" in err_out
+
+
+def test_multistage_pipeline_dynamic_tracking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that wait_parent.py handles multi-stage chains (A -> B -> C) where B is WAITING on A."""
+    from hermes_tools.condor import generate_wait_parent_script
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+
+    # 1. Run A (Running)
+    run_a = runs_root / "2026-11-12_10-00-00_stageA_AMD"
+    a_repro = run_a / "repro"
+    a_repro.mkdir(parents=True)
+    atomic_write_json(
+        run_a / "run.json",
+        {
+            "run_id": run_a.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 1001},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        a_repro,
+    )
+
+    # 2. Run B (Waiting on A)
+    run_b = runs_root / "2026-11-12_10-05-00_stageB_AMD"
+    b_repro = run_b / "repro"
+    b_repro.mkdir(parents=True)
+    atomic_write_json(
+        run_b / "run.json",
+        {
+            "run_id": run_b.name,
+            "status": "WAITING",
+            "submission": {"cluster_id": 2001},
+            "dependency": {
+                "parent_run_id": run_a.name,
+                "parent_run_dir": str(run_a),
+                "parent_cluster_id": 1001,
+                "dagman_cluster_id": 2001,
+                "job_cluster_id": None,
+                "require_ok": True,
+            },
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        b_repro,
+    )
+
+    # 3. Run C (Waiting on B)
+    run_c = runs_root / "2026-11-12_10-10-00_stageC_AMD"
+    c_repro = run_c / "repro"
+    c_repro.mkdir(parents=True)
+    atomic_write_json(
+        run_c / "run.json",
+        {
+            "run_id": run_c.name,
+            "status": "WAITING",
+            "submission": {"cluster_id": 3001},
+            "dependency": {
+                "parent_run_id": run_b.name,
+                "parent_run_dir": str(run_b),
+                "parent_cluster_id": 2001,
+                "dagman_cluster_id": 3001,
+                "job_cluster_id": None,
+                "require_ok": True,
+            },
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        c_repro,
+    )
+
+    script_path = tmp_path / "wait_parent.py"
+    script_path.write_text(generate_wait_parent_script(), encoding="utf-8")
+
+    # Import helper function dynamically from the generated script
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("wait_parent", str(script_path))
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # C waiting on B: B is still WAITING on A -> must NOT be finished!
+    fin, fate = mod.get_parent_fate(run_b, fallback_cid=2001)
+    assert fin is False
+    assert fate == "WAITING"
+
+    # Now A completes
+    atomic_write_json(
+        run_a / "run.json",
+        {
+            "run_id": run_a.name,
+            "status": "COMPLETED",
+            "submission": {"cluster_id": 1001},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0}],
+        },
+        a_repro,
+    )
+
+    # B waiting on A: A is finished
+    fin_a, fate_a = mod.get_parent_fate(run_a, fallback_cid=1001)
+    assert fin_a is True
+    assert fate_a == "COMPLETED"
+
+    # B transitions to RUNNING
+    atomic_write_json(
+        run_b / "run.json",
+        {
+            "run_id": run_b.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 2002},
+            "dependency": {
+                "parent_run_id": run_a.name,
+                "parent_run_dir": str(run_a),
+                "parent_cluster_id": 1001,
+                "dagman_cluster_id": 2001,
+                "job_cluster_id": 2002,
+                "require_ok": True,
+            },
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        b_repro,
+    )
+
+    # C waiting on B: B is now RUNNING -> must NOT be finished!
+    # Mock condor_q to show cluster 2002 running
+    monkeypatch.setattr(mod, "query_condor_jobs_for_cids", lambda cids, dids: [{"ClusterId": 2002}] if 2002 in cids else [])
+    fin_b, fate_b = mod.get_parent_fate(run_b, fallback_cid=2001)
+    assert fin_b is False
+    assert fate_b == "RUNNING"
+
+    # B finishes execution with success
+    atomic_write_json(
+        run_b / "run.json",
+        {
+            "run_id": run_b.name,
+            "status": "COMPLETED",
+            "submission": {"cluster_id": 2002},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0}],
+        },
+        b_repro,
+    )
+    monkeypatch.setattr(mod, "query_condor_jobs_for_cids", lambda cids, dids: [])
+
+    # Now C checking B sees COMPLETED
+    fin_b_done, fate_b_done = mod.get_parent_fate(run_b, fallback_cid=2001)
+    assert fin_b_done is True
+    assert fate_b_done == "COMPLETED"
+
+
+def test_sweep_parent_partial_failure_cancelled(tmp_path: Path) -> None:
+    """Verifies that when parent sweep finishes COMPLETED_WITH_ERRORS, child is cancelled."""
+    from hermes_tools.condor import generate_wait_parent_script
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+
+    parent_run = runs_root / "2026-11-12_10-00-00_sweep_AMD"
+    p_repro = parent_run / "repro"
+    p_repro.mkdir(parents=True)
+    atomic_write_json(
+        parent_run / "run.json",
+        {
+            "run_id": parent_run.name,
+            "status": "COMPLETED_WITH_ERRORS",
+            "submission": {"cluster_id": 5001},
+            "resources_requested": {"sweep_count": 2},
+            "executions": [
+                {"process_id": 0, "exit_code": 0},
+                {"process_id": 1, "exit_code": 1},
+            ],
+        },
+        p_repro,
+    )
+
+    child_run = runs_root / "2026-11-12_10-05-00_child_AMD"
+    c_repro = child_run / "repro"
+    c_repro.mkdir(parents=True)
+    atomic_write_json(
+        child_run / "run.json",
+        {
+            "run_id": child_run.name,
+            "status": "WAITING",
+            "submission": {"cluster_id": 6001},
+            "executions": [],
+        },
+        c_repro,
+    )
+
+    wait_py = tmp_path / "wait_parent.py"
+    wait_py.write_text(generate_wait_parent_script(), encoding="utf-8")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(wait_py),
+            "--child-dir",
+            str(child_run),
+            "--parent-dir",
+            str(parent_run),
+            "--require-ok",
+            "--poll-interval",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert res.returncode == 1
+    assert "Aborting dependent job (--require-ok)" in res.stderr
+
+    # Child run.json must be atomically marked CANCELLED (parent failed)
+    child_rj = load_run_json(child_run)
+    assert child_rj["status"] == "CANCELLED (parent failed)"
+    assert "finished with status COMPLETED_WITH_ERRORS" in child_rj.get("cancelled_reason", "")
+
+
+def test_fast_child_completion_discovery_from_logs(tmp_path: Path) -> None:
+    """Verifies that reconcile_run discovers child cluster ID and completes when condor_q is empty."""
+    from hermes_tools.condor import extract_child_cluster_id_from_logs, reconcile_run
+
+    run_dir = tmp_path / "runs" / "2026-11-12_12-00-00_fast_AMD"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+
+    # repro/condor.log shows cluster 777777 executed and completed
+    (repro_dir / "condor.log").write_text(
+        "000 (777777.000.000) 2026-11-12 12:00:00 Job submitted from host ...\n"
+        "...\n"
+        "001 (777777.000.000) 2026-11-12 12:00:01 Job executing on host ...\n"
+        "...\n"
+        "005 (777777.000.000) 2026-11-12 12:00:05 Job terminated.\n"
+        "    (1) Normal termination (return value 0)\n"
+        "...\n",
+        encoding="utf-8",
+    )
+    (repro_dir / "node_0.json").write_text(
+        json.dumps({"process_id": 0, "exit_code": 0, "walltime_sec": 4.5}),
+        encoding="utf-8",
+    )
+
+    data = {
+        "run_id": run_dir.name,
+        "status": "WAITING",
+        "submission": {"cluster_id": 700000},  # DAGMan CID
+        "resources_requested": {"sweep_count": 1},
+        "dependency": {
+            "dagman_cluster_id": 700000,
+            "job_cluster_id": None,
+            "parent_cluster_id": 699999,
+        },
+        "executions": [],
+    }
+    atomic_write_json(run_dir / "run.json", data, repro_dir)
+
+    assert extract_child_cluster_id_from_logs(repro_dir) == 777777
+
+    # reconcile_run with live_clusters={} (job already left condor_q)
+    rec = reconcile_run(run_dir, data, live_clusters={})
+    assert rec["status"] == "COMPLETED"
+    assert rec["dependency"]["job_cluster_id"] == 777777
+    assert rec["submission"]["cluster_id"] == 777777
+    assert len(rec["executions"]) == 1
+    assert rec["executions"][0]["exit_code"] == 0
+
+
+def test_provenance_equivalent_cli_resolves_run_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that equivalent_cli stores the resolved folder name, not 'latest' or '1'."""
+    import hermes_tools.send_cli as send_cli
+    from hermes_tools.core import update_latest_symlink
+
+    monkeypatch.chdir(tmp_path)
+    runs_root = tmp_path / "runs"
+    parent_dir = runs_root / "2026-11-12_09-00-00_train_GPU3090"
+    p_repro = parent_dir / "repro"
+    p_repro.mkdir(parents=True)
+    atomic_write_json(
+        parent_dir / "run.json",
+        {
+            "run_id": parent_dir.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 8888},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        p_repro,
+    )
+    update_latest_symlink(runs_root, parent_dir)
+
+    target_py = tmp_path / "eval.py"
+    target_py.write_text("print('eval')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        send_cli,
+        "query_live_condor_clusters",
+        lambda: {8888: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    # Run with --after latest
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["send", "eval.py", "-a", "AMD", "--after", "latest", "--dry-run"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cli.main()
+    assert exc.value.code == 0
+
+    from hermes_tools.runs_cli import list_run_dirs
+
+    child_dirs = [d for d in list_run_dirs(runs_root) if "eval" in d.name]
+    assert len(child_dirs) == 1
+    child_rj = load_run_json(child_dirs[0])
+
+    eq_cli = child_rj["submission"]["equivalent_cli"]
+    assert f"--after {parent_dir.name}" in eq_cli
+    assert "--after latest" not in eq_cli
+
+
+def test_subdirectory_send_runs_root_discovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that running send from a project subdirectory locates the parent runs/ directory."""
+    import hermes_tools.send_cli as send_cli
+
+    project_root = tmp_path / "my_project"
+    project_root.mkdir()
+    runs_root = project_root / "runs"
+    runs_root.mkdir()
+
+    parent_dir = runs_root / "2026-11-12_08-00-00_base_AMD"
+    p_repro = parent_dir / "repro"
+    p_repro.mkdir(parents=True)
+    atomic_write_json(
+        parent_dir / "run.json",
+        {
+            "run_id": parent_dir.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 9901},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        p_repro,
+    )
+
+    # Subdirectory inside project
+    sub_dir = project_root / "experiments" / "deep_sub"
+    sub_dir.mkdir(parents=True)
+    monkeypatch.chdir(sub_dir)
+
+    target_py = sub_dir / "task.py"
+    target_py.write_text("print('task')\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        send_cli,
+        "query_live_condor_clusters",
+        lambda: {9901: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["send", "task.py", "-a", "AMD", "--after", "1", "--dry-run"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cli.main()
+    assert exc.value.code == 0
+
+    # Ensure run capsule was created in project_root/runs, NOT in sub_dir/runs
+    assert not (sub_dir / "runs").exists()
+    created = [d for d in runs_root.iterdir() if "task" in d.name]
+    assert len(created) == 1
+
+
+def test_raw_condor_cluster_chaining(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies chaining after a raw HTCondor cluster ID not present in runs/."""
+    import hermes_tools.send_cli as send_cli
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "runs").mkdir()
+
+    target_py = tmp_path / "raw_chain.py"
+    target_py.write_text("print('raw')\n", encoding="utf-8")
+
+    # Cluster 999999 is running in condor_q
+    monkeypatch.setattr(
+        send_cli,
+        "query_live_condor_clusters",
+        lambda: {999999: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["send", "raw_chain.py", "-a", "AMD", "--after", "999999", "--after-ok", "--dry-run"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cli.main()
+    assert exc.value.code == 0
+
+    from hermes_tools.runs_cli import list_run_dirs
+
+    child_dirs = [d for d in list_run_dirs(tmp_path / "runs") if "raw_chain" in d.name]
+    assert len(child_dirs) == 1
+    child_rj = load_run_json(child_dirs[0])
+
+    assert child_rj["dependency"]["parent_cluster_id"] == 999999
+    assert child_rj["dependency"]["parent_run_dir"] is None
+    assert child_rj["dependency"]["require_ok"] is True
+    assert "--after 999999" in child_rj["submission"]["equivalent_cli"]
+
+
+def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Verifies that runs sync, runs retry, runs stop, and follow_run_log guard WAITING and CANCELLED runs."""
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+
+    # 1. Waiting run
+    wait_run = runs_root / "2026-11-12_10-00-00_wait_AMD"
+    w_repro = wait_run / "repro"
+    w_repro.mkdir(parents=True)
+    atomic_write_json(
+        wait_run / "run.json",
+        {
+            "run_id": wait_run.name,
+            "status": "WAITING",
+            "submission": {"cluster_id": 5555},
+            "resources_requested": {"sweep_count": 1},
+            "dependency": {"dagman_cluster_id": 5555, "parent_cluster_id": 4444},
+            "executions": [],
+        },
+        w_repro,
+    )
+
+    monkeypatch.setattr(
+        runs_cli,
+        "query_live_condor_clusters",
+        lambda: {5555: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    # Retrying a WAITING run should be disallowed
+    retry_args = argparse.Namespace(run=wait_run.name, all=False, in_place=False, new_run=False, update_code=False)
+    runs_cli.cmd_retry(retry_args, runs_root)
+    out = capsys.readouterr().out
+    assert "retry a waiting run" in out
+
+    # Stopping a WAITING run should remove DAGMan cluster and set status CANCELLED
+    rm_calls = []
+
+    def mock_condor_rm(cmd, **kwargs):
+        rm_calls.append(cmd)
+        import subprocess
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="Cluster 5555 was removed.\n", stderr="")
+
+    monkeypatch.setattr(runs_cli.subprocess, "run", mock_condor_rm)
+    stop_args = argparse.Namespace(run=wait_run.name, yes=True, all=False)
+    runs_cli.cmd_stop(stop_args, runs_root)
+    assert any("5555" in cmd for cmd in rm_calls)
+    stopped_rj = load_run_json(wait_run)
+    assert stopped_rj["status"] == "CANCELLED"
+
+    # Stopping an already CANCELLED run informs user cleanly
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+    runs_cli.cmd_stop(stop_args, runs_root)
+    out_stop = capsys.readouterr().out
+    assert "is already CANCELLED" in out_stop
+
+    # Syncing code into a CANCELLED run should be guarded
+    sync_args = argparse.Namespace(run=wait_run.name)
+    runs_cli.cmd_sync(sync_args, runs_root)
+    out_sync = capsys.readouterr().out
+    assert "cancelled runs" in out_sync
+
+    # follow_run_log on a CANCELLED run should return without crashing
+    runs_cli.follow_run_log(wait_run, wait_run / "wait.out")
+    out_follow = capsys.readouterr().out
+    assert "Run was cancelled" in out_follow
 
 
 
