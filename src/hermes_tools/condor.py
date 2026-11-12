@@ -764,6 +764,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import fcntl
@@ -776,7 +777,7 @@ for _p in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/lib/condor/bin", "/usr/lo
         os.environ["PATH"] = f"{_p}:{os.environ.get('PATH', '')}"
 
 
-def query_condor_jobs_for_cids(cids: set[int], dagman_cids: set[int]) -> list[dict]:
+def query_condor_jobs_for_cids(cids: Set[int], dagman_cids: Set[int]) -> List[Dict[str, Any]]:
     """Queries condor_q for any job matching specified ClusterIds or DAGManJobIds."""
     if not shutil.which("condor_q"):
         return []
@@ -824,7 +825,7 @@ def query_single_cluster_active(cid: int) -> bool:
     return False
 
 
-def get_parent_fate(parent_dir: Path | None, fallback_cid: int | None) -> tuple[bool, str]:
+def get_parent_fate(parent_dir: Optional[Path], fallback_cid: Optional[int]) -> Tuple[bool, str]:
     """
     Returns (is_finished, fate_string).
     Handles dynamic parent cluster discovery, waiting states (A -> B -> C), and sweep executions.
@@ -871,8 +872,8 @@ def get_parent_fate(parent_dir: Path | None, fallback_cid: int | None) -> tuple[
     sweep_count = int(req.get("sweep_count", 1) or 1)
 
     # 1. Collect all known cluster IDs for parent
-    cids: set[int] = set()
-    dagman_cids: set[int] = set()
+    cids: Set[int] = set()
+    dagman_cids: Set[int] = set()
     if fallback_cid is not None:
         cids.add(fallback_cid)
     for k in ("job_cluster_id", "cluster_id"):
@@ -989,7 +990,7 @@ def get_parent_fate(parent_dir: Path | None, fallback_cid: int | None) -> tuple[
     return False, status
 
 
-def record_child_cancelled(child_dir: Path | None, parent_label: str, parent_fate: str) -> None:
+def record_child_cancelled(child_dir: Optional[Path], parent_label: str, parent_fate: str) -> None:
     """Atomically updates child run.json to CANCELLED (parent failed) with lock."""
     if child_dir is None:
         return

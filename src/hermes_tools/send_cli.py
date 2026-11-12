@@ -923,7 +923,7 @@ def main() -> None:
     if submit_via_dag and dag_path is not None:
         try:
             res = subprocess.run(
-                ["condor_submit_dag", "-import_env", "-f", str(dag_path)],
+                ["condor_submit_dag", "-f", str(dag_path)],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
