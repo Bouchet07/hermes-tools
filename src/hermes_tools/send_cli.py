@@ -922,8 +922,12 @@ def main() -> None:
     # 8. Submit to HTCondor
     if submit_via_dag and dag_path is not None:
         try:
+            try:
+                dag_submit_arg = str(dag_path.relative_to(cwd))
+            except ValueError:
+                dag_submit_arg = str(dag_path)
             res = subprocess.run(
-                ["condor_submit_dag", "-f", str(dag_path)],
+                ["condor_submit_dag", "-f", dag_submit_arg],
                 cwd=cwd,
                 capture_output=True,
                 text=True,

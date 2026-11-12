@@ -1229,6 +1229,8 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
     send_cli.main()
     assert len(submitted_dag_calls) == 1
     assert "-f" in submitted_dag_calls[0]
+    assert "-import_env" not in submitted_dag_calls[0]
+    assert not Path(submitted_dag_calls[0][-1]).is_absolute()
     assert "job.dag" in submitted_dag_calls[0][-1]
 
     # Find the created dependent run directory
