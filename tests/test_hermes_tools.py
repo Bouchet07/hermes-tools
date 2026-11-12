@@ -1900,6 +1900,74 @@ def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.Mo
     assert "Run was cancelled" in out_follow
 
 
+def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import hermes_tools.condor as condor
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+
+    parent_dir = runs_root / "2026-11-12_10-00-00_parent_GPU3090"
+    parent_dir.mkdir()
+    (parent_dir / "repro").mkdir()
+    parent_rj = {
+        "status": "RUNNING",
+        "submission": {"cluster_id": 1074962},
+        "resources_requested": {"sweep_count": 1},
+    }
+    (parent_dir / "run.json").write_text(json.dumps(parent_rj), encoding="utf-8")
+
+    child_dir = runs_root / "2026-11-12_11-00-00_child_GPU3090"
+    child_dir.mkdir()
+    (child_dir / "repro").mkdir()
+    # Emulate a child run that was accidentally marked CANCELLED while DAGMan is still active in condor_q
+    child_rj = {
+        "status": "CANCELLED",
+        "submission": {"cluster_id": 1075087},
+        "resources_requested": {"sweep_count": 1},
+        "dependency": {
+            "dagman_cluster_id": 1075087,
+            "parent_cluster_id": 1074962,
+            "parent_run_dir": str(parent_dir),
+            "parent_run_id": parent_dir.name,
+        },
+    }
+    (child_dir / "run.json").write_text(json.dumps(child_rj), encoding="utf-8")
+
+    live_clusters = {
+        1074962: {"ClusterId": 1074962, "JobStatus": 2},
+        1075087: {"ClusterId": 1075087, "JobStatus": 2, "child_clusters": []},
+    }
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_clusters)
+
+    # Reconciling child_dir directly
+    rec = condor.reconcile_run(child_dir, child_rj, live_clusters)
+    assert rec["status"] == "WAITING"
+    assert rec["_live_badge"] == "WAITING (after #1074962)"
+
+    # Verify run.json on disk was healed to WAITING
+    healed_disk = json.loads((child_dir / "run.json").read_text(encoding="utf-8"))
+    assert healed_disk["status"] == "WAITING"
+
+    # cmd_ls should also list it and show WAITING
+    ls_args = argparse.Namespace(
+        quiet=False,
+        full=False,
+        all=False,
+        tag=None,
+        arch=None,
+        status=None,
+        target=None,
+        since=None,
+        until=None,
+        sort=None,
+        n=10,
+    )
+    runs_cli.cmd_ls(ls_args, runs_root)
+
+
+
 
 
 

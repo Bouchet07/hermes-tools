@@ -172,7 +172,15 @@ def resolve_run_dir(
     rows: List[Tuple[int, Path, str, str, str, str, str, str]] = []
     for i, d in enumerate(dirs[:35], start=1):
         raw_rj = load_run_json(d)
-        if run_needs_live_reconcile(raw_rj):
+        needs_rec = run_needs_live_reconcile(raw_rj)
+        if not needs_rec and not live_clusters_queried:
+            dep = raw_rj.get("dependency")
+            if isinstance(dep, dict) and dep.get("dagman_cluster_id") and not get_execution_records(raw_rj):
+                live_clusters = query_live_condor_clusters()
+                live_clusters_queried = True
+        if not needs_rec and live_clusters and any(c in live_clusters for c in get_all_cluster_ids(raw_rj)):
+            needs_rec = True
+        if needs_rec:
             if not live_clusters_queried:
                 live_clusters = query_live_condor_clusters()
                 live_clusters_queried = True
@@ -267,7 +275,15 @@ def _build_ls_table_with_state(
             data = cached_entry[1]
         else:
             raw_data = load_run_json(d)
-            if run_needs_live_reconcile(raw_data):
+            needs_rec = run_needs_live_reconcile(raw_data)
+            if not needs_rec and not live_clusters_queried:
+                dep = raw_data.get("dependency")
+                if isinstance(dep, dict) and dep.get("dagman_cluster_id") and not get_execution_records(raw_data):
+                    live_clusters = query_live_condor_clusters()
+                    live_clusters_queried = True
+            if not needs_rec and live_clusters and any(c in live_clusters for c in get_all_cluster_ids(raw_data)):
+                needs_rec = True
+            if needs_rec:
                 if not live_clusters_queried:
                     live_clusters = query_live_condor_clusters()
                     live_clusters_queried = True
@@ -569,6 +585,9 @@ def follow_run_log(run_dir: Path, log_file: Path, initial_lines: int = 60) -> No
     try:
         if not log_file.is_file():
             raw_rj = load_run_json(run_dir)
+            live_cls = query_live_condor_clusters()
+            if live_cls and any(c in live_cls for c in get_all_cluster_ids(raw_rj)):
+                raw_rj = reconcile_run(run_dir, raw_rj, live_cls)
             if not run_needs_live_reconcile(raw_rj):
                 st = str(raw_rj.get("status", "UNKNOWN"))
                 if st.startswith("CANCELLED"):

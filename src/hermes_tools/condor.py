@@ -770,6 +770,11 @@ try:
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 
+# Ensure standard HTCondor and system paths are in PATH
+for _p in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/lib/condor/bin", "/usr/local/condor/bin"):
+    if os.path.isdir(_p) and _p not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{_p}:{os.environ.get('PATH', '')}"
+
 
 def query_condor_jobs_for_cids(cids: set[int], dagman_cids: set[int]) -> list[dict]:
     """Queries condor_q for any job matching specified ClusterIds or DAGManJobIds."""
@@ -777,7 +782,7 @@ def query_condor_jobs_for_cids(cids: set[int], dagman_cids: set[int]) -> list[di
         return []
     try:
         res = subprocess.run(
-            ["condor_q", "-json", "-attributes", "ClusterId,JobStatus,DAGManJobId"],
+            ["condor_q", "-nobatch", "-json", "-attributes", "ClusterId,JobStatus,DAGManJobId"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -804,7 +809,7 @@ def query_single_cluster_active(cid: int) -> bool:
         return False
     try:
         res = subprocess.run(
-            ["condor_q", str(cid), "-json", "-attributes", "ClusterId,JobStatus"],
+            ["condor_q", str(cid), "-nobatch", "-json", "-attributes", "ClusterId,JobStatus"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1232,6 +1237,7 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
         cmd.append(user)
     cmd.extend(
         [
+            "-nobatch",
             "-json",
             "-attributes",
             "ClusterId,ProcId,JobStatus,HoldReason,RemoteHost,"
@@ -1426,7 +1432,9 @@ def reconcile_run(
     sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
 
     # Fast path for terminal runs: skip CephFS globbing and condor_q checks completely
-    if not is_active_status and (
+    # (unless an HTCondor cluster for this run is still actively running in condor_q)
+    has_live_cluster = live_clusters is not None and any(c in live_clusters for c in get_all_cluster_ids(data))
+    if not is_active_status and not has_live_cluster and (
         status in ("DRY_RUN", "SUBMIT_FAILED", "ABORTED", "CANCELLED")
         or status.startswith("CANCELLED")
         or len(get_execution_records(data)) >= sweep_count
@@ -1435,6 +1443,17 @@ def reconcile_run(
 
     repro_dir = run_dir / "repro"
     run_json_path = run_dir / "run.json"
+
+    dep = data.get("dependency")
+    is_dependent = isinstance(dep, dict)
+
+    # Check if a dependent run was prematurely marked CANCELLED while its DAGMan is actively running in condor_q
+    dagman_cid = dep.get("dagman_cluster_id") if is_dependent else None
+    if status.startswith("CANCELLED") and is_dependent and dagman_cid and live_clusters and dagman_cid in live_clusters:
+        locked_mutate_run_json(run_json_path, repro_dir, lambda d: d.update({"status": "WAITING"}))
+        data["status"] = "WAITING"
+        status = "WAITING"
+        is_active_status = True
 
     synced_execs: Optional[List[Dict[str, Any]]] = None
     if repro_dir.is_dir():
@@ -1500,15 +1519,41 @@ def reconcile_run(
                 if extracted in live_clusters and extracted not in active_cids:
                     active_cids.append(extracted)
 
+        # Check if DAGMan has finished / exited on disk
+        dag_out = repro_dir / "job.dag.dagman.out"
+        dag_has_exited = False
+        if dag_out.is_file():
+            try:
+                txt = dag_out.read_text(encoding="utf-8", errors="replace")
+                if "EXITING WITH STATUS" in txt or "failed with status" in txt:
+                    dag_has_exited = True
+            except OSError:
+                pass
+
+        # Check if parent run is still active
+        parent_dir_str = dep.get("parent_run_dir")
+        parent_active = False
+        if parent_dir_str:
+            try:
+                p_rj = load_run_json(Path(parent_dir_str))
+                p_st = str(p_rj.get("_live_badge") or p_rj.get("status", ""))
+                if p_st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")):
+                    parent_active = True
+            except Exception:
+                pass
+        if parent_cid is not None and live_clusters and parent_cid in live_clusters:
+            parent_active = True
+
         # Still waiting for parent if child job not active in queue and executions not yet finished
         if (
             (job_cid is None or job_cid not in live_clusters)
-            and (dagman_cid is not None and dagman_cid in live_clusters)
             and len(get_execution_records(data)) < sweep_count
         ):
-            parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
-            data["_live_badge"] = f"WAITING ({parent_tag})"
-            return data
+            is_dag_active = bool(dagman_cid is not None and dagman_cid in live_clusters)
+            if is_dag_active or (not dag_has_exited and parent_active):
+                parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
+                data["_live_badge"] = f"WAITING ({parent_tag})"
+                return data
 
         # If child job has started in condor_q, transition out of WAITING status
         if job_cid is not None and job_cid in live_clusters:
@@ -1596,10 +1641,13 @@ def reconcile_run(
                 require_ok = bool(dep.get("require_ok", False))
                 parent_dir_str = dep.get("parent_run_dir")
                 parent_ok = False
+                parent_active = False
                 if parent_dir_str:
                     try:
                         p_rj = load_run_json(Path(parent_dir_str))
-                        p_st = str(p_rj.get("status", ""))
+                        p_st = str(p_rj.get("_live_badge") or p_rj.get("status", ""))
+                        if p_st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")):
+                            parent_active = True
                         p_execs = get_execution_records(p_rj)
                         if p_st == "COMPLETED" or (
                             p_execs
@@ -1611,6 +1659,10 @@ def reconcile_run(
                             parent_ok = True
                     except Exception:
                         pass
+                if parent_active:
+                    parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
+                    data["_live_badge"] = f"WAITING ({parent_tag})"
+                    return data
                 if require_ok and not parent_ok:
                     new_status = "CANCELLED (parent failed)"
                 elif fate:
