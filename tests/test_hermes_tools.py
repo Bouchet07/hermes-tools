@@ -228,6 +228,29 @@ def test_code_snapshot_removes_deleted_files_on_sync(tmp_path: Path) -> None:
     assert not (repro_dir / "code" / "old_helper.py").exists()
 
 
+def test_code_snapshot_nongit_subdirectory_skips_runs_root(tmp_path: Path) -> None:
+    project_root = tmp_path / "nongit_project"
+    project_root.mkdir()
+    runs_dir = project_root / "runs"
+    runs_dir.mkdir()
+    (runs_dir / "old_artifact.txt").write_text("old", encoding="utf-8")
+
+    sub_dir = project_root / "deep" / "nested"
+    sub_dir.mkdir(parents=True)
+    target = sub_dir / "train.py"
+    target.write_text("print('train')\n", encoding="utf-8")
+
+    repro_dir = runs_dir / "r1" / "repro"
+    repro_dir.mkdir(parents=True)
+
+    create_code_snapshot(target, sub_dir, repro_dir, {"is_git": False})
+    # Target in subdir must be copied
+    assert (repro_dir / "code" / "train.py").is_file()
+    # Old runs contents must not be copied
+    assert not (repro_dir / "code" / "runs").exists()
+    assert not (repro_dir / "code" / "old_artifact.txt").exists()
+
+
 def test_end_to_end_send_dry_run_and_runs_cli(tmp_path: Path) -> None:
     script = tmp_path / "train.py"
     script.write_text("print('hello hermes')\n", encoding="utf-8")

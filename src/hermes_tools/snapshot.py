@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_tools.core import console, locked_mutate_run_json, write_text_lf
+from hermes_tools.core import console, get_runs_root, locked_mutate_run_json, write_text_lf
 
 _IGNORED_PARTS: Set[str] = {
     ".git",
@@ -203,7 +203,7 @@ def create_code_snapshot(
         shutil.rmtree(code_dir, ignore_errors=True)
     code_dir.mkdir(parents=True, exist_ok=True)
     created_dirs: Set[Path] = {code_dir}
-    runs_root = (cwd / "runs").resolve()
+    runs_root = get_runs_root(cwd).resolve()
     repro_resolved = repro_dir.resolve()
 
     if git_info.get("is_git") and git_info.get("root"):
@@ -283,7 +283,12 @@ def create_code_snapshot(
                     if entry.name in _IGNORED_PARTS or entry.name.startswith(".hermes"):
                         continue
                     entry_path = Path(entry.path)
-                    if entry_path == runs_root or entry_path == repro_resolved:
+                    if (
+                        entry_path == runs_root
+                        or entry_path == repro_resolved
+                        or entry_path.is_relative_to(runs_root)
+                        or entry_path.is_relative_to(repro_resolved)
+                    ):
                         continue
                     rel_path = entry_path.relative_to(cwd_resolved)
                     dest_file = code_dir / rel_path
