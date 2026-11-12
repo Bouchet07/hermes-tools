@@ -63,6 +63,8 @@ STATUS_STYLES: Dict[str, str] = {
     "COMPLETED": "bold green",
     "RUNNING": "bold cyan",
     "QUEUED": "bold yellow",
+    "WAITING": "bold blue",
+    "CANCELLED": "dim yellow",
     "HELD": "bold magenta",
     "FAILED": "bold red",
     "COMPLETED_WITH_ERRORS": "bold yellow",

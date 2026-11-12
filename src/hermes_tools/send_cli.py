@@ -23,8 +23,14 @@ from hermes_tools.condor import (
     build_send_command_tokens,
     format_condor_arg_line,
     generate_bash_wrapper,
+    generate_dag_file,
     generate_sub_file,
+    generate_wait_parent_script,
+    get_all_cluster_ids,
     query_condor_nodes,
+    query_live_condor_clusters,
+    reconcile_run,
+    run_needs_live_reconcile,
     summarize_condor_pools,
 )
 from hermes_tools.core import (
@@ -37,8 +43,10 @@ from hermes_tools.core import (
     get_username,
     is_valid_memory_input,
     load_project_config,
+    load_run_json,
     locked_mutate_run_json,
     parse_memory_to_mb,
+    resolve_submit_python,
     sanitize_tag,
     update_latest_symlink,
     write_text_lf,
@@ -119,6 +127,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Export custom environment variable(s) inside job.sh, e.g. -e WANDB_MODE=offline",
+    )
+    parser.add_argument(
+        "--after",
+        type=str,
+        help="Queue run as a dependent job after specified run (by ID, index, or cluster ID) completes",
+    )
+    parser.add_argument(
+        "--after-ok",
+        action="store_true",
+        help="When used with --after, only run if parent succeeds (exit 0); cancel if parent fails",
     )
     parser.add_argument(
         "-f",
@@ -466,6 +484,7 @@ def _render_submission_summary(
     git_info: Dict[str, object],
     env_vars: Dict[str, str],
     equivalent_cli: str,
+    dependency_info: Optional[str] = None,
 ) -> None:
     summary_table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     summary_table.add_column("Property", style="bold cyan", width=20)
@@ -506,6 +525,9 @@ def _render_submission_summary(
         summary_table.add_row(
             "Arguments", sweep_list[0] if sweep_list[0] else "[dim](none)[/dim]"
         )
+
+    if dependency_info:
+        summary_table.add_row("Dependency", dependency_info)
 
     if git_info["is_git"]:
         dirty_badge = (
@@ -550,8 +572,64 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    if args.after_ok and not args.after:
+        console.print("[bold red]✘ Error:[/bold red] --after-ok requires --after <run>.")
+        sys.exit(1)
+
     cwd = Path.cwd()
+    runs_root = (cwd / "runs").resolve()
     proj_cfg = load_project_config(cwd)
+
+    parent_run_dir: Optional[Path] = None
+    parent_data: Optional[Dict[str, Any]] = None
+    parent_cid: Optional[int] = None
+    submit_via_dag = False
+
+    if args.after:
+        from hermes_tools.runs_cli import resolve_run_dir
+
+        parent_run_dir = resolve_run_dir(runs_root, args.after)
+        if not parent_run_dir or not parent_run_dir.is_dir():
+            console.print(f"[bold red]✘ Error:[/bold red] Parent run '{args.after}' could not be resolved.")
+            sys.exit(1)
+        parent_data = load_run_json(parent_run_dir)
+        if not parent_data:
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
+            )
+            sys.exit(1)
+
+        live_clusters = query_live_condor_clusters()
+        if run_needs_live_reconcile(parent_data):
+            parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
+        p_cids = get_all_cluster_ids(parent_data)
+        parent_cid = p_cids[-1] if p_cids else None
+        parent_status = str(parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN"))
+        is_parent_active = parent_status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or (
+            live_clusters is not None and parent_cid is not None and parent_cid in live_clusters
+        )
+
+        if not is_parent_active:
+            if parent_status == "COMPLETED":
+                console.print(
+                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
+                    f"Submitting directly without DAGMan delay...[/dim]"
+                )
+                submit_via_dag = False
+            elif args.after_ok:
+                console.print(
+                    f"[bold red]✘ Cannot submit:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
+                    f"with status '{parent_status}'. Aborting because --after-ok was specified."
+                )
+                sys.exit(1)
+            else:
+                console.print(
+                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
+                    f"Proceeding with direct submission...[/dim]"
+                )
+                submit_via_dag = False
+        else:
+            submit_via_dag = True
 
     project_code = args.project if args.project is not None else proj_cfg.get("project")
     nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
@@ -612,6 +690,8 @@ def main() -> None:
         env_items=list(args.env),
         sweep_file=str(args.sweep_file) if args.sweep_file else None,
         sweep_specs=cli_sweep_specs,
+        after=str(args.after) if args.after else None,
+        after_ok=bool(args.after_ok),
     )
     cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
     if len(sweep_list) > 1:
@@ -627,11 +707,18 @@ def main() -> None:
     ts_str = now.strftime("%Y-%m-%d_%H-%M-%S")
     safe_tag = f"_{tag}" if tag else ""
     run_id = f"{ts_str}_{target_path.stem}_{arch}{safe_tag}"
-    runs_root = (cwd / "runs").resolve()
     run_dir = runs_root / run_id
     repro_dir = run_dir / "repro"
 
     git_info = get_git_info(cwd)
+
+    dep_info: Optional[str] = None
+    if parent_run_dir is not None:
+        cid_part = f" (#{parent_cid})" if parent_cid else ""
+        ok_part = " [bold yellow][exit 0 required][/bold yellow]" if args.after_ok else ""
+        dep_info = f"Starts after [bold]{parent_run_dir.name}[/bold]{cid_part}{ok_part}"
+        if not submit_via_dag:
+            dep_info += " [dim](parent completed; direct submit)[/dim]"
 
     _render_submission_summary(
         rel_target=rel_target,
@@ -647,6 +734,7 @@ def main() -> None:
         git_info=git_info,
         env_vars=env_vars,
         equivalent_cli=equivalent_cli,
+        dependency_info=dep_info,
     )
 
     if not args.yes and not args.dry_run:
@@ -710,9 +798,35 @@ def main() -> None:
     write_text_lf(sub_path, sub_content)
 
     is_sweep = len(sweep_list) > 1
+
+    dag_path: Optional[Path] = None
+    dag_content: Optional[str] = None
+    if submit_via_dag or (args.dry_run and args.after):
+        wait_script_path = repro_dir / "wait_parent.py"
+        write_text_lf(wait_script_path, generate_wait_parent_script())
+        try:
+            wait_script_path.chmod(0o755)
+        except OSError:
+            pass
+
+        dag_path = repro_dir / "job.dag"
+        submit_py = resolve_submit_python()
+        parent_condor_log = (parent_run_dir / "repro" / "condor.log") if parent_run_dir else None
+        dag_content = generate_dag_file(
+            sub_path=sub_path,
+            wait_script_path=wait_script_path,
+            python_bin=submit_py,
+            parent_dir=parent_run_dir if parent_run_dir else run_dir,
+            parent_cluster_id=parent_cid,
+            parent_log_path=parent_condor_log if parent_condor_log and parent_condor_log.is_file() else None,
+            require_ok=bool(args.after_ok),
+        )
+        write_text_lf(dag_path, dag_content)
+
+    initial_status = "DRY_RUN" if args.dry_run else ("WAITING" if submit_via_dag else "QUEUED")
     run_json_data: Dict[str, Any] = {
         "run_id": run_id,
-        "status": "DRY_RUN" if args.dry_run else "QUEUED",
+        "status": initial_status,
         "submission": {
             "submitted_at": now.isoformat(timespec="seconds"),
             "user": get_username(),
@@ -749,6 +863,15 @@ def main() -> None:
         },
         "executions": [],
     }
+    if submit_via_dag or (args.dry_run and args.after):
+        run_json_data["dependency"] = {
+            "parent_run_id": parent_run_dir.name if parent_run_dir else str(args.after),
+            "parent_run_dir": str(parent_run_dir) if parent_run_dir else None,
+            "parent_cluster_id": parent_cid,
+            "require_ok": bool(args.after_ok),
+            "dagman_cluster_id": None,
+            "job_cluster_id": None,
+        }
 
     run_json_path = run_dir / "run.json"
     atomic_write_json(run_json_path, run_json_data, repro_dir)
@@ -760,78 +883,150 @@ def main() -> None:
         console.print(
             f"\n[bold yellow]✔ Dry run complete![/bold yellow] Generated capsule in: [cyan]runs/{run_id}/[/cyan]"
         )
-        console.print(Syntax(sub_content, "ini", theme="monokai", line_numbers=True))
+        if dag_content:
+            console.print("[bold cyan]HTCondor DAGMan Workflow Definition (job.dag):[/bold cyan]")
+            console.print(Syntax(dag_content, "ini", theme="monokai", line_numbers=True, word_wrap=True))
+            console.print("\n[bold cyan]HTCondor Job Description (job.sub):[/bold cyan]")
+        console.print(Syntax(sub_content, "ini", theme="monokai", line_numbers=True, word_wrap=True))
         sys.exit(0)
 
     # 8. Submit to HTCondor
-    try:
-        res = subprocess.run(
-            ["condor_submit", str(sub_path)],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-        )
-        condor_out = res.stdout.strip()
-        cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
-        cluster_id = int(cluster_match.group(1)) if cluster_match else None
-
-        def _record_submit_info(data: Dict[str, Any]) -> None:
-            sub_block = data.setdefault("submission", {})
-            sub_block["condor_submit_output"] = condor_out
-            sub_block["cluster_id"] = cluster_id
-
-        locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
-        update_latest_symlink(runs_root, run_dir)
-
-        first_out_file = (
-            run_dir / f"{target_path.stem}_0.out"
-            if is_sweep
-            else run_dir / f"{target_path.stem}.out"
-        )
-        condor_q_cmd = f"condor_q {cluster_id}" if cluster_id else "condor_q"
-
-        console.print(
-            Panel(
-                f"[bold green]✔ {condor_out}[/bold green]\n\n"
-                f"  • [bold]Manage Run    :[/bold] [cyan]runs inspect latest[/cyan]\n"
-                f"  • [bold]Live Table    :[/bold] [cyan]runs watch[/cyan]  [dim](or {condor_q_cmd})[/dim]\n"
-                f"  • [bold]Follow Stdout :[/bold] [cyan]runs logs -f[/cyan]\n"
-                f"  • [bold]Follow Stderr :[/bold] [cyan]runs logs -e -f[/cyan]",
-                title="[bold green]🎉 Job Submitted to Hermes 2[/bold green]",
-                border_style="green",
-                expand=False,
+    if submit_via_dag and dag_path is not None:
+        try:
+            res = subprocess.run(
+                ["condor_submit_dag", "-f", str(dag_path)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
             )
-        )
+            condor_out = res.stdout.strip()
+            cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+            dagman_cluster_id = int(cluster_match.group(1)) if cluster_match else None
 
-        if args.follow:
-            from hermes_tools.runs_cli import follow_run_log
+            def _record_dag_info(data: Dict[str, Any]) -> None:
+                sub_block = data.setdefault("submission", {})
+                sub_block["condor_submit_output"] = condor_out
+                sub_block["cluster_id"] = dagman_cluster_id
+                dep_block = data.setdefault("dependency", {})
+                dep_block["dagman_cluster_id"] = dagman_cluster_id
 
-            follow_run_log(run_dir, first_out_file, initial_lines=60)
+            locked_mutate_run_json(run_json_path, repro_dir, _record_dag_info)
+            update_latest_symlink(runs_root, run_dir)
 
-    except FileNotFoundError:
-        locked_mutate_run_json(
-            run_json_path,
-            repro_dir,
-            lambda d: d.update({"status": "SUBMIT_FAILED"}),
-        )
-        console.print(
-            f"[bold red]✘ Error:[/bold red] 'condor_submit' not found in PATH (are you on hermes2?).\n"
-            f"  Run directory and repro capsule were still generated at: [cyan]runs/{run_id}/[/cyan]"
-        )
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        err_msg = (e.stderr or e.stdout or "").strip()
+            parent_label = (
+                f"#{parent_cid}"
+                if parent_cid
+                else (parent_run_dir.name if parent_run_dir else "parent")
+            )
+            condor_q_cmd = f"condor_q {dagman_cluster_id}" if dagman_cluster_id else "condor_q"
 
-        def _record_submit_err(data: Dict[str, Any]) -> None:
-            data["status"] = "SUBMIT_FAILED"
-            data.setdefault("submission", {})["condor_submit_error"] = err_msg
+            console.print(
+                Panel(
+                    f"[bold green]✔ {condor_out}[/bold green]\n\n"
+                    f"  • [bold]Status        :[/bold] [bold blue]WAITING[/bold blue] (starts automatically when {parent_label} finishes)\n"
+                    f"  • [bold]Manage Run    :[/bold] [cyan]runs inspect latest[/cyan]\n"
+                    f"  • [bold]Live Table    :[/bold] [cyan]runs watch[/cyan]  [dim](or {condor_q_cmd})[/dim]\n"
+                    f"  • [bold]Diagnose Wait :[/bold] [cyan]runs why latest[/cyan]\n"
+                    f"  • [bold]Abort Waiting :[/bold] [cyan]runs stop latest[/cyan]",
+                    title="[bold green]🔗 Dependent Job Chained via DAGMan[/bold green]",
+                    border_style="green",
+                    expand=False,
+                )
+            )
 
-        locked_mutate_run_json(run_json_path, repro_dir, _record_submit_err)
-        console.print(f"[bold red]✘ condor_submit failed:[/bold red]\n{err_msg}")
-        sys.exit(1)
+        except FileNotFoundError:
+            locked_mutate_run_json(
+                run_json_path,
+                repro_dir,
+                lambda d: d.update({"status": "SUBMIT_FAILED"}),
+            )
+            console.print(
+                f"[bold red]✘ Error:[/bold red] 'condor_submit_dag' not found in PATH (are you on hermes2?).\n"
+                f"  Run directory and repro capsule were still generated at: [cyan]runs/{run_id}/[/cyan]"
+            )
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            err_msg = (e.stderr or e.stdout or "").strip()
+
+            def _record_dag_err(data: Dict[str, Any]) -> None:
+                data["status"] = "SUBMIT_FAILED"
+                data.setdefault("submission", {})["condor_submit_error"] = err_msg
+
+            locked_mutate_run_json(run_json_path, repro_dir, _record_dag_err)
+            console.print(f"[bold red]✘ condor_submit_dag failed:[/bold red]\n{err_msg}")
+            sys.exit(1)
+    else:
+        try:
+            res = subprocess.run(
+                ["condor_submit", str(sub_path)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
+            condor_out = res.stdout.strip()
+            cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+            cluster_id = int(cluster_match.group(1)) if cluster_match else None
+
+            def _record_submit_info(data: Dict[str, Any]) -> None:
+                sub_block = data.setdefault("submission", {})
+                sub_block["condor_submit_output"] = condor_out
+                sub_block["cluster_id"] = cluster_id
+
+            locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
+            update_latest_symlink(runs_root, run_dir)
+
+            first_out_file = (
+                run_dir / f"{target_path.stem}_0.out"
+                if is_sweep
+                else run_dir / f"{target_path.stem}.out"
+            )
+            condor_q_cmd = f"condor_q {cluster_id}" if cluster_id else "condor_q"
+
+            console.print(
+                Panel(
+                    f"[bold green]✔ {condor_out}[/bold green]\n\n"
+                    f"  • [bold]Manage Run    :[/bold] [cyan]runs inspect latest[/cyan]\n"
+                    f"  • [bold]Live Table    :[/bold] [cyan]runs watch[/cyan]  [dim](or {condor_q_cmd})[/dim]\n"
+                    f"  • [bold]Follow Stdout :[/bold] [cyan]runs logs -f[/cyan]\n"
+                    f"  • [bold]Follow Stderr :[/bold] [cyan]runs logs -e -f[/cyan]",
+                    title="[bold green]🎉 Job Submitted to Hermes 2[/bold green]",
+                    border_style="green",
+                    expand=False,
+                )
+            )
+
+            if args.follow:
+                from hermes_tools.runs_cli import follow_run_log
+
+                follow_run_log(run_dir, first_out_file, initial_lines=60)
+
+        except FileNotFoundError:
+            locked_mutate_run_json(
+                run_json_path,
+                repro_dir,
+                lambda d: d.update({"status": "SUBMIT_FAILED"}),
+            )
+            console.print(
+                f"[bold red]✘ Error:[/bold red] 'condor_submit' not found in PATH (are you on hermes2?).\n"
+                f"  Run directory and repro capsule were still generated at: [cyan]runs/{run_id}/[/cyan]"
+            )
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            err_msg = (e.stderr or e.stdout or "").strip()
+
+            def _record_submit_err(data: Dict[str, Any]) -> None:
+                data["status"] = "SUBMIT_FAILED"
+                data.setdefault("submission", {})["condor_submit_error"] = err_msg
+
+            locked_mutate_run_json(run_json_path, repro_dir, _record_submit_err)
+            console.print(f"[bold red]✘ condor_submit failed:[/bold red]\n{err_msg}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

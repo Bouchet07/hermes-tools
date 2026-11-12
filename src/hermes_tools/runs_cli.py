@@ -399,6 +399,14 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
 
     meta.add_row("Run ID", f"[bold]{run_dir.name}[/bold]")
     meta.add_row("Status", style_status(display_status))
+    dep = data.get("dependency")
+    if isinstance(dep, dict) and dep.get("parent_run_id"):
+        p_id = dep.get("parent_run_id")
+        p_cid = dep.get("parent_cluster_id")
+        r_ok = dep.get("require_ok", False)
+        cid_part = f" (#{p_cid})" if p_cid else ""
+        cond_part = " [bold yellow][exit 0 required][/bold yellow]" if r_ok else ""
+        meta.add_row("Dependency", f"After [bold]{p_id}[/bold]{cid_part}{cond_part}")
     hold_reasons = data.get("_hold_reasons") or []
     if hold_reasons:
         meta.add_row(
@@ -767,13 +775,13 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             cids = get_all_cluster_ids(data)
             if not cids:
                 continue
-            is_act = st.startswith(("QUEUED", "RUNNING", "HELD"))
+            is_act = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING"))
             act_cids = [c for c in cids if live_clusters is None or c in live_clusters]
             if act_cids or is_act:
                 active_targets.append((d, act_cids or cids, is_act, st))
 
         if not active_targets:
-            console.print("[green]No active (QUEUED/RUNNING/HELD) runs found.[/green]")
+            console.print("[green]No active (QUEUED/RUNNING/HELD/WAITING) runs found.[/green]")
             return
 
         for d, tcids, _, st in active_targets:
@@ -806,7 +814,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
         console.print(f"[yellow]Run {run_dir.name} has no HTCondor cluster_id.[/yellow]")
         return
 
-    is_active_status = status.startswith(("QUEUED", "RUNNING", "HELD"))
+    is_active_status = status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING"))
     active_cids = [c for c in cids if live_clusters is None or c in live_clusters]
 
     if not active_cids and not is_active_status:
@@ -1063,7 +1071,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
             data = raw_data
 
         st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
-        if st.startswith(("RUNNING", "QUEUED", "HELD")):
+        if st.startswith(("RUNNING", "QUEUED", "HELD", "WAITING")):
             continue
 
         if not has_filters:
@@ -1075,10 +1083,14 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 
         match = False
         if args.failed and (
-            st in ("FAILED", "SUBMIT_FAILED", "VANISHED") or st.startswith("FAILED")
+            st in ("FAILED", "SUBMIT_FAILED", "VANISHED", "CANCELLED")
+            or st.startswith(("FAILED", "CANCELLED"))
         ):
             match = True
-        if args.aborted and (st in ("ABORTED", "INTERRUPTED") or st.startswith("INTERRUPTED")):
+        if args.aborted and (
+            st in ("ABORTED", "INTERRUPTED", "CANCELLED")
+            or st.startswith(("INTERRUPTED", "CANCELLED", "ABORTED"))
+        ):
             match = True
         if args.dry and st == "DRY_RUN":
             match = True
@@ -1725,9 +1737,54 @@ def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
         sys.exit(1)
 
     job_target = f"{cids[-1]}.{proc_idx}"
+    cur_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+
+    if cur_status.startswith("WAITING") or data.get("status") == "WAITING":
+        dep = data.get("dependency", {})
+        p_id = dep.get("parent_run_id") or "unknown"
+        p_cid = dep.get("parent_cluster_id")
+        p_dir = dep.get("parent_run_dir")
+        r_ok = dep.get("require_ok", False)
+
+        p_status = "UNKNOWN"
+        if p_dir:
+            try:
+                p_data = load_run_json(Path(p_dir))
+                p_data = reconcile_run(Path(p_dir), p_data, live_clusters)
+                p_status = str(p_data.get("_live_badge") or p_data.get("status", "UNKNOWN"))
+            except Exception:
+                pass
+
+        p_cid_str = f" (#{p_cid})" if p_cid else ""
+        info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+        info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
+        info_tbl.add_column("V", style="white")
+        info_tbl.add_row("Verdict", "[bold blue]WAITING FOR PARENT RUN[/bold blue]")
+        info_tbl.add_row("Parent Run", f"[bold]{p_id}[/bold]{p_cid_str}")
+        info_tbl.add_row("Parent Status", style_status(p_status))
+        info_tbl.add_row(
+            "Condition",
+            "[yellow]Parent must exit 0 (--after-ok)[/yellow]"
+            if r_ok
+            else "Runs when parent terminates (any exit code)",
+        )
+        info_tbl.add_row(
+            "Action",
+            "HTCondor DAGMan will automatically release and queue this job when the parent finishes.",
+        )
+
+        console.print(
+            Panel(
+                info_tbl,
+                title=f"[bold cyan]⏳ Dependency Wait Analysis — Job {job_target}[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        return
+
     console.print(
         f"[dim]Analyzing run[/dim] [bold white]{run_dir.name}[/bold white] "
-        f"[dim](Job {job_target}, Status:[/dim] {style_status(str(data.get('_live_badge') or data.get('status', 'UNKNOWN')))}[dim])[/dim]"
+        f"[dim](Job {job_target}, Status:[/dim] {style_status(cur_status)}[dim])[/dim]"
     )
     _render_queue_analysis_panel(job_target, raw_mode=raw_mode)
 

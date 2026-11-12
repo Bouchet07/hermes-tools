@@ -707,6 +707,8 @@ def build_send_command_tokens(
     sweep_file: Optional[str] = None,
     sweep_specs: Optional[List[str]] = None,
     args_flag_val: Optional[str] = None,
+    after: Optional[str] = None,
+    after_ok: bool = False,
     yes: bool = False,
 ) -> List[str]:
     """Builds the canonical list of CLI tokens for `send` (used by both `send` and `runs retry --new-run`)."""
@@ -741,9 +743,212 @@ def build_send_command_tokens(
         cmd.extend(["-s", str(s)])
     if args_flag_val:
         cmd.append(f"--args={args_flag_val}")
+    if after:
+        cmd.extend(["--after", str(after)])
+    if after_ok:
+        cmd.append("--after-ok")
     if yes:
         cmd.append("-y")
     return cmd
+
+
+_WAIT_PARENT_SCRIPT = r'''#!/usr/bin/env python3
+"""wait_parent.py — HTCondor DAGMan PRE script to wait for a parent run to finish."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def is_cluster_in_condor_q(cid: int) -> bool:
+    if not shutil.which("condor_q"):
+        return False
+    try:
+        res = subprocess.run(
+            ["condor_q", str(cid), "-json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            items = json.loads(res.stdout.strip())
+            return bool(items)
+    except Exception:
+        pass
+    return False
+
+
+def get_parent_fate(parent_dir: Path, parent_cid: int | None, parent_log: Path | None) -> tuple[bool, str]:
+    """Returns (is_finished, status_or_verdict)."""
+    rj_path = parent_dir / "run.json"
+    data = {}
+    if rj_path.is_file():
+        try:
+            data = json.loads(rj_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    status = str(data.get("status", "UNKNOWN"))
+    execs = data.get("executions", [])
+    req = data.get("resources_requested", {})
+    sweep_count = int(req.get("sweep_count", 1) or 1)
+
+    # 1. If parent cluster is actively tracked in condor_q, it is not finished
+    if parent_cid is not None and is_cluster_in_condor_q(parent_cid):
+        return False, status
+
+    # 2. If status is already terminal
+    if status in (
+        "COMPLETED",
+        "FAILED",
+        "COMPLETED_WITH_ERRORS",
+        "INTERRUPTED",
+        "ABORTED",
+        "CANCELLED",
+        "VANISHED",
+        "SUBMIT_FAILED",
+    ) or status.startswith(("INTERRUPTED", "CANCELLED", "FAILED")):
+        return True, status
+
+    # 3. If executions are all present
+    if len(execs) >= sweep_count and sweep_count > 0:
+        any_sig = any(bool(x.get("signal")) for x in execs)
+        any_err = any(x.get("exit_code", 0) != 0 for x in execs)
+        if any_sig:
+            return True, "INTERRUPTED"
+        if any_err:
+            return True, "COMPLETED_WITH_ERRORS" if sweep_count > 1 else "FAILED"
+        return True, "COMPLETED"
+
+    # 4. If parent_cid is no longer in condor_q and condor.log has termination events
+    log_file = parent_log or (parent_dir / "repro" / "condor.log")
+    if log_file.is_file():
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+            if any(term in text for term in (
+                "Job terminated of its own accord",
+                "Job was aborted",
+                "Abnormal termination",
+                "Normal termination",
+            )):
+                return True, status if status not in ("UNKNOWN", "QUEUED", "RUNNING") else "TERMINATED"
+        except Exception:
+            pass
+
+    return False, status
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Wait for HTCondor parent run.")
+    parser.add_argument("--parent-dir", required=True, help="Path to parent run directory")
+    parser.add_argument("--parent-cluster", type=int, default=None, help="HTCondor cluster ID of parent")
+    parser.add_argument("--parent-log", default=None, help="Path to parent condor.log")
+    parser.add_argument("--require-ok", action="store_true", help="Abort if parent does not exit 0")
+    parser.add_argument("--poll-interval", type=int, default=5, help="Polling interval in seconds")
+    args = parser.parse_args()
+
+    parent_dir = Path(args.parent_dir)
+    parent_log = Path(args.parent_log) if args.parent_log else None
+    require_ok = args.require_ok
+    parent_cid = args.parent_cluster
+    poll_sec = max(1, args.poll_interval)
+
+    cid_label = f"#{parent_cid}" if parent_cid else "—"
+    print(f"[WAIT_PARENT] Waiting for parent run {parent_dir.name} ({cid_label})...", flush=True)
+
+    while True:
+        finished, status = get_parent_fate(parent_dir, parent_cid, parent_log)
+        if finished:
+            time.sleep(2)
+            rj_path = parent_dir / "run.json"
+            final_status = status
+            executions = []
+            if rj_path.is_file():
+                try:
+                    d = json.loads(rj_path.read_text(encoding="utf-8"))
+                    final_status = str(d.get("status", status))
+                    executions = d.get("executions", [])
+                except Exception:
+                    pass
+
+            is_ok = False
+            if final_status == "COMPLETED":
+                is_ok = True
+            elif executions:
+                is_ok = all(int(x.get("exit_code", -1)) == 0 and not x.get("signal") for x in executions)
+
+            if require_ok and not is_ok:
+                print(
+                    f"[WAIT_PARENT] Parent run finished with status '{final_status}' (not OK). "
+                    f"Aborting dependent job (--require-ok).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                sys.exit(1)
+
+            print(
+                f"[WAIT_PARENT] Parent run finished with status '{final_status}'. "
+                f"Proceeding to submit dependent job.",
+                flush=True,
+            )
+            sys.exit(0)
+
+        time.sleep(poll_sec)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def generate_wait_parent_script() -> str:
+    """Returns the standalone Python PRE script placed in `repro/wait_parent.py`."""
+    return _WAIT_PARENT_SCRIPT.lstrip()
+
+
+def generate_dag_file(
+    sub_path: Path,
+    wait_script_path: Path,
+    python_bin: str,
+    parent_dir: Path,
+    parent_cluster_id: Optional[int] = None,
+    parent_log_path: Optional[Path] = None,
+    require_ok: bool = False,
+    poll_interval: int = 5,
+) -> str:
+    """Generates `repro/job.dag` for HTCondor DAGMan dependency chaining."""
+    lines = [
+        "# --- HTCondor DAGMan Workflow Definition generated by hermes-tools ---",
+        f"JOB main {sub_path.resolve().as_posix()}",
+    ]
+    pre_args: List[str] = [
+        wait_script_path.resolve().as_posix(),
+        "--parent-dir",
+        parent_dir.resolve().as_posix(),
+        "--poll-interval",
+        str(poll_interval),
+    ]
+    if parent_cluster_id is not None:
+        pre_args.extend(["--parent-cluster", str(parent_cluster_id)])
+    if parent_log_path is not None:
+        pre_args.extend(["--parent-log", parent_log_path.resolve().as_posix()])
+    if require_ok:
+        pre_args.append("--require-ok")
+
+    pre_cmd = f"SCRIPT PRE main {python_bin} " + " ".join(
+        f'"{a}"' if any(c.isspace() or c in ('"', "'") for c in a) else a
+        for a in pre_args
+    )
+    lines.append(pre_cmd)
+    return "\n".join(lines) + "\n"
 
 
 def generate_retry_sub_file(
@@ -787,7 +992,7 @@ def generate_retry_sub_file(
 # Live HTCondor Queue & Multi-Cluster Reconciliation
 # ---------------------------------------------------------------------------
 def get_all_cluster_ids(data: Dict[str, Any]) -> List[int]:
-    """Returns all HTCondor cluster IDs (initial + retries) associated with a run."""
+    """Returns all HTCondor cluster IDs (initial + retries + dependency DAGMan/job) associated with a run."""
     sub = data.get("submission", {})
     cids: List[int] = []
     for raw in sub.get("retry_clusters") or []:
@@ -805,6 +1010,17 @@ def get_all_cluster_ids(data: Dict[str, Any]) -> List[int]:
                 cids.append(v)
         except (ValueError, TypeError):
             pass
+    dep = data.get("dependency", {})
+    if isinstance(dep, dict):
+        for k in ("dagman_cluster_id", "job_cluster_id"):
+            raw_dep_cid = dep.get(k)
+            if raw_dep_cid is not None:
+                try:
+                    v = int(raw_dep_cid)
+                    if v not in cids:
+                        cids.append(v)
+                except (ValueError, TypeError):
+                    pass
     return cids
 
 
@@ -823,7 +1039,7 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
             "-attributes",
             "ClusterId,ProcId,JobStatus,HoldReason,RemoteHost,"
             "JobCurrentStartExecutingDate,JobCurrentStartDate,EnteredCurrentStatus,"
-            "ServerTime,MemoryUsage,ResidentSetSize",
+            "ServerTime,MemoryUsage,ResidentSetSize,DAGManJobId",
         ]
     )
     try:
@@ -843,9 +1059,18 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
         items = json.loads(raw)
         now_fallback = int(_time.time())
         clusters: Dict[int, Dict[str, Any]] = {}
+        dag_parent_map: Dict[int, List[int]] = {}
         for job in items:
             cid = int(job.get("ClusterId", -1))
             st = int(job.get("JobStatus", 0))  # 1=Idle, 2=Running, 5=Held
+            raw_dag = job.get("DAGManJobId")
+            if raw_dag is not None:
+                try:
+                    did = int(raw_dag)
+                    if did > 0:
+                        dag_parent_map.setdefault(did, []).append(cid)
+                except (ValueError, TypeError):
+                    pass
             info = clusters.setdefault(
                 cid,
                 {
@@ -857,6 +1082,7 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
                     "hosts": [],
                     "max_runtime_sec": 0,
                     "max_ram_mb": 0.0,
+                    "child_clusters": [],
                 },
             )
             info["total"] += 1
@@ -892,6 +1118,25 @@ def query_live_condor_clusters() -> Optional[Dict[int, Dict[str, Any]]]:
                 hr = str(job.get("HoldReason") or "").strip()
                 if hr and hr not in info["hold_reasons"]:
                     info["hold_reasons"].append(hr)
+        for did, ch_list in dag_parent_map.items():
+            dag_info = clusters.setdefault(
+                did,
+                {
+                    "total": 0,
+                    "running": 0,
+                    "idle": 0,
+                    "held": 0,
+                    "hold_reasons": [],
+                    "hosts": [],
+                    "max_runtime_sec": 0,
+                    "max_ram_mb": 0.0,
+                    "child_clusters": [],
+                },
+            )
+            existing_ch = dag_info.setdefault("child_clusters", [])
+            for c in ch_list:
+                if c not in existing_ch:
+                    existing_ch.append(c)
         return clusters
     except Exception:
         return None
@@ -961,13 +1206,14 @@ def run_needs_live_reconcile(data: Dict[str, Any]) -> bool:
     status = str(data.get("status", "UNKNOWN"))
     if status in ("DRY_RUN", "SUBMIT_FAILED"):
         return False
-    if status.startswith(("QUEUED", "RUNNING", "HELD")):
+    if status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")):
         return True
     sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
     return len(get_execution_records(data)) < sweep_count and status not in (
         "ABORTED",
         "VANISHED",
-    )
+        "CANCELLED",
+    ) and not status.startswith("CANCELLED")
 
 
 def reconcile_run(
@@ -977,14 +1223,15 @@ def reconcile_run(
 ) -> Dict[str, Any]:
     """Synchronizes `run.json` with `repro/node_*.json` and all live `condor_q` clusters."""
     status = str(data.get("status", "UNKNOWN"))
-    is_active_status = status in ("QUEUED", "RUNNING", "HELD") or status.startswith(
-        ("QUEUED", "RUNNING", "HELD")
+    is_active_status = status in ("QUEUED", "RUNNING", "HELD", "WAITING") or status.startswith(
+        ("QUEUED", "RUNNING", "HELD", "WAITING")
     )
     sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
 
     # Fast path for terminal runs: skip CephFS globbing and condor_q checks completely
     if not is_active_status and (
-        status in ("DRY_RUN", "SUBMIT_FAILED", "ABORTED")
+        status in ("DRY_RUN", "SUBMIT_FAILED", "ABORTED", "CANCELLED")
+        or status.startswith("CANCELLED")
         or len(get_execution_records(data)) >= sweep_count
     ):
         return data
@@ -1012,6 +1259,52 @@ def reconcile_run(
 
     all_cids = get_all_cluster_ids(data)
     active_cids = [c for c in all_cids if c in live_clusters]
+
+    # --- DAGMan Dependency Workflow Handling ---
+    dep = data.get("dependency")
+    if isinstance(dep, dict):
+        dagman_cid = dep.get("dagman_cluster_id")
+        job_cid = dep.get("job_cluster_id")
+        parent_cid = dep.get("parent_cluster_id")
+
+        # Discover job_cid from live_clusters DAGMan child_clusters if not yet recorded
+        if dagman_cid is not None and dagman_cid in live_clusters:
+            ch_list = live_clusters[dagman_cid].get("child_clusters") or []
+            if ch_list and (job_cid is None or job_cid not in ch_list):
+                job_cid = ch_list[0]
+
+                def _update_job_cid(d: Dict[str, Any]) -> None:
+                    d.setdefault("dependency", {})["job_cluster_id"] = job_cid
+                    d.setdefault("submission", {})["cluster_id"] = job_cid
+
+                locked_mutate_run_json(run_json_path, repro_dir, _update_job_cid)
+                dep["job_cluster_id"] = job_cid
+                data.setdefault("submission", {})["cluster_id"] = job_cid
+                if job_cid not in all_cids:
+                    all_cids.append(job_cid)
+                if job_cid in live_clusters and job_cid not in active_cids:
+                    active_cids.append(job_cid)
+
+        # Still waiting for parent if child job not active in queue
+        if (job_cid is None or job_cid not in live_clusters) and (
+            dagman_cid is not None and dagman_cid in live_clusters
+        ):
+            parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
+            data["_live_badge"] = f"WAITING ({parent_tag})"
+            return data
+
+        # If child job has started in condor_q, transition out of WAITING status
+        if job_cid is not None and job_cid in live_clusters:
+            if status == "WAITING":
+                child_running = int(live_clusters[job_cid].get("running", 0))
+                new_st = "RUNNING" if child_running > 0 else "QUEUED"
+                locked_mutate_run_json(
+                    run_json_path, repro_dir, lambda d: d.update({"status": new_st})
+                )
+                data["status"] = new_st
+                status = new_st
+            # Don't attribute DAGMan host/RAM/walltime to the workload telemetry
+            active_cids = [c for c in active_cids if c != dagman_cid]
 
     if active_cids:
         if synced_execs is not None:
@@ -1082,6 +1375,31 @@ def reconcile_run(
         else:
             if fate == "ABORTED":
                 new_status = "ABORTED"
+            elif dep and isinstance(dep, dict) and not get_execution_records(data):
+                require_ok = bool(dep.get("require_ok", False))
+                parent_dir_str = dep.get("parent_run_dir")
+                parent_ok = False
+                if parent_dir_str:
+                    try:
+                        p_rj = load_run_json(Path(parent_dir_str))
+                        p_st = str(p_rj.get("status", ""))
+                        p_execs = get_execution_records(p_rj)
+                        if p_st == "COMPLETED" or (
+                            p_execs
+                            and all(
+                                int(x.get("exit_code", -1)) == 0 and not x.get("signal")
+                                for x in p_execs
+                            )
+                        ):
+                            parent_ok = True
+                    except Exception:
+                        pass
+                if require_ok and not parent_ok:
+                    new_status = "CANCELLED (parent failed)"
+                elif fate:
+                    new_status = fate
+                else:
+                    new_status = "CANCELLED"
             elif fate == "FAILED":
                 new_status = (
                     f"FAILED ({len(execs)}/{sweep_count} finished)"
@@ -1098,7 +1416,7 @@ def reconcile_run(
         def _heal(d: Dict[str, Any]) -> None:
             if synced_execs is not None:
                 set_execution_records(d, synced_execs)
-            if str(d.get("status", "")).startswith(("QUEUED", "RUNNING", "HELD")):
+            if str(d.get("status", "")).startswith(("QUEUED", "RUNNING", "HELD", "WAITING")):
                 d["status"] = new_status
 
         data = locked_mutate_run_json(run_json_path, repro_dir, _heal)

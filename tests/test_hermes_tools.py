@@ -1030,6 +1030,368 @@ nv3090-09.i3a.es
     assert capsys.readouterr().out.strip() == str((rd / "train.err").resolve())
 
 
+def test_dagman_generation_and_wait_script(tmp_path: Path) -> None:
+    from hermes_tools.condor import generate_dag_file, generate_wait_parent_script
+
+    sub_path = tmp_path / "job.sub"
+    wait_py = tmp_path / "wait_parent.py"
+    parent_dir = tmp_path / "runs" / "parent_run"
+    parent_dir.mkdir(parents=True)
+
+    dag_str = generate_dag_file(
+        sub_path=sub_path,
+        wait_script_path=wait_py,
+        python_bin="/usr/bin/python3",
+        parent_dir=parent_dir,
+        parent_cluster_id=12345,
+        parent_log_path=parent_dir / "condor.log",
+        require_ok=True,
+        poll_interval=2,
+    )
+    assert f"JOB main {sub_path.resolve().as_posix()}" in dag_str
+    assert "SCRIPT PRE main /usr/bin/python3" in dag_str
+    assert f"--parent-dir {parent_dir.resolve().as_posix()}" in dag_str
+    assert "--parent-cluster 12345" in dag_str
+    assert "--require-ok" in dag_str
+    assert "--poll-interval 2" in dag_str
+
+    script_content = generate_wait_parent_script()
+    assert "#!/usr/bin/env python3" in script_content
+    assert "def get_parent_fate(" in script_content
+    assert "--require-ok" in script_content
+
+    # Validate that script compiles without syntax errors
+    compile(script_content, "wait_parent.py", "exec")
+
+    # Verify execution behavior of wait_parent.py
+    wait_script_file = tmp_path / "wait_parent.py"
+    wait_script_file.write_text(script_content, encoding="utf-8")
+
+    # 1. Success parent with --require-ok -> exit 0
+    (parent_dir / "run.json").write_text(
+        json.dumps({"status": "COMPLETED", "executions": [{"exit_code": 0}]}),
+        encoding="utf-8",
+    )
+    res_ok = subprocess.run(
+        [sys.executable, str(wait_script_file), "--parent-dir", str(parent_dir), "--require-ok", "--poll-interval", "1"],
+        capture_output=True,
+        text=True,
+    )
+    assert res_ok.returncode == 0
+    assert "Proceeding to submit dependent job" in res_ok.stdout
+
+    # 2. Failed parent with --require-ok -> exit 1
+    (parent_dir / "run.json").write_text(
+        json.dumps({"status": "FAILED", "executions": [{"exit_code": 1}]}),
+        encoding="utf-8",
+    )
+    res_fail_req = subprocess.run(
+        [sys.executable, str(wait_script_file), "--parent-dir", str(parent_dir), "--require-ok", "--poll-interval", "1"],
+        capture_output=True,
+        text=True,
+    )
+    assert res_fail_req.returncode == 1
+    assert "Aborting dependent job (--require-ok)" in res_fail_req.stderr
+
+    # 3. Failed parent without --require-ok -> exit 0
+    res_fail_noreq = subprocess.run(
+        [sys.executable, str(wait_script_file), "--parent-dir", str(parent_dir), "--poll-interval", "1"],
+        capture_output=True,
+        text=True,
+    )
+    assert res_fail_noreq.returncode == 0
+
+
+def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    import hermes_tools.send_cli as send_cli
+    from hermes_tools.condor import get_all_cluster_ids, reconcile_run
+    from hermes_tools.core import atomic_write_json, load_run_json
+
+    monkeypatch.chdir(tmp_path)
+    runs_root = tmp_path / "runs"
+    parent_run = runs_root / "2026-11-12_10-00-00_train_GPU3090"
+    p_repro = parent_run / "repro"
+    p_repro.mkdir(parents=True)
+    atomic_write_json(
+        parent_run / "run.json",
+        {
+            "run_id": parent_run.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 1000},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [],
+        },
+        p_repro,
+    )
+
+    # Mock condor_q: parent cluster 1000 is running
+    monkeypatch.setattr(
+        send_cli,
+        "query_live_condor_clusters",
+        lambda: {1000: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    target_script = tmp_path / "step2.py"
+    target_script.write_text("print('step2')\n", encoding="utf-8")
+
+    # 1. Test dry-run with --after and --after-ok
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "send",
+            "step2.py",
+            "-a",
+            "AMD",
+            "-c",
+            "8",
+            "-m",
+            "16G",
+            "--after",
+            "1",
+            "--after-ok",
+            "--dry-run",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cli.main()
+    assert exc.value.code == 0
+    dry_out = capsys.readouterr().out
+    assert "Dry run complete!" in dry_out
+    assert "HTCondor DAGMan Workflow Definition (job.dag)" in dry_out
+    dry_dirs = [d for d in runs_cli.list_run_dirs(runs_root) if "step2" in d.name]
+    assert len(dry_dirs) == 1
+    assert "--require-ok" in (dry_dirs[0] / "repro" / "job.dag").read_text(encoding="utf-8")
+    import shutil
+    shutil.rmtree(dry_dirs[0])
+
+    # 2. Test live DAGMan submission
+    submitted_dag_calls = []
+
+    def mock_subprocess_run(cmd, **kwargs):
+        if cmd[0] == "condor_submit_dag":
+            submitted_dag_calls.append(cmd)
+            import subprocess
+
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="1 job(s) submitted to cluster 2000.\n",
+                stderr="",
+            )
+        raise RuntimeError(f"Unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(send_cli.subprocess, "run", mock_subprocess_run)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "send",
+            "step2.py",
+            "-a",
+            "AMD",
+            "-c",
+            "8",
+            "-m",
+            "16G",
+            "--after",
+            "1",
+            "--after-ok",
+            "-y",
+        ],
+    )
+    send_cli.main()
+    assert len(submitted_dag_calls) == 1
+    assert "-f" in submitted_dag_calls[0]
+    assert "job.dag" in submitted_dag_calls[0][-1]
+
+    # Find the created dependent run directory
+    child_run_dirs = [d for d in runs_cli.list_run_dirs(runs_root) if "step2" in d.name]
+    assert len(child_run_dirs) == 1
+    child_dir = child_run_dirs[0]
+    child_rj = load_run_json(child_dir)
+
+    assert child_rj["status"] == "WAITING"
+    assert child_rj["dependency"]["parent_cluster_id"] == 1000
+    assert child_rj["dependency"]["require_ok"] is True
+    assert child_rj["dependency"]["dagman_cluster_id"] == 2000
+    assert child_rj["dependency"]["job_cluster_id"] is None
+    assert (child_dir / "repro" / "code" / "step2.py").is_file()  # Snapshot verified
+    assert "--after" in child_rj["submission"]["equivalent_cli"]
+    assert "--after-ok" in child_rj["submission"]["equivalent_cli"]
+
+    # 3. Test reconciliation while DAGMan is waiting (dagman_cid in live_clusters, child not yet spawned)
+    live_wait = {
+        1000: {"total": 1, "running": 1, "idle": 0, "held": 0},
+        2000: {"total": 1, "running": 1, "idle": 0, "held": 0, "child_clusters": []},
+    }
+    rec_wait = reconcile_run(child_dir, child_rj, live_wait)
+    assert rec_wait["_live_badge"] == "WAITING (after #1000)"
+
+    # Test `runs why` on WAITING run
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_wait)
+    why_args = argparse.Namespace(run=child_dir.name, proc=0, raw=False)
+    runs_cli.cmd_why(why_args, runs_root)
+    why_out = capsys.readouterr().out
+    assert "WAITING FOR PARENT RUN" in why_out
+    assert "Parent must exit 0 (--after-ok)" in why_out
+
+    # 4. Test reconciliation when DAGMan spawns child job 2001
+    live_dispatched = {
+        2000: {"total": 1, "running": 1, "idle": 0, "held": 0, "child_clusters": [2001]},
+        2001: {
+            "total": 1,
+            "running": 1,
+            "idle": 0,
+            "held": 0,
+            "hosts": ["her09-20"],
+            "max_runtime_sec": 45,
+            "max_ram_mb": 512.0,
+        },
+    }
+    rec_active = reconcile_run(child_dir, child_rj, live_dispatched)
+    assert rec_active["status"] == "RUNNING"
+    assert rec_active["_live_badge"] == "RUNNING"
+    assert rec_active["_live_hosts"] == ["her09-20"]
+    assert 2001 in get_all_cluster_ids(rec_active)
+
+    # 5. Test `runs stop` aborts DAGMan cluster
+    rm_calls = []
+
+    def mock_condor_rm(cmd, **kwargs):
+        rm_calls.append(cmd)
+        import subprocess
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="Cluster 2000 was removed.\n", stderr="")
+
+    monkeypatch.setattr(runs_cli.subprocess, "run", mock_condor_rm)
+    stop_args = argparse.Namespace(run=child_dir.name, yes=True, all=False)
+    runs_cli.cmd_stop(stop_args, runs_root)
+    assert any("2000" in cmd for cmd in rm_calls)
+    stopped_rj = load_run_json(child_dir)
+    assert stopped_rj["status"] == "ABORTED"
+
+
+def test_send_after_parent_failure_cancelled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    import hermes_tools.send_cli as send_cli
+    from hermes_tools.condor import reconcile_run
+    from hermes_tools.core import atomic_write_json, load_run_json
+
+    monkeypatch.chdir(tmp_path)
+    runs_root = tmp_path / "runs"
+    parent_run = runs_root / "2026-11-12_11-00-00_train_A100"
+    p_repro = parent_run / "repro"
+    p_repro.mkdir(parents=True)
+    atomic_write_json(
+        parent_run / "run.json",
+        {
+            "run_id": parent_run.name,
+            "status": "FAILED",
+            "submission": {"cluster_id": 3000},
+            "resources_requested": {"architecture": "A100", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 1}],
+        },
+        p_repro,
+    )
+
+    child_run = runs_root / "2026-11-12_11-05-00_eval_GPU3090"
+    c_repro = child_run / "repro"
+    c_repro.mkdir(parents=True)
+    atomic_write_json(
+        child_run / "run.json",
+        {
+            "run_id": child_run.name,
+            "status": "WAITING",
+            "submission": {"cluster_id": 4000},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "dependency": {
+                "parent_run_id": parent_run.name,
+                "parent_run_dir": str(parent_run),
+                "parent_cluster_id": 3000,
+                "require_ok": True,
+                "dagman_cluster_id": 4000,
+                "job_cluster_id": None,
+            },
+            "executions": [],
+        },
+        c_repro,
+    )
+
+    # When DAGMan leaves condor_q after PRE script exited 1 because parent failed:
+    rec = reconcile_run(child_run, load_run_json(child_run), live_clusters={})
+    assert rec["status"] == "CANCELLED (parent failed)"
+
+    # Test `runs clean --failed` picks up CANCELLED (parent failed) run
+    clean_args = argparse.Namespace(failed=True, aborted=False, dry=False, older_than=None, yes=True)
+    runs_cli.cmd_clean(clean_args, runs_root)
+    clean_out = capsys.readouterr().out
+    assert "Deleted 2 run(s)" in clean_out or "Deleted 1 run(s)" in clean_out
+
+    # Test direct submit when parent already completed successfully
+    p_ok = runs_root / "2026-11-12_12-00-00_done_AMD"
+    p_ok_repro = p_ok / "repro"
+    p_ok_repro.mkdir(parents=True)
+    atomic_write_json(
+        p_ok / "run.json",
+        {
+            "run_id": p_ok.name,
+            "status": "COMPLETED",
+            "submission": {"cluster_id": 5000},
+            "resources_requested": {"architecture": "AMD", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0}],
+        },
+        p_ok_repro,
+    )
+
+    submit_normal_calls = []
+
+    def mock_submit(cmd, **kwargs):
+        submit_normal_calls.append(cmd)
+        import subprocess
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="1 job(s) submitted to cluster 6000.\n", stderr="")
+
+    monkeypatch.setattr(send_cli.subprocess, "run", mock_submit)
+    target = tmp_path / "post.py"
+    target.write_text("print('post')\n", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["send", "post.py", "-a", "AMD", "-c", "2", "-m", "4G", "--after", p_ok.name, "-y"])
+    send_cli.main()
+    assert len(submit_normal_calls) == 1
+    assert submit_normal_calls[0][0] == "condor_submit"  # Directly submitted without DAGMan delay!
+
+    # Test rejection when parent failed and --after-ok is passed
+    p_fail = runs_root / "2026-11-12_13-00-00_fail_AMD"
+    p_fail_repro = p_fail / "repro"
+    p_fail_repro.mkdir(parents=True)
+    atomic_write_json(
+        p_fail / "run.json",
+        {
+            "run_id": p_fail.name,
+            "status": "FAILED",
+            "submission": {"cluster_id": 7000},
+            "resources_requested": {"architecture": "AMD", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 1}],
+        },
+        p_fail_repro,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["send", "post.py", "-a", "AMD", "-c", "2", "-m", "4G", "--after", p_fail.name, "--after-ok", "-y"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cli.main()
+    assert exc.value.code == 1
+    err_out = capsys.readouterr().out
+    assert "Aborting because --after-ok was specified" in err_out
+
+
 
 
 

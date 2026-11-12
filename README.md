@@ -14,6 +14,7 @@ Definitive HTCondor job submission (`send`), code provenance, live telemetry, an
    - [Parallel Sweeps & Array Jobs](#24-parallel-sweeps--array-jobs)
    - [Passing Script Arguments Safely (`--` vs `--args` vs `-s`)](#25-passing-script-arguments-safely----vs---args-vs--s)
    - [Node Filtering, Project Accounting & Scratch Mode](#26-node-filtering-project-accounting--scratch-mode)
+   - [Automated Job Dependencies & Chaining (`--after` / `--after-ok`)](#27-automated-job-dependencies--chaining---after---after-ok)
 3. [Project Configuration (`.hermes.toml` / `pyproject.toml`)](#3-project-configuration-hermestoml--pyprojecttoml)
 4. [Discovery & Fallback Chains](#4-discovery--fallback-chains)
    - [Virtual Environment & Conda Discovery](#41-virtual-environment--conda-discovery)
@@ -95,6 +96,8 @@ send train.py -a GPU3090 --dry-run                  # Generate capsule without s
 | `--project` | `str` | `None` | Inject I3A institutional accounting directive `+Proyecto = "<code>"`. |
 | `--scratch` | `files...` | `[]` | Enable HTCondor file transfer (`should_transfer_files = YES`) and copy listed input files to worker scratch space. |
 | `-e`, `--env` | `KEY=VAL` (repeatable) | `[]` | Export custom environment variable(s) inside `repro/job.sh` (merges with `[env]` / `[tool.hermes.env]`). |
+| `--after` | `query` | `None` | Chain execution after specified run (by run ID, cluster ID, or `#index`, e.g. `--after 1` or `--after latest`). Handled automatically via HTCondor DAGMan. |
+| `--after-ok` | `flag` | `False` | When chained with `--after`, only launch if parent run exits `0`. If parent fails/aborts, automatically cancels without running (`CANCELLED (parent failed)`). |
 | `-f`, `--follow` | `flag` | `False` | Wait for the submitted job to start and stream live stdout until completion. |
 | `-y`, `--yes` | `flag` | `False` | Skip the final `"Submit job to HTCondor queue now?"` confirmation prompt. |
 | `--dry-run` | `flag` | `False` | Materialize `runs/<run_id>/` (`job.sh`, `job.sub`, `run.json`, `repro/code/`) and print `job.sub` without calling `condor_submit`. |
@@ -155,6 +158,31 @@ Use `-s` / `--sweep` or `--sweep-file` to queue a single HTCondor cluster with m
   Generates HTCondor `requirements = ((TARGET.Machine == "nv3090-01.i3a.es") || ...)` expressions automatically.
 - **Project Accounting**: `--project 100-100` adds `+Proyecto = "100-100"` to `job.sub`.
 - **Scratch Transfer Mode**: `--scratch data.tar weights.pt` enables `should_transfer_files = YES`, `when_to_transfer_output = ON_EXIT`, and `transfer_input_files = data.tar, weights.pt`.
+
+### 2.7 Automated Job Dependencies & Chaining (`--after` / `--after-ok`)
+
+When multi-stage pipelines require sequential execution (e.g. data preprocessing -> model training -> evaluation), you no longer need to manually poll the queue or write custom wrapper scripts:
+
+```bash
+# Queue train.py immediately when run #1 completes
+send train.py -a GPU3090 --after 1 -y
+
+# Only run evaluation if training completes successfully (exit code 0); cancel if training fails
+send eval.py -a GPU3090 --after latest --after-ok -y
+
+# Chain by specific cluster ID or run directory name
+send postprocess.py -a AMD -c 8 -m 16G --after 1074525 --after-ok -y
+```
+
+**How Automated Chaining Works**:
+1. **Immediate Code Snapshot**: The code snapshot in `repro/code/` for the dependent job is frozen *at submission time*. You can edit files, experiment, or switch git branches in your workspace immediately without affecting either the running parent or the queued child.
+2. **HTCondor DAGMan Workflow**: `send` materializes `repro/job.dag` and a standalone PRE script (`repro/wait_parent.py`), submitting via `condor_submit_dag`. The workflow runs entirely inside the HTCondor schedd daemon—you can log out of Hermes 2 or close your laptop and your dependency chain continues uninterrupted.
+3. **Live Status Tracking**: In `runs ls` and `runs watch`, dependent jobs clearly indicate their status as `WAITING (after #<cid>)` in bold blue while the parent is running, smoothly transitioning to `QUEUED` and `RUNNING` the moment the parent completes.
+4. **Parent Failure Safeguards (`--after-ok`)**: If the parent job fails or aborts and `--after-ok` was passed, DAGMan aborts node submission and the run is healed cleanly to `CANCELLED (parent failed)` without consuming GPU/CPU compute.
+5. **Wait Diagnostics & Abort**:
+   - Run `runs why <child>` on a waiting job to see an instant dependency diagnosis: parent run ID, cluster ID, parent's live status, and wait conditions.
+   - Run `runs stop <child>` to cleanly abort the DAGMan workflow and PRE script via `condor_rm`.
+   - Run `runs clean --failed` or `runs clean --aborted` to delete cancelled or aborted workflows.
 
 ---
 
@@ -460,11 +488,13 @@ cat "$(runs path -j)"          # Print raw `run.json` via path
   - `DRY_RUN`: Generated locally with `--dry-run`.
   - `SUBMIT_FAILED`: `condor_submit` returned an error or was not found.
   - `QUEUED` / `QUEUED (RETRY)`: Submitted and idle in `condor_q`.
+  - `WAITING (after #<cid>)`: Waiting for parent run to complete via HTCondor DAGMan dependency chaining (`send --after`).
   - `RUNNING` / `RUNNING (k active, m/N done)`: Executing on worker node(s).
   - `HELD (k held)`: Held by HTCondor (e.g. exceeded memory request or spool issue).
   - `COMPLETED`: All processes exited with code `0`.
   - `COMPLETED_WITH_ERRORS`: All sweep processes finished, but at least one exited non-zero.
   - `FAILED`: Process exited non-zero or terminated abnormally in `condor.log`.
+  - `CANCELLED (parent failed)`: Cancelled before execution because parent run failed or aborted (`--after-ok`).
   - `INCOMPLETE (m/N)`: Sweep left `condor_q` before all `N` processes recorded telemetry.
   - `INTERRUPTED`: Job caught `SIGTERM` / `SIGINT` / `SIGHUP` (eviction or preemption).
   - `ABORTED`: Removed via `runs stop` or `condor_rm`.
