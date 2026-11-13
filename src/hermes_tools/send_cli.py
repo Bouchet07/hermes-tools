@@ -9,6 +9,7 @@ import datetime
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from hermes_tools.condor import (
     format_condor_arg_line,
     generate_bash_wrapper,
     generate_dag_file,
+    generate_dagman_config,
     generate_sub_file,
     generate_wait_parent_script,
     get_all_cluster_ids,
@@ -31,6 +33,7 @@ from hermes_tools.condor import (
     query_live_condor_clusters,
     reconcile_run,
     run_needs_live_reconcile,
+    sanitize_dagman_condor_sub,
     summarize_condor_pools,
 )
 from hermes_tools.core import (
@@ -841,6 +844,11 @@ def main() -> None:
 
         dag_path = repro_dir / "job.dag"
         submit_py = resolve_submit_python()
+        dagman_cfg_path: Optional[Path] = None
+        dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
+        if dagman_cfg:
+            dagman_cfg_path = repro_dir / "dagman.config"
+            write_text_lf(dagman_cfg_path, dagman_cfg)
         dag_content = generate_dag_file(
             sub_path=sub_path,
             wait_script_path=wait_script_path,
@@ -849,6 +857,7 @@ def main() -> None:
             parent_dir=parent_run_dir,
             parent_cluster_id=parent_cid,
             require_ok=bool(args.after_ok),
+            config_path=dagman_cfg_path,
         )
         write_text_lf(dag_path, dag_content)
 
@@ -938,30 +947,12 @@ def main() -> None:
                 check=True,
             )
 
-            # Step 2: Ensure clean, uncorrupted arguments in .condor.sub (workaround for HTCondor 9.0 quoting bugs)
+            # Step 2: Strip "notification" tokens so site condor_submit wrappers that run
+            # `sed -i "/notification/d"` don't delete the DAGMan `arguments` line.
             condor_sub_path = Path(f"{dag_path}.condor.sub")
             if condor_sub_path.is_file():
-                lock_file = dag_path.with_name(f"{dag_path.name}.lock")
-                try:
-                    rel_lock = str(lock_file.relative_to(cwd).as_posix())
-                except ValueError:
-                    rel_lock = str(lock_file.as_posix())
-                try:
-                    rel_dag = str(dag_path.relative_to(cwd).as_posix())
-                except ValueError:
-                    rel_dag = str(dag_path.as_posix())
-
-                clean_arg_line = (
-                    f"arguments       = -p 0 -f -l . -Lockfile {rel_lock} "
-                    f"-AutoRescue 1 -DoRescueFrom 0 -Dag {rel_dag} "
-                    f"-Suppress_notification -CsdVersion 9.0.9 -AllowVersionMismatch -Force"
-                )
                 sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
-                if re.search(r"^arguments\s*=.*", sub_txt, re.MULTILINE):
-                    sub_txt = re.sub(r"^arguments\s*=.*", clean_arg_line, sub_txt, flags=re.MULTILINE)
-                else:
-                    sub_txt = re.sub(r"^queue\b", f"{clean_arg_line}\nqueue", sub_txt, flags=re.MULTILINE)
-                write_text_lf(condor_sub_path, sub_txt)
+                write_text_lf(condor_sub_path, sanitize_dagman_condor_sub(sub_txt))
 
             # Step 3: Submit the validated .condor.sub via condor_submit
             try:

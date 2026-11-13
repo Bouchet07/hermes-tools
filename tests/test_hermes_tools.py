@@ -1197,10 +1197,15 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
     def mock_subprocess_run(cmd, **kwargs):
         if cmd[0] == "condor_submit_dag":
             submitted_dag_calls.append(cmd)
-            # Simulate condor_submit_dag -no_submit creating the .condor.sub file
+            # Simulate HTCondor 9.0.9 `condor_submit_dag -no_submit` output
             dag_sub = Path(kwargs.get("cwd", ".")) / f"{cmd[-1]}.condor.sub"
             dag_sub.write_text(
-                "arguments = broken_version_syntax\nqueue\n",
+                "universe        = scheduler\n"
+                "executable      = /usr/bin/condor_dagman\n"
+                f"arguments       = \"-p 0 -f -l . -Lockfile {cmd[-1]}.lock -AutoRescue 1 "
+                f"-DoRescueFrom 0 -Dag {cmd[-1]} -Suppress_notification "
+                "-CsdVersion $CondorVersion:' '9.0.9' '$ -Force -Dagman /usr/bin/condor_dagman\"\n"
+                "queue\n",
                 encoding="utf-8",
             )
             import subprocess
@@ -1213,6 +1218,13 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
             )
         if cmd[0] == "condor_submit":
             submitted_sub_calls.append(cmd)
+            # Simulate the Hermes 2 wrapper: sed -i "/notification/d" on the submit file
+            sub_file = Path(kwargs.get("cwd", ".")) / cmd[-1]
+            kept = [
+                ln for ln in sub_file.read_text(encoding="utf-8").splitlines()
+                if "notification" not in ln
+            ]
+            sub_file.write_text("\n".join(kept) + "\n", encoding="utf-8")
             import subprocess
 
             return subprocess.CompletedProcess(
@@ -1254,12 +1266,23 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
     assert len(submitted_sub_calls) == 1
     assert "job.dag.condor.sub" in submitted_sub_calls[0][-1]
 
-    # Verify that .condor.sub arguments were sanitized and injected with AllowVersionMismatch
+    # The DAGMan arguments line must survive the wrapper's `sed -i "/notification/d"`
     created_sub = Path(submitted_dag_calls[0][-1] + ".condor.sub")
     assert created_sub.is_file()
     sub_content = created_sub.read_text(encoding="utf-8")
-    assert "-AllowVersionMismatch" in sub_content
-    assert "broken_version_syntax" not in sub_content
+    assert "Suppress_notification" not in sub_content
+    arg_lines = [ln for ln in sub_content.splitlines() if ln.startswith("arguments")]
+    assert len(arg_lines) == 1
+    assert "-Dag " in arg_lines[0] and "-Lockfile " in arg_lines[0]
+    assert "-CsdVersion $CondorVersion:' '9.0.9' '$" in arg_lines[0]
+
+    # DAG pins DAGMAN_CONDOR_SUBMIT_EXE via a CONFIG file when condor_submit is on PATH
+    dag_text = Path(submitted_dag_calls[0][-1]).read_text(encoding="utf-8")
+    cfg_file = Path(submitted_dag_calls[0][-1]).parent / "dagman.config"
+    if send_cli.shutil.which("condor_submit"):
+        assert "CONFIG " in dag_text and cfg_file.is_file()
+    else:
+        assert "CONFIG " not in dag_text
 
     # Find the created dependent run directory
     child_run_dirs = [d for d in runs_cli.list_run_dirs(runs_root) if "step2" in d.name]
@@ -2003,3 +2026,41 @@ def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monke
 
 
 
+
+
+def test_dagman_survives_site_condor_submit_wrapper(tmp_path: Path) -> None:
+    """Hermes 2's /usr/local/bin/condor_submit runs `sed -i "/notification/d"` on the submit file."""
+    from hermes_tools.condor import (
+        generate_dag_file,
+        generate_dagman_config,
+        sanitize_dagman_condor_sub,
+    )
+
+    raw = (
+        "universe        = scheduler\n"
+        "notification    = never\n"
+        "arguments       = \"-p 0 -f -l . -Lockfile r/job.dag.lock -Dag r/job.dag "
+        "-Suppress_notification -CsdVersion $CondorVersion:' '9.0.9' '$ -Force\"\n"
+        "queue\n"
+    )
+    cleaned = sanitize_dagman_condor_sub(raw)
+    after_wrapper = [ln for ln in cleaned.splitlines() if "notification" not in ln]
+    assert after_wrapper == cleaned.strip().splitlines()
+    assert any(ln.startswith("arguments") and "-Dag r/job.dag" in ln for ln in after_wrapper)
+
+    assert generate_dagman_config(None) is None
+    cfg = generate_dagman_config("/usr/local/bin/condor_submit")
+    assert "DAGMAN_CONDOR_SUBMIT_EXE = /usr/local/bin/condor_submit" in cfg
+
+    cfg_path = tmp_path / "dagman.config"
+    cfg_path.write_text(cfg, encoding="utf-8")
+    dag = generate_dag_file(
+        sub_path=tmp_path / "job.sub",
+        wait_script_path=tmp_path / "wait_parent.py",
+        python_bin="/usr/bin/python3",
+        parent_cluster_id=123,
+        config_path=cfg_path,
+    )
+    dag_lines = dag.splitlines()
+    assert dag_lines[1].startswith("CONFIG ") and dag_lines[1].endswith("dagman.config")
+    assert dag_lines[2].startswith("JOB main ")
