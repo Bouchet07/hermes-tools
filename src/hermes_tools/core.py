@@ -267,6 +267,27 @@ def resolve_latest_symlink(runs_root: Path) -> Optional[Path]:
     return None
 
 
+def sync_live_update(live: Any, renderable: Any) -> None:
+    """Wraps `live.update(..., refresh=True)` in DEC Mode 2026 Synchronized Output on TTYs."""
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if is_tty:
+        sys.stdout.write("\x1b[?2026h")
+        sys.stdout.flush()
+    try:
+        live.update(renderable, refresh=True)
+    finally:
+        if is_tty:
+            sys.stdout.write("\x1b[?2026l")
+            sys.stdout.flush()
+
+
+def get_watch_row_limit(requested_limit: int, chrome_lines: int = 7) -> int:
+    """Clamps `--watch` table row counts to fit the visible terminal height without scroll jumps."""
+    if not console.is_terminal:
+        return requested_limit
+    return min(requested_limit, max(5, console.size.height - chrome_lines))
+
+
 def update_latest_symlink(runs_root: Path, target_run_dir: Optional[Path] = None) -> None:
     """Atomically updates or repairs `runs/latest` symlink."""
     if not runs_root.is_dir():
@@ -561,3 +582,24 @@ def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Opt
             return p
 
     return None
+
+
+def sync_live_update(live: Any, renderable: Any) -> None:
+    """Wraps `live.update(..., refresh=True)` in DEC Mode 2026 Synchronized Output on TTYs."""
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if is_tty:
+        sys.stdout.write("\x1b[?2026h")
+        sys.stdout.flush()
+    try:
+        live.update(renderable, refresh=True)
+    finally:
+        if is_tty:
+            sys.stdout.write("\x1b[?2026l")
+            sys.stdout.flush()
+
+
+def get_watch_row_limit(requested_limit: int, chrome_lines: int = 7) -> int:
+    """Clamps `--watch` table row counts to fit the visible terminal height without scroll jumps."""
+    if not console.is_terminal:
+        return requested_limit
+    return min(requested_limit, max(5, console.size.height - chrome_lines))
