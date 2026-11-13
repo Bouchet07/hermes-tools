@@ -935,6 +935,7 @@ def generate_sub_file(
     scratch_files: List[str],
     retry_targets: Optional[List[Tuple[int, str]]] = None,
     retry_epoch: Optional[int] = None,
+    max_parallel: Optional[int] = None,
 ) -> str:
     is_sweep = len(sweep_args) > 1
 
@@ -989,6 +990,11 @@ def generate_sub_file(
         lines.append("when_to_transfer_output = ON_EXIT")
         lines.append(f"transfer_input_files    = {', '.join(clean_scratch)}")
         lines.append('transfer_output_files   = ""')
+
+    if is_sweep and max_parallel is not None and int(max_parallel) >= 1:
+        lines.append("")
+        lines.append("# --- Sweep Concurrency Limit ---")
+        lines.append(f"max_idle                = {int(max_parallel)}")
 
     if retry_targets is not None:
         lines.extend(
@@ -1101,6 +1107,8 @@ def build_send_command_tokens(
     after: Optional[str] = None,
     after_ok: bool = False,
     from_run: Optional[str] = None,
+    max_parallel: Optional[int] = None,
+    chain: bool = False,
     yes: bool = False,
 ) -> List[str]:
     """Builds the canonical list of CLI tokens for `send` (used by both `send` and `runs retry --new-run`)."""
@@ -1141,6 +1149,10 @@ def build_send_command_tokens(
         cmd.append("--after-ok")
     if from_run:
         cmd.extend(["--from-run", str(from_run)])
+    if max_parallel is not None:
+        cmd.extend(["-j", str(int(max_parallel))])
+    if chain:
+        cmd.append("--chain")
     if yes:
         cmd.append("-y")
     return cmd

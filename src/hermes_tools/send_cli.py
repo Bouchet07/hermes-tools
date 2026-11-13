@@ -107,6 +107,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sweep-file", type=str, help="File containing one argument string per line for sweep"
     )
     parser.add_argument(
+        "-j",
+        "--max-parallel",
+        type=int,
+        default=None,
+        help="Limit concurrent running sweep jobs (e.g. -j 1 or -j 2; emits max_idle = K)",
+    )
+    parser.add_argument(
+        "--chain",
+        "--seq",
+        action="store_true",
+        help="Split sweep into separate sequential runs chained via --after (one run per sweep item)",
+    )
+    parser.add_argument(
         "-t", "--tag", type=str, default="", help="Optional tag appended to the run directory name"
     )
     parser.add_argument(
@@ -439,13 +452,57 @@ def _resolve_hardware_resources(
     return arch, cpus, mem_mb, gpus, interactive_mode
 
 
+def _derive_sweep_item_tag(base_tag: str, raw_sweep_item: str, idx: int) -> str:
+    """Derives a short, readable tag for a single chained sweep item."""
+    raw = (raw_sweep_item or "").strip()
+    try:
+        tokens = shlex.split(raw) if raw else []
+    except ValueError:
+        tokens = raw.split() if raw else []
+
+    pairs: List[Tuple[Optional[str], str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("-") and len(tok) > 1:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                pairs.append((k.lstrip("-"), v))
+                i += 1
+            elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                pairs.append((tok.lstrip("-"), tokens[i + 1]))
+                i += 2
+            else:
+                pairs.append((None, tok.lstrip("-")))
+                i += 1
+        else:
+            pairs.append((None, tok))
+            i += 1
+
+    item_tag = ""
+    if len(pairs) == 1:
+        k, v = pairs[0]
+        if k and re.fullmatch(r"-?\d+(?:\.\d+)?", v):
+            item_tag = sanitize_tag(f"{k}_{v}")
+        else:
+            item_tag = sanitize_tag(v)
+    elif pairs:
+        parts = [f"{k}_{v}" if k else v for k, v in pairs]
+        item_tag = sanitize_tag("_".join(parts))[:24].strip("_-")
+
+    if not item_tag:
+        item_tag = f"s{idx}"
+
+    return f"{base_tag}_{item_tag}" if base_tag else item_tag
+
+
 def _resolve_sweeps_and_tag(
     args: argparse.Namespace,
     proj_cfg: Dict[str, Any],
     passthrough_args: str,
     interactive_mode: bool,
-) -> tuple[str, List[str], List[str], str]:
-    """Resolves single/sweep arguments and run tag, returning (combined_single_args, sweep_list, cli_sweep_specs, tag)."""
+) -> tuple[str, List[str], List[str], List[str], str]:
+    """Resolves single/sweep arguments and run tag, returning (combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, tag)."""
     combined_single_args = " ".join(
         x for x in [args.args.strip(), passthrough_args.strip()] if x
     ).strip()
@@ -470,6 +527,7 @@ def _resolve_sweeps_and_tag(
         expanded_sweeps.extend(expand_arg_sweeps(item))
 
     if expanded_sweeps:
+        raw_sweep_items = list(expanded_sweeps)
         sweep_list = [
             f"{combined_single_args} {s}".strip() if combined_single_args else s
             for s in expanded_sweeps
@@ -486,10 +544,12 @@ def _resolve_sweeps_and_tag(
             sys.exit(0)
         ans_clean = ans_args.strip()
         sweep_list = expand_arg_sweeps(ans_clean)
+        raw_sweep_items = list(sweep_list)
         if len(sweep_list) > 1 and ans_clean:
             cli_sweep_specs = [ans_clean]
     else:
         sweep_list = [combined_single_args]
+        raw_sweep_items = [combined_single_args]
 
     for s_arg in sweep_list:
         if s_arg:
@@ -508,7 +568,7 @@ def _resolve_sweeps_and_tag(
             sys.exit(0)
         raw_tag = ans_tag.strip()
 
-    return combined_single_args, sweep_list, cli_sweep_specs, sanitize_tag(raw_tag)
+    return combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, sanitize_tag(raw_tag)
 
 
 def _render_submission_summary(
@@ -529,6 +589,9 @@ def _render_submission_summary(
     equivalent_cli: str,
     dependency_info: Optional[str] = None,
     cloned_from_label: Optional[str] = None,
+    max_parallel: Optional[int] = None,
+    chain: bool = False,
+    chain_tags: Optional[List[str]] = None,
 ) -> None:
     summary_table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     summary_table.add_column("Property", style="bold cyan", width=20)
@@ -558,15 +621,33 @@ def _render_submission_summary(
     summary_table.add_row("Resources", hw_str)
 
     if len(sweep_list) > 1:
-        preview_sweeps = "\n".join(
-            [f"  [dim]Process {i}:[/dim] {s}" for i, s in enumerate(sweep_list[:5])]
-        )
-        if len(sweep_list) > 5:
-            preview_sweeps += f"\n  [dim]... (+{len(sweep_list) - 5} more parallel jobs)[/dim]"
-        summary_table.add_row(
-            "Job Mode",
-            f"[bold yellow]Parallel Array Sweep ({len(sweep_list)} jobs)[/bold yellow]\n{preview_sweeps}",
-        )
+        if chain:
+            preview_lines = []
+            for i, s in enumerate(sweep_list[:5]):
+                t_badge = f" [cyan][{chain_tags[i]}][/cyan]" if chain_tags and i < len(chain_tags) else ""
+                preview_lines.append(f"  [dim]Run {i + 1}:[/dim]{t_badge} {s}")
+            preview_sweeps = "\n".join(preview_lines)
+            if len(sweep_list) > 5:
+                preview_sweeps += f"\n  [dim]... (+{len(sweep_list) - 5} more chained runs)[/dim]"
+            summary_table.add_row(
+                "Job Mode",
+                f"[bold cyan]Sequential Chained Runs ({len(sweep_list)} separate runs: Run 1 -> Run 2 -> ...)[/bold cyan]\n{preview_sweeps}",
+            )
+        else:
+            preview_sweeps = "\n".join(
+                [f"  [dim]Process {i}:[/dim] {s}" for i, s in enumerate(sweep_list[:5])]
+            )
+            if len(sweep_list) > 5:
+                preview_sweeps += f"\n  [dim]... (+{len(sweep_list) - 5} more parallel jobs)[/dim]"
+            mode_label = (
+                f"Parallel Array Sweep ({len(sweep_list)} jobs, max {max_parallel} parallel)"
+                if max_parallel
+                else f"Parallel Array Sweep ({len(sweep_list)} jobs)"
+            )
+            summary_table.add_row(
+                "Job Mode",
+                f"[bold yellow]{mode_label}[/bold yellow]\n{preview_sweeps}",
+            )
     else:
         summary_table.add_row(
             "Arguments", sweep_list[0] if sweep_list[0] else "[dim](none)[/dim]"
@@ -610,6 +691,131 @@ def _render_submission_summary(
     )
 
 
+def _submit_dag_run(
+    cwd: Path, dag_path: Path, run_dir: Path, repro_dir: Path
+) -> Tuple[Optional[int], str]:
+    """Submits a DAGMan workflow via condor_submit_dag -no_submit -> sanitize -> condor_submit."""
+    run_json_path = run_dir / "run.json"
+    try:
+        try:
+            dag_submit_arg = str(dag_path.relative_to(cwd))
+        except ValueError:
+            dag_submit_arg = str(dag_path)
+
+        subprocess.run(
+            ["condor_submit_dag", "-f", "-no_submit", dag_submit_arg],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+
+        condor_sub_path = Path(f"{dag_path}.condor.sub")
+        if condor_sub_path.is_file():
+            sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
+            write_text_lf(condor_sub_path, sanitize_dagman_condor_sub(sub_txt))
+
+        try:
+            sub_submit_arg = str(condor_sub_path.relative_to(cwd))
+        except ValueError:
+            sub_submit_arg = str(condor_sub_path)
+
+        sub_res = subprocess.run(
+            ["condor_submit", sub_submit_arg],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        condor_out = sub_res.stdout.strip()
+        cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+        dagman_cluster_id = int(cluster_match.group(1)) if cluster_match else None
+
+        def _record_dag_info(data: Dict[str, Any]) -> None:
+            sub_block = data.setdefault("submission", {})
+            sub_block["condor_submit_output"] = condor_out
+            sub_block["cluster_id"] = dagman_cluster_id
+            dep_block = data.setdefault("dependency", {})
+            dep_block["dagman_cluster_id"] = dagman_cluster_id
+
+        locked_mutate_run_json(run_json_path, repro_dir, _record_dag_info)
+        return dagman_cluster_id, condor_out
+    except FileNotFoundError:
+        locked_mutate_run_json(
+            run_json_path,
+            repro_dir,
+            lambda d: d.update({"status": "SUBMIT_FAILED"}),
+        )
+        console.print(
+            f"[bold red]✘ Error:[/bold red] 'condor_submit_dag' not found in PATH (are you on hermes2?).\n"
+            f"  Run directory and repro capsule were still generated at: [cyan]runs/{run_dir.name}/[/cyan]"
+        )
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+
+        def _record_dag_err(data: Dict[str, Any]) -> None:
+            data["status"] = "SUBMIT_FAILED"
+            data.setdefault("submission", {})["condor_submit_error"] = err_msg
+
+        locked_mutate_run_json(run_json_path, repro_dir, _record_dag_err)
+        console.print(f"[bold red]✘ condor_submit_dag failed:[/bold red]\n{err_msg}")
+        sys.exit(1)
+
+
+def _submit_direct_run(
+    cwd: Path, sub_path: Path, run_dir: Path, repro_dir: Path
+) -> Tuple[Optional[int], str]:
+    """Submits a standard job.sub via condor_submit and records cluster_id in run.json."""
+    run_json_path = run_dir / "run.json"
+    try:
+        res = subprocess.run(
+            ["condor_submit", str(sub_path)],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        condor_out = res.stdout.strip()
+        cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+        cluster_id = int(cluster_match.group(1)) if cluster_match else None
+
+        def _record_submit_info(data: Dict[str, Any]) -> None:
+            sub_block = data.setdefault("submission", {})
+            sub_block["condor_submit_output"] = condor_out
+            sub_block["cluster_id"] = cluster_id
+
+        locked_mutate_run_json(run_json_path, repro_dir, _record_submit_info)
+        return cluster_id, condor_out
+    except FileNotFoundError:
+        locked_mutate_run_json(
+            run_json_path,
+            repro_dir,
+            lambda d: d.update({"status": "SUBMIT_FAILED"}),
+        )
+        console.print(
+            f"[bold red]✘ Error:[/bold red] 'condor_submit' not found in PATH (are you on hermes2?).\n"
+            f"  Run directory and repro capsule were still generated at: [cyan]runs/{run_dir.name}/[/cyan]"
+        )
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+
+        def _record_submit_err(data: Dict[str, Any]) -> None:
+            data["status"] = "SUBMIT_FAILED"
+            data.setdefault("submission", {})["condor_submit_error"] = err_msg
+
+        locked_mutate_run_json(run_json_path, repro_dir, _record_submit_err)
+        console.print(f"[bold red]✘ condor_submit failed:[/bold red]\n{err_msg}")
+        sys.exit(1)
+
+
 def main() -> None:
     argv = sys.argv[1:]
     passthrough_args = ""
@@ -622,8 +828,11 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    if args.after_ok and not args.after:
-        console.print("[bold red]✘ Error:[/bold red] --after-ok requires --after <run>.")
+    if args.after_ok and not args.after and not args.chain:
+        console.print("[bold red]✘ Error:[/bold red] --after-ok requires --after <run> or --chain.")
+        sys.exit(1)
+    if args.max_parallel is not None and args.max_parallel < 1:
+        console.print("[bold red]✘ Error:[/bold red] --max-parallel (-j) must be >= 1.")
         sys.exit(1)
 
     cwd = Path.cwd()
@@ -751,7 +960,7 @@ def main() -> None:
         args, proj_cfg, interactive_mode
     )
 
-    combined_single_args, sweep_list, cli_sweep_specs, tag = _resolve_sweeps_and_tag(
+    combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, tag = _resolve_sweeps_and_tag(
         args, proj_cfg, passthrough_args, interactive_mode
     )
 
@@ -771,6 +980,7 @@ def main() -> None:
     elif args.after:
         resolved_after_id = str(args.after)
 
+    is_chained_sweep = bool(args.chain and len(sweep_list) > 1)
     base_tokens = build_send_command_tokens(
         send_bin="send",
         target=rel_target,
@@ -791,6 +1001,8 @@ def main() -> None:
         after=resolved_after_id,
         after_ok=bool(args.after_ok),
         from_run=source_run_dir.name if source_run_dir else None,
+        max_parallel=args.max_parallel,
+        chain=is_chained_sweep,
     )
     cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
     if len(sweep_list) > 1:
@@ -826,11 +1038,25 @@ def main() -> None:
         ok_part = " [bold yellow][exit 0 required][/bold yellow]" if args.after_ok else ""
         dep_info = f"Starts after external cluster [bold]#{parent_cid}[/bold]{ok_part}"
 
+    step_tags: List[str] = []
+    step_run_ids: List[str] = []
+    if is_chained_sweep:
+        used_ids = set()
+        for idx in range(len(sweep_list)):
+            raw_item = raw_sweep_items[idx] if idx < len(raw_sweep_items) else sweep_list[idx]
+            st_tag = _derive_sweep_item_tag(tag, raw_item, idx)
+            cand_id = f"{ts_str}_{target_path.stem}_{arch}_{st_tag}"
+            if cand_id in used_ids or (runs_root / cand_id).exists():
+                cand_id = f"{cand_id}_{idx}"
+            used_ids.add(cand_id)
+            step_tags.append(st_tag)
+            step_run_ids.append(cand_id)
+
     _render_submission_summary(
         rel_target=rel_target,
         exec_type=exec_type,
         cwd=cwd,
-        run_id=run_id,
+        run_id=f"{step_run_ids[0]} .. (+{len(step_run_ids) - 1})" if is_chained_sweep else run_id,
         tag=tag or None,
         venv_path=venv_path,
         arch=arch,
@@ -843,17 +1069,272 @@ def main() -> None:
         equivalent_cli=equivalent_cli,
         dependency_info=dep_info,
         cloned_from_label=cloned_from_label,
+        max_parallel=args.max_parallel,
+        chain=is_chained_sweep,
+        chain_tags=step_tags if is_chained_sweep else None,
     )
 
     if not args.yes and not args.dry_run:
         import questionary
 
+        prompt_msg = (
+            f"Submit {len(sweep_list)} chained runs to HTCondor queue now?"
+            if is_chained_sweep
+            else "Submit job to HTCondor queue now?"
+        )
         confirm = questionary.confirm(
-            "Submit job to HTCondor queue now?", default=True, style=get_prompt_style()
+            prompt_msg, default=True, style=get_prompt_style()
         ).ask()
         if not confirm:
             console.print("[yellow]Submission cancelled.[/yellow]")
             sys.exit(0)
+
+    if is_chained_sweep:
+        first_run_dir: Optional[Path] = None
+        prev_run_dir: Optional[Path] = None
+        prev_cid: Optional[int] = None
+        created_runs: List[Tuple[Path, Optional[int], str, str]] = []
+        patch_rel_path: Optional[str] = None
+
+        for idx, single_arg in enumerate(sweep_list):
+            step_tag = step_tags[idx]
+            step_run_id = step_run_ids[idx]
+            step_run_dir = runs_root / step_run_id
+            step_repro_dir = step_run_dir / "repro"
+            step_repro_dir.mkdir(parents=True, exist_ok=True)
+
+            if idx == 0:
+                freeze_python_env(venv_path, step_repro_dir, detach=True)
+                if source_run_dir is not None:
+                    snap_exec_path, snap_py_root = clone_code_snapshot(
+                        source_run_dir, rel_target, step_repro_dir
+                    )
+                    if (step_repro_dir / "uncommitted.patch").is_file():
+                        patch_rel_path = "repro/uncommitted.patch"
+                else:
+                    snap_exec_path, snap_py_root = create_code_snapshot(
+                        target_path, cwd, step_repro_dir, git_info
+                    )
+                    if git_info.get("is_git") and git_info.get("diff"):
+                        write_text_lf(step_repro_dir / "uncommitted.patch", str(git_info["diff"]))
+                        patch_rel_path = "repro/uncommitted.patch"
+                first_run_dir = step_run_dir
+            else:
+                assert first_run_dir is not None
+                first_env = first_run_dir / "repro" / "env.txt"
+                if first_env.is_file():
+                    shutil.copy2(first_env, step_repro_dir / "env.txt")
+                snap_exec_path, snap_py_root = clone_code_snapshot(
+                    first_run_dir, rel_target, step_repro_dir
+                )
+                patch_rel_path = (
+                    "repro/uncommitted.patch"
+                    if (step_repro_dir / "uncommitted.patch").is_file()
+                    else None
+                )
+
+            if idx == 0:
+                step_parent_dir = parent_run_dir
+                step_parent_cid = parent_cid
+                step_submit_via_dag = submit_via_dag
+                step_resolved_after = resolved_after_id
+            else:
+                step_parent_dir = prev_run_dir
+                step_parent_cid = prev_cid
+                step_submit_via_dag = True
+                step_resolved_after = (
+                    prev_run_dir.name
+                    if prev_run_dir is not None
+                    else (str(prev_cid) if prev_cid is not None else None)
+                )
+
+            step_tokens = build_send_command_tokens(
+                send_bin="send",
+                target=rel_target,
+                arch=arch,
+                cpus=cpus,
+                mem_mb=mem_mb,
+                gpus=gpus,
+                tag=step_tag or None,
+                no_venv=no_venv_flag,
+                venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
+                nodes_include=nodes_include,
+                nodes_exclude=nodes_exclude,
+                project_code=str(project_code) if project_code else None,
+                scratch_files=scratch_files,
+                env_items=list(args.env),
+                args_flag_val=single_arg or None,
+                after=step_resolved_after,
+                after_ok=bool(args.after_ok) if step_resolved_after else False,
+                from_run=source_run_dir.name if source_run_dir else None,
+            )
+            step_equivalent_cli = " ".join(
+                [step_tokens[0]] + [shlex.quote(t) for t in step_tokens[1:]]
+            )
+
+            sh_path = step_repro_dir / "job.sh"
+            sh_content = generate_bash_wrapper(
+                exec_type=exec_type,
+                target_exec_path=snap_exec_path,
+                venv_path=venv_path,
+                pythonpath_dir=snap_py_root,
+                project_cwd=cwd,
+                run_dir=step_run_dir,
+                repro_dir=step_repro_dir,
+                submit_epoch=submit_epoch,
+                sweep_count=1,
+                requested_cpus=cpus,
+                env_vars=env_vars,
+            )
+            write_text_lf(sh_path, sh_content)
+            try:
+                sh_path.chmod(0o755)
+            except OSError:
+                pass
+
+            sub_path = step_repro_dir / "job.sub"
+            sub_content = generate_sub_file(
+                sh_path=sh_path,
+                project_cwd=cwd,
+                run_dir=step_run_dir,
+                repro_dir=step_repro_dir,
+                script_stem=target_path.stem,
+                arch=arch,
+                cpus=cpus,
+                mem_mb=mem_mb,
+                gpus=gpus,
+                sweep_args=[single_arg],
+                nodes_include=nodes_include,
+                nodes_exclude=nodes_exclude,
+                project_code=str(project_code) if project_code else None,
+                scratch_files=scratch_files,
+            )
+            write_text_lf(sub_path, sub_content)
+
+            step_has_dep = step_submit_via_dag or (args.dry_run and (idx > 0 or bool(args.after)))
+            dag_path: Optional[Path] = None
+            if step_has_dep:
+                wait_script_path = step_repro_dir / "wait_parent.py"
+                write_text_lf(wait_script_path, generate_wait_parent_script())
+                try:
+                    wait_script_path.chmod(0o755)
+                except OSError:
+                    pass
+                dag_path = step_repro_dir / "job.dag"
+                submit_py = resolve_submit_python()
+                dagman_cfg_path: Optional[Path] = None
+                dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
+                if dagman_cfg:
+                    dagman_cfg_path = step_repro_dir / "dagman.config"
+                    write_text_lf(dagman_cfg_path, dagman_cfg)
+                dag_content = generate_dag_file(
+                    sub_path=sub_path,
+                    wait_script_path=wait_script_path,
+                    python_bin=submit_py,
+                    child_dir=step_run_dir,
+                    parent_dir=step_parent_dir,
+                    parent_cluster_id=step_parent_cid,
+                    require_ok=bool(args.after_ok),
+                    config_path=dagman_cfg_path,
+                )
+                write_text_lf(dag_path, dag_content)
+
+            step_status = (
+                "DRY_RUN"
+                if args.dry_run
+                else ("WAITING" if step_submit_via_dag else "QUEUED")
+            )
+            step_run_json: Dict[str, Any] = {
+                "run_id": step_run_id,
+                "status": step_status,
+                "submission": {
+                    "submitted_at": now.isoformat(timespec="seconds"),
+                    "user": get_username(),
+                    "submit_host": get_hostname(),
+                    "target": rel_target,
+                    "tag": step_tag or None,
+                    "snapshot_executable": snap_exec_path.relative_to(step_run_dir).as_posix(),
+                    "working_directory": str(cwd),
+                    "run_directory": str(step_run_dir),
+                    "venv": str(venv_path) if venv_path else None,
+                    "no_venv": no_venv_flag,
+                    "equivalent_cli": step_equivalent_cli,
+                    "cluster_id": None,
+                    "chain_index": idx,
+                    "chain_total": len(sweep_list),
+                    **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
+                },
+                "resources_requested": {
+                    "architecture": arch,
+                    "cpus": cpus,
+                    "memory_mb": mem_mb,
+                    "gpus": 1 if arch == "GPU3090" else gpus,
+                    "sweep_count": 1,
+                    "sweep_arguments": [single_arg],
+                    "node_include": nodes_include,
+                    "node_exclude": nodes_exclude,
+                    "project_code": str(project_code) if project_code else None,
+                    "scratch_files": scratch_files,
+                    "env": env_vars,
+                },
+                "git": {
+                    "is_git": git_info.get("is_git", False),
+                    "branch": git_info.get("branch"),
+                    "commit": git_info.get("commit"),
+                    "dirty": git_info.get("dirty", False),
+                    "patch_file": patch_rel_path,
+                    **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
+                },
+                "executions": [],
+            }
+            if step_has_dep:
+                step_run_json["dependency"] = {
+                    "parent_run_id": step_resolved_after
+                    or (
+                        step_parent_dir.name
+                        if step_parent_dir
+                        else (str(step_parent_cid) if step_parent_cid else str(args.after))
+                    ),
+                    "parent_run_dir": str(step_parent_dir) if step_parent_dir else None,
+                    "parent_cluster_id": step_parent_cid,
+                    "require_ok": bool(args.after_ok),
+                    "dagman_cluster_id": None,
+                    "job_cluster_id": None,
+                }
+            atomic_write_json(step_run_dir / "run.json", step_run_json, step_repro_dir)
+
+            submitted_cid: Optional[int] = None
+            if not args.dry_run:
+                if step_submit_via_dag and dag_path is not None:
+                    submitted_cid, _ = _submit_dag_run(cwd, dag_path, step_run_dir, step_repro_dir)
+                else:
+                    submitted_cid, _ = _submit_direct_run(cwd, sub_path, step_run_dir, step_repro_dir)
+
+            prev_run_dir = step_run_dir
+            prev_cid = submitted_cid
+            created_runs.append((step_run_dir, submitted_cid, step_status, step_tag))
+
+        update_latest_symlink(runs_root, created_runs[0][0])
+        chain_lines = []
+        for idx, (r_dir, cid, st, s_tag) in enumerate(created_runs, start=1):
+            cid_disp = f"#{cid}" if cid else "dry"
+            st_color = "cyan" if st == "QUEUED" else ("blue" if st == "WAITING" else "yellow")
+            chain_lines.append(
+                f"  {idx}. [bold]{r_dir.name}[/bold] ({s_tag}) — [{st_color}]{st}[/{st_color}] [{cid_disp}]"
+            )
+        console.print(
+            Panel(
+                "\n".join(chain_lines),
+                title=f"[bold green]🔗 Chained {len(created_runs)} Sequential Runs[/bold green]",
+                border_style="green",
+                expand=False,
+            )
+        )
+        if args.follow and not args.dry_run:
+            from hermes_tools.runs_cli import follow_run_log
+
+            follow_run_log(created_runs[0][0], created_runs[0][0] / f"{target_path.stem}.out", initial_lines=60)
+        return
 
     # 7. Materialize Run Directory & Repro Capsule (Cached/detached env freeze)
     repro_dir.mkdir(parents=True, exist_ok=True)
@@ -906,6 +1387,7 @@ def main() -> None:
         nodes_exclude=nodes_exclude,
         project_code=str(project_code) if project_code else None,
         scratch_files=scratch_files,
+        max_parallel=args.max_parallel,
     )
     write_text_lf(sub_path, sub_content)
 
@@ -965,6 +1447,7 @@ def main() -> None:
             "memory_mb": mem_mb,
             "gpus": 1 if arch == "GPU3090" else gpus,
             "sweep_count": len(sweep_list),
+            "max_parallel": args.max_parallel,
             "sweep_arguments": sweep_list,
             "node_include": nodes_include,
             "node_exclude": nodes_exclude,

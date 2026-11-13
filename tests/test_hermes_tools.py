@@ -2461,3 +2461,139 @@ def test_runs_pin_unpin_and_clean_protection(
     capsys.readouterr()
     assert not r1.exists()
 
+
+def test_send_sweep_max_parallel_throttling(tmp_path: Path) -> None:
+    """Verifies send -s ... -j 1 emits max_idle = 1 and records max_parallel in run.json."""
+    script = tmp_path / "train.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            str(script),
+            "-a",
+            "GPU3090",
+            "-s",
+            "--lr {1e-3,1e-4} --bs {32,64}",
+            "-j",
+            "1",
+            "--dry-run",
+            "--no-venv",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res.returncode == 0, res.stderr
+
+    runs_root = tmp_path / "runs"
+    run_dirs = [d for d in runs_root.iterdir() if d.is_dir()]
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+
+    rj = load_run_json(run_dir)
+    assert rj["resources_requested"]["sweep_count"] == 4
+    assert rj["resources_requested"]["max_parallel"] == 1
+    assert "-j 1" in rj["submission"]["equivalent_cli"]
+
+    sub_txt = (run_dir / "repro" / "job.sub").read_text(encoding="utf-8")
+    assert "max_idle" in sub_txt
+    assert "= 1" in sub_txt
+
+
+def test_send_sweep_chain_creates_separate_linked_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies send -s ... --chain --after-ok creates N separate chained runs with auto-derived tags."""
+    import hermes_tools.send_cli as send_cli
+
+    script = tmp_path / "all_pipeline.py"
+    script.write_text("print('pipeline')\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        send_cli,
+        "get_git_info",
+        lambda _cwd: {"is_git": False, "branch": None, "commit": None, "dirty": False, "diff": ""},
+    )
+    monkeypatch.setattr(send_cli.shutil, "which", lambda _cmd: "/usr/bin/condor_submit")
+
+    def fake_run(cmd, **kwargs):
+        exe = Path(cmd[0]).name
+        if exe == "condor_submit_dag":
+            dag_arg = Path(cmd[-1])
+            dag_abs = dag_arg if dag_arg.is_absolute() else (tmp_path / dag_arg)
+            Path(f"{dag_abs}.condor.sub").write_text(
+                "universe = scheduler\narguments = -f -l . -Notification NEVER\nqueue\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if exe == "condor_submit":
+            sub_arg = str(cmd[-1])
+            if sub_arg.endswith(".condor.sub"):
+                # Determine step by checking existing runs count or order
+                if "lab" in sub_arg:
+                    cid = 1002
+                else:
+                    cid = 1003
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"1 job(s) submitted to cluster {cid}.\n", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="1 job(s) submitted to cluster 1001.\n", stderr=""
+            )
+        raise AssertionError(f"Unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(send_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "send",
+            str(script),
+            "-a",
+            "GPU3090",
+            "-s",
+            "--task {age,lab,survival}",
+            "--chain",
+            "--after-ok",
+            "-y",
+            "--no-venv",
+        ],
+    )
+
+    send_cli.main()
+
+    runs_root = tmp_path / "runs"
+    run_dirs = [d for d in runs_root.iterdir() if d.is_dir()]
+    assert len(run_dirs) == 3
+
+    run1 = next(d for d in run_dirs if d.name.endswith("_age"))
+    run2 = next(d for d in run_dirs if d.name.endswith("_lab"))
+    run3 = next(d for d in run_dirs if d.name.endswith("_survival"))
+
+    rj1 = load_run_json(run1)
+    rj2 = load_run_json(run2)
+    rj3 = load_run_json(run3)
+
+    assert rj1["status"] == "QUEUED"
+    assert rj1["submission"]["cluster_id"] == 1001
+    assert "dependency" not in rj1
+
+    assert rj2["status"] == "WAITING"
+    assert rj2["dependency"]["parent_run_id"] == run1.name
+    assert rj2["dependency"]["parent_cluster_id"] == 1001
+    assert rj2["dependency"]["require_ok"] is True
+    assert rj2["dependency"]["dagman_cluster_id"] == 1002
+
+    assert rj3["status"] == "WAITING"
+    assert rj3["dependency"]["parent_run_id"] == run2.name
+    assert rj3["dependency"]["parent_cluster_id"] == 1002
+    assert rj3["dependency"]["require_ok"] is True
+    assert rj3["dependency"]["dagman_cluster_id"] == 1003
+
+

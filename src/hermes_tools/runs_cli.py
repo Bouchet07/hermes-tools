@@ -482,6 +482,8 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
         "Architecture",
         f"[bold magenta]{req.get('architecture', '—')}[/bold magenta] (CPUs: {req.get('cpus') or 'Auto'}, RAM: {req.get('memory_mb') or 'Auto'} MB, GPUs: {req.get('gpus') or 0})",
     )
+    if req.get("max_parallel"):
+        meta.add_row("Max Parallel", f"{req['max_parallel']} concurrent job(s)")
     env_map = req.get("env") or {}
     if isinstance(env_map, dict) and env_map:
         env_str = ", ".join(f"[cyan]{k}[/cyan]={v}" for k, v in env_map.items())
@@ -1093,6 +1095,7 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             sweep_specs=[arg_line for _, arg_line in targets] if is_sweep else None,
             args_flag_val=targets[0][1] if (not is_sweep and targets[0][1]) else None,
             from_run=run_dir.name if not update_code else None,
+            max_parallel=req.get("max_parallel"),
             yes=bool(args.yes),
         )
 

@@ -88,6 +88,8 @@ send train.py -a GPU3090 --dry-run                  # Generate capsule without s
 | `-- <args...>` | `tokens` | `""` | Passthrough arguments after `--` (e.g. `send train.py -a GPU3090 -- --lr 1e-4`). |
 | `-s`, `--sweep` | `str` (repeatable) | `[]` | Parallel sweep specification (supports `{start..end}`, `{00..09}`, `{a,b}`, `;`, or multiple `-s`). |
 | `--sweep-file` | `path` | `None` | Text file with one argument string per line (`#` comments and blank lines ignored). |
+| `-j`, `--max-parallel` | `int` | `None` | Limit concurrent sweep processes in a single array (`max_idle = K` in `job.sub`). |
+| `--chain`, `--seq` | `flag` | `False` | Split sweep into separate sequential runs chained via `--after` (one run directory per sweep item, with auto-derived tags). |
 | `-t`, `--tag` | `str` | `""` | Optional suffix sanitized and appended to the run folder: `<timestamp>_<script>_<arch>_<tag>`. |
 | `--venv` | `path` | Auto-discovered | Explicit path to a Python virtual environment or Conda environment. |
 | `--no-venv` | `flag` | `False` | Do not activate a virtual environment; run with the submitter's default Python 3. |
@@ -115,7 +117,7 @@ Hermes 2 scheduler policies require specific resource directives to be omitted o
 | **`INTEL`** | Intel Xeon 6226R | Emitted (default `4`) | Emitted (default `8192` MB) | **Omitted** |
 | **`UNDEFINED`** | Any available node | Emitted (default `4`) | Emitted (default `8192` MB) | **Omitted** |
 
-### 2.4 Parallel Sweeps & Array Jobs
+### 2.4 Parallel, Throttled (`-j`) & Chained (`--chain`) Sweeps
 
 Use `-s` / `--sweep` or `--sweep-file` to queue a single HTCondor cluster with multiple parallel processes (`queue job_args from (...)`):
 
@@ -137,6 +139,14 @@ Use `-s` / `--sweep` or `--sweep-file` to queue a single HTCondor cluster with m
   ```bash
   send train.py -a GPU3090 -s '--fold {0..4}' -- --data /mnt/cephfs/dataset
   # Proc i receives: --data /mnt/cephfs/dataset --fold <i>
+  ```
+- **Throttled array sweeps (`-j` / `--max-parallel`)**: Keep all processes inside one run folder while limiting concurrency via `max_idle = K` in `job.sub`:
+  ```bash
+  send train.py -a GPU3090 -s '--lr {1e-3,1e-4} --bs {32,64}' -j 2
+  ```
+- **Sequential chained sweeps (`--chain` / `--seq`)**: Split a sweep into separate single-job run directories with auto-derived tags (`age`, `lab`, `survival`) and chain them sequentially via DAGMan (add `--after-ok` to stop the chain on failure):
+  ```bash
+  send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain --after-ok -y
   ```
 
 ### 2.5 Passing Script Arguments Safely (`--` vs `--args` vs `-s`)
@@ -172,6 +182,9 @@ send eval.py -a GPU3090 --after latest --after-ok -y
 
 # Chain by specific cluster ID or run directory name
 send postprocess.py -a AMD -c 8 -m 16G --after 1074525 --after-ok -y
+
+# Or chain an entire sweep sequentially across separate run folders:
+send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain --after-ok -y
 ```
 
 **How Automated Chaining Works**:
