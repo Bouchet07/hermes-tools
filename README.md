@@ -191,10 +191,12 @@ send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain --after-o
 1. **Immediate Code Snapshot**: The code snapshot in `repro/code/` for the dependent job is frozen *at submission time*. You can edit files, experiment, or switch git branches in your workspace immediately without affecting either the running parent or the queued child.
 2. **HTCondor DAGMan Workflow**: `send` materializes `repro/job.dag` and a standalone PRE script (`repro/wait_parent.py`), submitting via `condor_submit_dag`. The workflow runs entirely inside the HTCondor schedd daemon—you can log out of Hermes 2 or close your laptop and your dependency chain continues uninterrupted.
 3. **Live Status Tracking**: In `runs ls` and `runs watch`, dependent jobs clearly indicate their status as `WAITING (after #<cid>)` in bold blue while the parent is running, smoothly transitioning to `QUEUED` and `RUNNING` the moment the parent completes.
-4. **Parent Failure Safeguards (`--after-ok`)**: If the parent job fails or aborts and `--after-ok` was passed, DAGMan aborts node submission and the run is healed cleanly to `CANCELLED (parent failed)` without consuming GPU/CPU compute.
-5. **Wait Diagnostics & Abort**:
+4. **Parent Failure & Abort Safeguards**:
+   - If the parent job is manually stopped (`ABORTED` / `CANCELLED`), any waiting downstream job automatically aborts without launching, even without `--after-ok`.
+   - If the parent job fails (`FAILED`) and `--after-ok` was passed, DAGMan aborts node submission and the run is healed cleanly to `CANCELLED (parent failed)` without consuming GPU/CPU compute.
+5. **Wait Diagnostics & Chain-Aware Abort**:
    - Run `runs why <child>` on a waiting job to see an instant dependency diagnosis: parent run ID, cluster ID, parent's live status, and wait conditions.
-   - Run `runs stop <child>` to cleanly abort the DAGMan workflow and PRE script via `condor_rm`.
+   - Run `runs stop <parent>` to stop the parent and automatically cascade to all downstream `WAITING` runs in the chain (pass `--single` / `--no-cascade` to stop only `<parent>`).
    - Run `runs clean --failed` or `runs clean --aborted` to delete cancelled or aborted workflows.
 
 ---
@@ -426,12 +428,13 @@ runs diff 1 2
 
 ### 6.7 `runs stop` (`kill`, `rm`)
 
-Calls `condor_rm` on all active HTCondor cluster IDs associated with the run (or all active runs with `--all`) and marks `run.json` as `ABORTED`:
+Calls `condor_rm` on all active HTCondor cluster IDs associated with the run (or all active runs with `--all`) and marks `run.json` as `ABORTED`. When stopping a run that has downstream `WAITING` runs chained via `--after` / `--chain`, `runs stop` detects the downstream chain and cascades the stop across all dependent runs (use `--single` / `--no-cascade` to stop only the target run):
 
 ```bash
-runs stop latest
-runs stop 1071044 -y
-runs stop --all -y             # Abort all currently QUEUED / RUNNING / HELD runs
+runs stop latest               # Stop run (and downstream chained runs if any)
+runs stop 1071044 -y           # Stop without confirmation prompt (cascades to downstream runs)
+runs stop 1 --single -y        # Stop only run #1 without stopping downstream runs (--no-cascade)
+runs stop --all -y             # Abort all currently QUEUED / RUNNING / HELD / WAITING runs
 ```
 
 ### 6.8 `runs clean` (`prune`), `runs pin` & `runs unpin`
