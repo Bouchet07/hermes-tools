@@ -779,11 +779,17 @@ for _p in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/lib/condor/bin", "/usr/lo
 
 def query_condor_jobs_for_cids(cids: Set[int], dagman_cids: Set[int]) -> List[Dict[str, Any]]:
     """Queries condor_q for any job matching specified ClusterIds or DAGManJobIds."""
-    if not shutil.which("condor_q"):
+    if (not cids and not dagman_cids) or not shutil.which("condor_q"):
         return []
+    clauses = []
+    if cids:
+        clauses.append(f"member(ClusterId, {{{','.join(str(c) for c in sorted(cids))}}})")
+    if dagman_cids:
+        clauses.append(f"member(DAGManJobId, {{{','.join(str(d) for d in sorted(dagman_cids))}}})")
+    constraint = " || ".join(clauses)
     try:
         res = subprocess.run(
-            ["condor_q", "-nobatch", "-json", "-attributes", "ClusterId,JobStatus,DAGManJobId"],
+            ["condor_q", "-nobatch", "-json", "-attributes", "ClusterId,JobStatus,DAGManJobId", "-constraint", constraint],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -908,10 +914,7 @@ def get_parent_fate(parent_dir: Optional[Path], fallback_cid: Optional[int]) -> 
     dag_out = repro_dir / "job.dag.dagman.out"
     if status.startswith("WAITING"):
         # Parent compute job hasn't started yet!
-        # Check if parent DAGMan is still running or if it terminated
-        if dagman_cids and query_condor_jobs_for_cids(dagman_cids, set()):
-            return False, "WAITING"
-        # If DAGMan is not in condor_q, check if dagman.out shows terminal state
+        # Check if dagman.out shows terminal state
         if dag_out.is_file():
             try:
                 txt = dag_out.read_text(encoding="utf-8", errors="replace")
@@ -1402,7 +1405,7 @@ def inspect_condor_log_fate(condor_log: Path, is_sweep: bool = False) -> Optiona
                 return "ABORTED"
             if "Job terminated of its own accord" in block or "Normal termination" in block:
                 if "return value 0" in block:
-                    return None
+                    return "COMPLETED"
                 return "FAILED"
             if "Abnormal termination" in block or (
                 "MemoryUsage" in block and "Hold reason" in block
@@ -1473,9 +1476,7 @@ def reconcile_run(
     sweep_count = int(data.get("resources_requested", {}).get("sweep_count", 1) or 1)
 
     # Fast path for terminal runs: skip CephFS globbing and condor_q checks completely
-    # (unless an HTCondor cluster for this run is still actively running in condor_q)
-    has_live_cluster = live_clusters is not None and any(c in live_clusters for c in get_all_cluster_ids(data))
-    if not is_active_status and not has_live_cluster and (
+    if not is_active_status and (
         status in ("DRY_RUN", "SUBMIT_FAILED", "ABORTED", "CANCELLED")
         or status.startswith("CANCELLED")
         or len(get_execution_records(data)) >= sweep_count
@@ -1484,17 +1485,6 @@ def reconcile_run(
 
     repro_dir = run_dir / "repro"
     run_json_path = run_dir / "run.json"
-
-    dep = data.get("dependency")
-    is_dependent = isinstance(dep, dict)
-
-    # Check if a dependent run was prematurely marked CANCELLED while its DAGMan is actively running in condor_q
-    dagman_cid = dep.get("dagman_cluster_id") if is_dependent else None
-    if status.startswith("CANCELLED") and is_dependent and dagman_cid and live_clusters and dagman_cid in live_clusters:
-        locked_mutate_run_json(run_json_path, repro_dir, lambda d: d.update({"status": "WAITING"}))
-        data["status"] = "WAITING"
-        status = "WAITING"
-        is_active_status = True
 
     synced_execs: Optional[List[Dict[str, Any]]] = None
     if repro_dir.is_dir():
@@ -1591,7 +1581,13 @@ def reconcile_run(
             and len(get_execution_records(data)) < sweep_count
         ):
             is_dag_active = bool(dagman_cid is not None and dagman_cid in live_clusters)
-            if is_dag_active or (not dag_has_exited and parent_active):
+            if not is_dag_active:
+                disk_data = load_run_json(run_dir)
+                disk_status = str(disk_data.get("status", ""))
+                if disk_status.startswith("CANCELLED"):
+                    data["status"] = disk_status
+                    return data
+            if is_dag_active or (dag_out.is_file() and not dag_has_exited) or (not dag_has_exited and parent_active):
                 parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
                 data["_live_badge"] = f"WAITING ({parent_tag})"
                 return data

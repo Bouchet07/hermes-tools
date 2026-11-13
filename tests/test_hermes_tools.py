@@ -206,6 +206,15 @@ def test_inspect_condor_log_fate_sweep_vs_single(tmp_path: Path) -> None:
     # In a sweep, even though proc 1 succeeded last, proc 0 failed earlier:
     assert inspect_condor_log_fate(log_file, is_sweep=True) == "FAILED"
 
+    single_ok = tmp_path / "single_ok.log"
+    single_ok.write_text(
+        "005 (051.000.000) 2026-10-29 12:00:00 Job terminated.\n"
+        "    (1) Normal termination (return value 0)\n"
+        "...\n",
+        encoding="utf-8",
+    )
+    assert inspect_condor_log_fate(single_ok, is_sweep=False) == "COMPLETED"
+
 
 def test_code_snapshot_removes_deleted_files_on_sync(tmp_path: Path) -> None:
     src_a = tmp_path / "main.py"
@@ -1919,7 +1928,7 @@ def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.Mo
     out = capsys.readouterr().out
     assert "retry a waiting run" in out
 
-    # Stopping a WAITING run should remove DAGMan cluster and set status CANCELLED
+    # Stopping a WAITING run should remove DAGMan cluster and set status ABORTED
     rm_calls = []
 
     def mock_condor_rm(cmd, **kwargs):
@@ -1933,15 +1942,23 @@ def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.Mo
     runs_cli.cmd_stop(stop_args, runs_root)
     assert any("5555" in cmd for cmd in rm_calls)
     stopped_rj = load_run_json(wait_run)
-    assert stopped_rj["status"] == "CANCELLED"
+    assert stopped_rj["status"] == "ABORTED"
 
-    # Stopping an already CANCELLED run informs user cleanly
+    # Stopping an already ABORTED run informs user cleanly
     monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
     runs_cli.cmd_stop(stop_args, runs_root)
     out_stop = capsys.readouterr().out
-    assert "is already CANCELLED" in out_stop
+    assert "has already finished" in out_stop
 
-    # Syncing code into a CANCELLED run should be guarded
+    # Syncing code / following logs on a CANCELLED run should be guarded cleanly
+    atomic_write_json(
+        wait_run / "run.json",
+        {**stopped_rj, "status": "CANCELLED (parent failed)"},
+        w_repro,
+    )
+    runs_cli.cmd_stop(stop_args, runs_root)
+    assert "is already" in capsys.readouterr().out
+
     sync_args = argparse.Namespace(run=wait_run.name)
     runs_cli.cmd_sync(sync_args, runs_root)
     out_sync = capsys.readouterr().out
@@ -1953,7 +1970,7 @@ def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.Mo
     assert "Run was cancelled" in out_follow
 
 
-def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reconcile_waiting_race_and_terminal_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import argparse
     import hermes_tools.condor as condor
     import hermes_tools.runs_cli as runs_cli
@@ -1965,18 +1982,21 @@ def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monke
     parent_dir.mkdir()
     (parent_dir / "repro").mkdir()
     parent_rj = {
-        "status": "RUNNING",
+        "status": "COMPLETED",
         "submission": {"cluster_id": 1074962},
         "resources_requested": {"sweep_count": 1},
+        "executions": [{"process_id": 0, "status": "COMPLETED"}],
     }
     (parent_dir / "run.json").write_text(json.dumps(parent_rj), encoding="utf-8")
 
     child_dir = runs_root / "2026-11-12_11-00-00_child_GPU3090"
     child_dir.mkdir()
     (child_dir / "repro").mkdir()
-    # Emulate a child run that was accidentally marked CANCELLED while DAGMan is still active in condor_q
+    (child_dir / "repro" / "job.dag.dagman.out").write_text(
+        "11/12/26 11:00:01 DAGMan running...\n", encoding="utf-8"
+    )
     child_rj = {
-        "status": "CANCELLED",
+        "status": "WAITING",
         "submission": {"cluster_id": 1075087},
         "resources_requested": {"sweep_count": 1},
         "dependency": {
@@ -1988,22 +2008,23 @@ def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monke
     }
     (child_dir / "run.json").write_text(json.dumps(child_rj), encoding="utf-8")
 
-    live_clusters = {
-        1074962: {"ClusterId": 1074962, "JobStatus": 2},
-        1075087: {"ClusterId": 1075087, "JobStatus": 2, "child_clusters": []},
-    }
-    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_clusters)
-
-    # Reconciling child_dir directly
-    rec = condor.reconcile_run(child_dir, child_rj, live_clusters)
+    # Even if condor_q temporarily misses dagman_cid while dagman.out has not exited, keep WAITING
+    rec = condor.reconcile_run(child_dir, dict(child_rj), {})
     assert rec["status"] == "WAITING"
     assert rec["_live_badge"] == "WAITING (after #1074962)"
+    assert json.loads((child_dir / "run.json").read_text(encoding="utf-8"))["status"] == "WAITING"
 
-    # Verify run.json on disk was healed to WAITING
-    healed_disk = json.loads((child_dir / "run.json").read_text(encoding="utf-8"))
-    assert healed_disk["status"] == "WAITING"
+    # If wait_parent.py already wrote CANCELLED (parent failed) on disk, sync from disk
+    (child_dir / "run.json").write_text(
+        json.dumps({**child_rj, "status": "CANCELLED (parent failed)"}),
+        encoding="utf-8",
+    )
+    rec_cancelled = condor.reconcile_run(child_dir, dict(child_rj), {})
+    assert rec_cancelled["status"] == "CANCELLED (parent failed)"
 
-    # cmd_ls should also list it and show WAITING
+    # Terminal runs (including CANCELLED) must NOT trigger query_live_condor_clusters in cmd_ls
+    called = []
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: called.append(1) or {})
     ls_args = argparse.Namespace(
         quiet=False,
         full=False,
@@ -2018,6 +2039,102 @@ def test_reconcile_heals_prematurely_cancelled_waiting_run(tmp_path: Path, monke
         n=10,
     )
     runs_cli.cmd_ls(ls_args, runs_root)
+    assert called == []
+
+
+def test_wait_parent_query_condor_jobs_uses_constraint(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+    import hermes_tools.condor as condor
+
+    ns: dict = {}
+    exec(condor._WAIT_PARENT_SCRIPT.split("def main()")[0], ns)
+    q_fn = ns["query_condor_jobs_for_cids"]
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps([{"ClusterId": 101, "JobStatus": 2, "DAGManJobId": None}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(ns["shutil"], "which", lambda exe: "/usr/bin/condor_q")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert q_fn(set(), set()) == []
+    assert calls == []
+
+    res = q_fn({102, 101}, {201})
+    assert len(res) == 1
+    assert "-constraint" in calls[0]
+    c_idx = calls[0].index("-constraint")
+    constraint_expr = calls[0][c_idx + 1]
+    assert "member(ClusterId, {101,102})" in constraint_expr
+    assert "member(DAGManJobId, {201})" in constraint_expr
+
+
+def test_retry_in_place_updates_dependency_job_cluster_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import subprocess
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "2026-11-12_12-00-00_dep_retry_GPU3090"
+    repro = run_dir / "repro"
+    repro.mkdir(parents=True)
+    (repro / "job.sub").write_text("executable = /bin/true\nqueue\n", encoding="utf-8")
+    (repro / "condor.log").write_text(
+        "005 (111.000.000) 2026-11-12 12:05:00 Job terminated.\n"
+        "    (1) Normal termination (return value 1)\n...\n",
+        encoding="utf-8",
+    )
+    rj = {
+        "status": "FAILED",
+        "submission": {"cluster_id": 111},
+        "resources_requested": {"sweep_count": 1},
+        "executions": [{"process_id": 0, "status": "FAILED"}],
+        "dependency": {"dagman_cluster_id": 110, "job_cluster_id": 111, "parent_cluster_id": 100},
+    }
+    atomic_write_json(run_dir / "run.json", rj, repro)
+
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+    monkeypatch.setattr(
+        runs_cli.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="1 job(s) submitted to cluster 222.\n", stderr=""),
+    )
+
+    args = argparse.Namespace(run=run_dir.name, all=False, in_place=True, new_run=False, update_code=False, force=False, yes=True)
+    runs_cli.cmd_retry(args, runs_root)
+
+    updated = load_run_json(run_dir)
+    assert updated["submission"]["cluster_id"] == 222
+    assert updated["dependency"]["job_cluster_id"] == 222
+
+
+def test_why_and_top_raw_cluster_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+
+    rendered = []
+    monkeypatch.setattr(
+        runs_cli,
+        "_render_queue_analysis_panel",
+        lambda job_target, raw_mode=False: rendered.append((job_target, raw_mode)),
+    )
+    runs_cli.cmd_why(argparse.Namespace(run="999999", proc=0, raw=False), runs_root)
+    assert rendered == [("999999.0", False)]
+
+    job_target, run_name, arch = runs_cli._resolve_running_job_context(
+        argparse.Namespace(run="999999", proc=2), runs_root
+    )
+    assert (job_target, run_name, arch) == ("999999.2", None, None)
 
 
 
