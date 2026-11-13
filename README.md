@@ -475,11 +475,27 @@ cd "$(runs path -c)"           # Jump into `repro/code/` snapshot of the latest 
 vim "$(runs path -e)"          # Open the `.err` log file of the latest run (auto-selects failed sweep proc)
 less "$(runs path -o -p 1)"    # Open the `.out` log file of sweep process #1
 cat "$(runs path -j)"          # Print raw `run.json` via path
+head "$(runs path -t)"         # Print path to 5s telemetry CSV (`repro/telemetry_0.csv`)
+```
+
+### 6.12 `runs plot` (`telemetry`, `chart`)
+
+Visualizes the continuous 5-second hardware and I/O telemetry (`repro/telemetry_<proc>.csv`) with multi-row Unicode sparklines, `Min | Avg | P95 | Max` statistics, and an automated bottleneck diagnosis panel (GPU starvation / I/O wait, memory bandwidth bound, VRAM OOM/headroom, thermal throttling, kernel contention):
+
+```bash
+runs plot                      # Plot telemetry of latest run (RUNNING or COMPLETED)
+runs plot 1 -p 2               # Plot sweep process #2 of run #1
+runs plot 1 -w                 # Live-updating terminal charts while job is RUNNING
+runs plot 1 --save             # Also save high-res PNG to runs/<id>/telemetry_0.png (via matplotlib)
+runs plot 1 --save report.pdf  # Save high-res PDF/PNG to custom path
 ```
 
 ---
 
 ## 7. Under the Hood: Telemetry, Locking & Status Lifecycle
+
+- **Continuous 5s Time-Series Telemetry (`repro/telemetry_<proc>.csv`)**: Every job spawns a zero-overhead Python `/proc` + `nvidia-smi` sampler that buffers locally in `/tmp` and atomically syncs to `repro/telemetry_<proc>.csv` every 60 seconds and on job exit (before `run.json` summary aggregation). Exact 25-column schema:
+  `timestamp_iso,epoch,elapsed_s,num_procs,num_threads,io_wait_procs,cpu_total_pct,cpu_user_pct,cpu_sys_pct,rss_mb,pss_mb,node_ram_avail_mb,node_load_1m,io_read_mb_s,io_write_mb_s,disk_read_mb_s,disk_write_mb_s,maj_faults_delta,gpu_util_pct,gpu_mem_bw_pct,vram_used_mb,vram_total_mb,gpu_temp_c,gpu_power_w,gpu_sm_clock_mhz`
 
 - **Signal & Preemption Auditing**: `job.sh` traps `SIGTERM`, `SIGINT`, and `SIGHUP`. When wrapped by `/usr/bin/time -v`, signals are forwarded directly to the child workload process (`pkill -<SIG> -P <time_pid>`) so your Python script can flush/checkpoint cleanly and `/usr/bin/time` still writes peak RSS (`MaxRSS`), CPU utilization, page faults, and context switches before exiting.
 - **Locale Isolation**: Hardware probes (`lscpu`, `free`, `df`), `/usr/bin/time -v`, and `awk` run under `LC_ALL=C` / `LC_MESSAGES=C LC_NUMERIC=C` so Spanish locales (`es_ES.UTF-8`) on cluster nodes never break regex parsing or floating-point decimal dots, while your workload keeps its native UTF-8 locale.

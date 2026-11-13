@@ -4,6 +4,7 @@ condor.py — Hermes 2 architecture specs, job.sh/job.sub generators, and live c
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import shlex
@@ -222,6 +223,11 @@ echo "  Command  ${SHORT_CMD}"
 echo "  Started  ${START_ISO} (queued ${QUEUE_WAIT}s)"
 echo "────────────────────────────────────────────────────────────────────────────────"
 
+if [ ! -x "${UPDATER_PYTHON}" ]; then
+    UPDATER_PYTHON="$(command -v python3 || command -v python || echo python3)"
+fi
+
+TELEM_PID=""
 if [ "${SETUP_OK}" -eq 1 ]; then
     if [ -x /usr/bin/time ]; then
         USED_USR_TIME=1
@@ -232,6 +238,313 @@ if [ "${SETUP_OK}" -eq 1 ]; then
     fi
     CHILD_PID=$!
 
+    TELEM_CSV="${REPRO_DIR}/telemetry_${CONDOR_PROC_ID}.csv"
+    TELEM_TMP="/tmp/hermes_telem_${USER:-user}_${SUBMIT_EPOCH}_${CONDOR_PROC_ID}_$$.csv"
+    if ! touch "${TELEM_TMP}" 2>/dev/null; then
+        TELEM_TMP="${REPRO_DIR}/.telemetry_${CONDOR_PROC_ID}.tmp.csv"
+    fi
+    TELEM_CHILD_PID="${CHILD_PID}" \
+    TELEM_TMP_PATH="${TELEM_TMP}" \
+    TELEM_OUT_PATH="${TELEM_CSV}" \
+    TELEM_START_EPOCH="${START_EPOCH}" \
+    TELEM_PROC_ID="${CONDOR_PROC_ID}" \
+    TELEM_TIME_WRAPPED="${USED_USR_TIME}" \
+    "${UPDATER_PYTHON}" - <<'TELEMPY' &
+import datetime
+import os
+import shutil
+import signal
+import subprocess
+import time
+from collections import defaultdict
+from pathlib import Path
+
+child_pid = int(os.environ["TELEM_CHILD_PID"])
+tmp_path = Path(os.environ["TELEM_TMP_PATH"])
+out_path = Path(os.environ["TELEM_OUT_PATH"])
+start_epoch = float(os.environ.get("TELEM_START_EPOCH", str(int(time.time()))))
+proc_id = os.environ.get("TELEM_PROC_ID", "0")
+time_wrapped = os.environ.get("TELEM_TIME_WRAPPED", "0") == "1"
+
+stop_flag = False
+
+
+def _handle_stop(_signum, _frame):
+    global stop_flag
+    stop_flag = True
+
+
+signal.signal(signal.SIGTERM, _handle_stop)
+signal.signal(signal.SIGINT, _handle_stop)
+
+HEADER = (
+    "timestamp_iso,epoch,elapsed_s,num_procs,num_threads,io_wait_procs,"
+    "cpu_total_pct,cpu_user_pct,cpu_sys_pct,rss_mb,pss_mb,node_ram_avail_mb,"
+    "node_load_1m,io_read_mb_s,io_write_mb_s,disk_read_mb_s,disk_write_mb_s,"
+    "maj_faults_delta,gpu_util_pct,gpu_mem_bw_pct,vram_used_mb,vram_total_mb,"
+    "gpu_temp_c,gpu_power_w,gpu_sm_clock_mhz\n"
+)
+
+clk_tck = os.sysconf("SC_CLK_TCK")
+page_size = os.sysconf("SC_PAGE_SIZE")
+has_nvidia = bool(shutil.which("nvidia-smi"))
+
+
+def _sync_to_out() -> None:
+    if not tmp_path.is_file():
+        return
+    stage = out_path.parent / f".telemetry_{proc_id}.csv.tmp.{os.getpid()}"
+    try:
+        shutil.copyfile(str(tmp_path), str(stage))
+        os.replace(str(stage), str(out_path))
+    except OSError:
+        try:
+            if stage.exists():
+                stage.unlink()
+        except OSError:
+            pass
+
+
+def _collect_tree():
+    stats = {}
+    children = defaultdict(list)
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            continue
+        parts = raw[rparen + 2 :].split()
+        if len(parts) < 22:
+            continue
+        try:
+            ppid = int(parts[1])
+            stats[pid] = {
+                "state": parts[0],
+                "ppid": ppid,
+                "majflt": int(parts[9]),
+                "utime": int(parts[11]),
+                "stime": int(parts[12]),
+                "cutime": int(parts[13]),
+                "cstime": int(parts[14]),
+                "threads": int(parts[17]),
+                "rss_pages": int(parts[21]),
+            }
+            children[ppid].append(pid)
+        except (ValueError, IndexError):
+            continue
+
+    if child_pid not in stats:
+        return None
+
+    tree = []
+    queue = [child_pid]
+    seen = set()
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen or cur not in stats:
+            continue
+        seen.add(cur)
+        tree.append(cur)
+        queue.extend(children.get(cur, []))
+
+    workload = [p for p in tree if p != child_pid] if (time_wrapped and len(tree) > 1) else tree
+    return stats, tree, workload
+
+
+def _read_pss_mb(pids, rss_fallback: float) -> float:
+    total_kb = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/smaps_rollup", "r", encoding="utf-8", errors="replace") as fh:
+                found = False
+                for line in fh:
+                    if line.startswith("Pss:"):
+                        total_kb += int(line.split()[1])
+                        found = True
+                        break
+                if not found:
+                    return rss_fallback
+        except (OSError, ValueError, IndexError):
+            return rss_fallback
+    return round(total_kb / 1024.0, 2)
+
+
+def _read_io(pids):
+    rchar = wchar = rbytes = wbytes = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/io", "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("rchar:"):
+                        rchar += int(line.split()[1])
+                    elif line.startswith("wchar:"):
+                        wchar += int(line.split()[1])
+                    elif line.startswith("read_bytes:"):
+                        rbytes += int(line.split()[1])
+                    elif line.startswith("write_bytes:"):
+                        wbytes += int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return rchar, wchar, rbytes, wbytes
+
+
+def _read_node_metrics():
+    load_1m = 0.0
+    ram_avail_mb = 0.0
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8", errors="replace") as fh:
+            load_1m = float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    ram_avail_mb = round(int(line.split()[1]) / 1024.0, 1)
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    return load_1m, ram_avail_mb
+
+
+def _read_gpu_metrics():
+    if not has_nvidia:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    try:
+        res = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,clocks.current.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        rows = []
+        for ln in res.stdout.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            vals = []
+            for tok in ln.split(","):
+                try:
+                    vals.append(float(tok.strip()))
+                except ValueError:
+                    vals.append(0.0)
+            if len(vals) >= 7:
+                rows.append(vals[:7])
+        if not rows:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        n = float(len(rows))
+        gpu_util = round(sum(r[0] for r in rows) / n, 1)
+        gpu_mem_bw = round(sum(r[1] for r in rows) / n, 1)
+        vram_used = round(sum(r[2] for r in rows), 1)
+        vram_total = round(sum(r[3] for r in rows), 1)
+        gpu_temp = round(sum(r[4] for r in rows) / n, 1)
+        gpu_power = round(sum(r[5] for r in rows), 1)
+        gpu_clock = round(sum(r[6] for r in rows) / n, 1)
+        return gpu_util, gpu_mem_bw, vram_used, vram_total, gpu_temp, gpu_power, gpu_clock
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+
+prev_ts = None
+prev_utime = prev_stime = prev_majflt = 0
+prev_rchar = prev_wchar = prev_rbytes = prev_wbytes = 0
+sample_idx = 0
+
+try:
+    with open(tmp_path, "w", encoding="utf-8", newline="") as tfh:
+        tfh.write(HEADER)
+        tfh.flush()
+        while not stop_flag:
+            tree_info = _collect_tree()
+            if tree_info is None:
+                break
+            stats, tree_pids, workload_pids = tree_info
+            now_epoch = time.time()
+            now_mono = time.monotonic()
+            ts_iso = datetime.datetime.fromtimestamp(now_epoch).astimezone().isoformat(timespec="seconds")
+            elapsed_s = round(max(0.0, now_epoch - start_epoch), 1)
+
+            num_procs = len(workload_pids)
+            num_threads = sum(stats[p]["threads"] for p in workload_pids)
+            io_wait_procs = sum(1 for p in workload_pids if stats[p]["state"] == "D")
+            rss_mb = round(sum(stats[p]["rss_pages"] for p in workload_pids) * page_size / (1024.0 * 1024.0), 2)
+            pss_mb = _read_pss_mb(workload_pids, rss_mb)
+
+            cur_utime = sum(stats[p]["utime"] + stats[p]["cutime"] for p in tree_pids)
+            cur_stime = sum(stats[p]["stime"] + stats[p]["cstime"] for p in tree_pids)
+            cur_majflt = sum(stats[p]["majflt"] for p in workload_pids)
+            cur_rchar, cur_wchar, cur_rbytes, cur_wbytes = _read_io(workload_pids)
+
+            if prev_ts is None:
+                cpu_user = cpu_sys = cpu_tot = 0.0
+                io_r = io_w = disk_r = disk_w = 0.0
+                maj_delta = 0
+            else:
+                dt = max(0.1, now_mono - prev_ts)
+                d_u = max(0, cur_utime - prev_utime)
+                d_s = max(0, cur_stime - prev_stime)
+                cpu_user = round(max(0.0, (d_u / clk_tck) / dt * 100.0), 1)
+                cpu_sys = round(max(0.0, (d_s / clk_tck) / dt * 100.0), 1)
+                cpu_tot = round(cpu_user + cpu_sys, 1)
+                io_r = round(max(0, cur_rchar - prev_rchar) / (1024.0 * 1024.0) / dt, 3)
+                io_w = round(max(0, cur_wchar - prev_wchar) / (1024.0 * 1024.0) / dt, 3)
+                disk_r = round(max(0, cur_rbytes - prev_rbytes) / (1024.0 * 1024.0) / dt, 3)
+                disk_w = round(max(0, cur_wbytes - prev_wbytes) / (1024.0 * 1024.0) / dt, 3)
+                maj_delta = max(0, cur_majflt - prev_majflt)
+
+            prev_ts = now_mono
+            prev_utime, prev_stime, prev_majflt = cur_utime, cur_stime, cur_majflt
+            prev_rchar, prev_wchar, prev_rbytes, prev_wbytes = cur_rchar, cur_wchar, cur_rbytes, cur_wbytes
+
+            load_1m, ram_avail_mb = _read_node_metrics()
+            g_util, g_bw, v_used, v_tot, g_temp, g_pwr, g_clk = _read_gpu_metrics()
+
+            tfh.write(
+                f"{ts_iso},{now_epoch:.1f},{elapsed_s:.1f},{num_procs},{num_threads},{io_wait_procs},"
+                f"{cpu_tot:.1f},{cpu_user:.1f},{cpu_sys:.1f},{rss_mb:.2f},{pss_mb:.2f},{ram_avail_mb:.1f},"
+                f"{load_1m:.2f},{io_r:.3f},{io_w:.3f},{disk_r:.3f},{disk_w:.3f},{maj_delta},"
+                f"{g_util:.1f},{g_bw:.1f},{v_used:.1f},{v_tot:.1f},{g_temp:.1f},{g_pwr:.1f},{g_clk:.1f}\n"
+            )
+            tfh.flush()
+            sample_idx += 1
+            if sample_idx % 12 == 0:
+                _sync_to_out()
+
+            deadline = time.monotonic() + 5.0
+            while not stop_flag:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                time.sleep(min(0.5, rem))
+finally:
+    _sync_to_out()
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    except OSError:
+        pass
+TELEMPY
+    TELEM_PID=$!
+
     while true; do
         TRAP_FIRED=0
         wait "${CHILD_PID}"
@@ -240,6 +553,11 @@ if [ "${SETUP_OK}" -eq 1 ]; then
             break
         fi
     done
+
+    if [ -n "${TELEM_PID:-}" ]; then
+        kill -TERM "${TELEM_PID}" 2>/dev/null || true
+        wait "${TELEM_PID}" 2>/dev/null || true
+    fi
 
     if [ -n "${CAUGHT_SIG}" ] && [ "${EXIT_CODE}" -eq 0 ]; then
         EXIT_CODE=143
@@ -311,12 +629,10 @@ export UPD_RSS_MB="${MAX_RSS_MB:-0.0}"
 export UPD_CPU_PCT="${CPU_PCT}"
 export UPD_FAULTS="${MAJ_FAULTS:-0}"
 
-if [ ! -x "${UPDATER_PYTHON}" ]; then
-    UPDATER_PYTHON="$(command -v python3 || command -v python || echo python3)"
-fi
-
 "${UPDATER_PYTHON}" - <<'PYEOF'
+import csv
 import fcntl
+import csv
 import json
 import os
 import random
@@ -364,6 +680,81 @@ exec_record = {
     "cpu_utilization": os.environ.get("UPD_CPU_PCT", "N/A"),
     "major_page_faults": safe_int(os.environ.get("UPD_FAULTS", "0")),
 }
+
+telem_csv = repro_dir / f"telemetry_{proc_id}.csv"
+if telem_csv.is_file():
+    try:
+        with open(telem_csv, "r", encoding="utf-8", errors="replace", newline="") as cf:
+            t_rows = list(csv.DictReader(cf))
+        if t_rows:
+            def _col(name: str):
+                vals = []
+                for row in t_rows:
+                    try:
+                        vals.append(float(row.get(name, 0.0) or 0.0))
+                    except (TypeError, ValueError):
+                        vals.append(0.0)
+                return vals
+
+            n_samples = len(t_rows)
+            elapsed_vals = _col("elapsed_s")
+            dts = []
+            for idx_t, el in enumerate(elapsed_vals):
+                if idx_t == 0:
+                    dts.append(elapsed_vals[1] - el if len(elapsed_vals) > 1 else 5.0)
+                else:
+                    dts.append(max(0.0, el - elapsed_vals[idx_t - 1]))
+            cpu_tot_v = _col("cpu_total_pct")
+            cpu_sys_v = _col("cpu_sys_pct")
+            rss_v = _col("rss_mb")
+            pss_v = _col("pss_mb")
+            iow_v = _col("io_wait_procs")
+            ior_v = _col("io_read_mb_s")
+            iowr_v = _col("io_write_mb_s")
+            dr_v = _col("disk_read_mb_s")
+            dw_v = _col("disk_write_mb_s")
+            gu_v = _col("gpu_util_pct")
+            gbw_v = _col("gpu_mem_bw_pct")
+            vu_v = _col("vram_used_mb")
+            vt_v = _col("vram_total_mb")
+            gt_v = _col("gpu_temp_c")
+            gp_v = _col("gpu_power_w")
+            gc_v = _col("gpu_sm_clock_mhz")
+            sorted_gu = sorted(gu_v)
+            gu_p50 = sorted_gu[n_samples // 2]
+            pss_max = max(pss_v)
+            rss_max = max(rss_v)
+            summary = {
+                "samples": n_samples,
+                "cpu_pct_avg": round(sum(cpu_tot_v) / n_samples, 1),
+                "cpu_pct_max": round(max(cpu_tot_v), 1),
+                "cpu_sys_pct_avg": round(sum(cpu_sys_v) / n_samples, 1),
+                "rss_mb_avg": round(sum(rss_v) / n_samples, 2),
+                "rss_mb_max": round(rss_max, 2),
+                "pss_mb_max": round(pss_max, 2),
+                "io_wait_pct": round(sum(1 for x in iow_v if x > 0) / n_samples * 100.0, 1),
+                "io_read_mb_total": round(sum(v * dt for v, dt in zip(ior_v, dts)), 2),
+                "io_write_mb_total": round(sum(v * dt for v, dt in zip(iowr_v, dts)), 2),
+                "disk_read_mb_total": round(sum(v * dt for v, dt in zip(dr_v, dts)), 2),
+                "disk_write_mb_total": round(sum(v * dt for v, dt in zip(dw_v, dts)), 2),
+                "gpu_util_avg": round(sum(gu_v) / n_samples, 1),
+                "gpu_util_p50": round(gu_p50, 1),
+                "gpu_util_max": round(max(gu_v), 1),
+                "gpu_mem_bw_avg": round(sum(gbw_v) / n_samples, 1),
+                "vram_mb_avg": round(sum(vu_v) / n_samples, 1),
+                "vram_mb_max": round(max(vu_v), 1),
+                "vram_total_mb": round(max(vt_v), 1),
+                "gpu_temp_max_c": round(max(gt_v), 1),
+                "gpu_power_avg_w": round(sum(gp_v) / n_samples, 1),
+                "gpu_power_max_w": round(max(gp_v), 1),
+                "gpu_clock_min_mhz": round(min(gc_v), 1),
+                "gpu_clock_max_mhz": round(max(gc_v), 1),
+            }
+            exec_record["telemetry_file"] = f"repro/telemetry_{proc_id}.csv"
+            exec_record["telemetry_summary"] = summary
+            exec_record["peak_ram_mb"] = max(exec_record["peak_ram_mb"], round(pss_max or rss_max, 2))
+    except Exception:
+        pass
 
 # Always write lock-free per-process node_<proc_id>.json atomically first
 node_tmp = repro_dir / f".node_{proc_id}.json.tmp.{os.getpid()}"
@@ -757,6 +1148,7 @@ _WAIT_PARENT_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -2668,3 +3060,89 @@ def stream_job_live_telemetry(job_target: str, interval: int = 2):
                 proc.kill()
             except Exception:
                 pass
+
+
+def read_telemetry_csv(csv_path: Path) -> List[Dict[str, Any]]:
+    """Reads a 25-column `repro/telemetry_<proc>.csv` into a list of typed sample dicts."""
+    if not csv_path.is_file():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            for raw in csv.DictReader(fh):
+                parsed: Dict[str, Any] = {"timestamp_iso": str(raw.get("timestamp_iso", "") or "")}
+                for k, v in raw.items():
+                    if k == "timestamp_iso" or k is None:
+                        continue
+                    try:
+                        parsed[k] = float(v or 0.0)
+                    except (TypeError, ValueError):
+                        parsed[k] = 0.0
+                rows.append(parsed)
+    except OSError:
+        return []
+    return rows
+
+
+def compute_telemetry_summary(
+    csv_path: Path, rows: Optional[List[Dict[str, Any]]] = None
+) -> Optional[Dict[str, Any]]:
+    """Computes compact summary statistics from a telemetry CSV file or pre-parsed rows."""
+    t_rows = rows if rows is not None else read_telemetry_csv(csv_path)
+    if not t_rows:
+        return None
+    n_samples = len(t_rows)
+    elapsed_vals = [float(r.get("elapsed_s", 0.0) or 0.0) for r in t_rows]
+    dts = [
+        (elapsed_vals[1] - el if len(elapsed_vals) > 1 else 5.0)
+        if i == 0
+        else max(0.0, el - elapsed_vals[i - 1])
+        for i, el in enumerate(elapsed_vals)
+    ]
+
+    def _col(name: str) -> List[float]:
+        return [float(r.get(name, 0.0) or 0.0) for r in t_rows]
+
+    cpu_tot_v = _col("cpu_total_pct")
+    cpu_sys_v = _col("cpu_sys_pct")
+    rss_v = _col("rss_mb")
+    pss_v = _col("pss_mb")
+    iow_v = _col("io_wait_procs")
+    ior_v = _col("io_read_mb_s")
+    iowr_v = _col("io_write_mb_s")
+    dr_v = _col("disk_read_mb_s")
+    dw_v = _col("disk_write_mb_s")
+    gu_v = _col("gpu_util_pct")
+    gbw_v = _col("gpu_mem_bw_pct")
+    vu_v = _col("vram_used_mb")
+    vt_v = _col("vram_total_mb")
+    gt_v = _col("gpu_temp_c")
+    gp_v = _col("gpu_power_w")
+    gc_v = _col("gpu_sm_clock_mhz")
+    sorted_gu = sorted(gu_v)
+    return {
+        "samples": n_samples,
+        "cpu_pct_avg": round(sum(cpu_tot_v) / n_samples, 1),
+        "cpu_pct_max": round(max(cpu_tot_v), 1),
+        "cpu_sys_pct_avg": round(sum(cpu_sys_v) / n_samples, 1),
+        "rss_mb_avg": round(sum(rss_v) / n_samples, 2),
+        "rss_mb_max": round(max(rss_v), 2),
+        "pss_mb_max": round(max(pss_v), 2),
+        "io_wait_pct": round(sum(1 for x in iow_v if x > 0) / n_samples * 100.0, 1),
+        "io_read_mb_total": round(sum(v * dt for v, dt in zip(ior_v, dts)), 2),
+        "io_write_mb_total": round(sum(v * dt for v, dt in zip(iowr_v, dts)), 2),
+        "disk_read_mb_total": round(sum(v * dt for v, dt in zip(dr_v, dts)), 2),
+        "disk_write_mb_total": round(sum(v * dt for v, dt in zip(dw_v, dts)), 2),
+        "gpu_util_avg": round(sum(gu_v) / n_samples, 1),
+        "gpu_util_p50": round(sorted_gu[n_samples // 2], 1),
+        "gpu_util_max": round(max(gu_v), 1),
+        "gpu_mem_bw_avg": round(sum(gbw_v) / n_samples, 1),
+        "vram_mb_avg": round(sum(vu_v) / n_samples, 1),
+        "vram_mb_max": round(max(vu_v), 1),
+        "vram_total_mb": round(max(vt_v), 1),
+        "gpu_temp_max_c": round(max(gt_v), 1),
+        "gpu_power_avg_w": round(sum(gp_v) / n_samples, 1),
+        "gpu_power_max_w": round(max(gp_v), 1),
+        "gpu_clock_min_mhz": round(min(gc_v), 1),
+        "gpu_clock_max_mhz": round(max(gc_v), 1),
+    }

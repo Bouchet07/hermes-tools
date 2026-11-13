@@ -22,6 +22,7 @@ from rich.table import Table
 
 from hermes_tools.condor import (
     build_send_command_tokens,
+    compute_telemetry_summary,
     generate_retry_sub_file,
     get_all_cluster_ids,
     get_failed_or_missing_procs,
@@ -29,6 +30,7 @@ from hermes_tools.condor import (
     query_condor_nodes,
     query_job_live_telemetry,
     query_live_condor_clusters,
+    read_telemetry_csv,
     reconcile_run,
     run_needs_live_reconcile,
     stream_job_live_telemetry,
@@ -527,6 +529,47 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
                 str(r.get("arguments", "")),
             )
         console.print(et)
+
+        telem_rows = []
+        for r in records:
+            pid = r.get("process_id", 0)
+            tsum = r.get("telemetry_summary")
+            if not isinstance(tsum, dict):
+                tsum = compute_telemetry_summary(run_dir / "repro" / f"telemetry_{pid}.csv")
+            if isinstance(tsum, dict) and tsum.get("samples", 0) > 0:
+                telem_rows.append((pid, tsum))
+
+        if telem_rows:
+            tt = Table(
+                title="Telemetry Summary",
+                title_style="bold cyan",
+                box=box.SIMPLE_HEAVY,
+                header_style="bold cyan",
+            )
+            tt.add_column("Proc", justify="right")
+            tt.add_column("Samples", justify="right")
+            tt.add_column("GPU Util (Avg / Max)", justify="right")
+            tt.add_column("Peak VRAM", justify="right")
+            tt.add_column("PSS / RSS Max", justify="right")
+            tt.add_column("I/O Wait %", justify="right")
+            for pid, tsum in telem_rows:
+                vtot = float(tsum.get("vram_total_mb", 0.0) or 0.0)
+                vmax = float(tsum.get("vram_mb_max", 0.0) or 0.0)
+                gavg = float(tsum.get("gpu_util_avg", 0.0) or 0.0)
+                gmax = float(tsum.get("gpu_util_max", 0.0) or 0.0)
+                gpu_cell = f"{gavg:.0f}% / {gmax:.0f}%" if (vtot > 0 or gmax > 0) else "—"
+                vram_cell = (
+                    f"{vmax / 1024:.2f} / {vtot / 1024:.1f} GB"
+                    if vtot > 0
+                    else (f"{vmax:.0f} MB" if vmax > 0 else "—")
+                )
+                pss_m = float(tsum.get("pss_mb_max", 0.0) or 0.0)
+                rss_m = float(tsum.get("rss_mb_max", 0.0) or 0.0)
+                ram_cell = f"{pss_m:.0f} / {rss_m:.0f} MB"
+                iow = float(tsum.get("io_wait_pct", 0.0) or 0.0)
+                iow_cell = f"[yellow]{iow:.1f}%[/yellow]" if iow > 15.0 else f"{iow:.1f}%"
+                tt.add_row(str(pid), str(tsum.get("samples", 0)), gpu_cell, vram_cell, ram_cell, iow_cell)
+            console.print(tt)
 
     err_files = sorted(run_dir.glob("*.err"))
     syntax_cls = None
@@ -1036,6 +1079,9 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         node_f = repro_dir / f"node_{pid}.json"
         if node_f.is_file():
             node_f.unlink()
+        telem_f = repro_dir / f"telemetry_{pid}.csv"
+        if telem_f.is_file():
+            shutil.move(str(telem_f), str(repro_dir / f"telemetry_{pid}.csv.{backup_tag}"))
 
     retry_sub_content = generate_retry_sub_file(
         orig_sub_path=repro_dir / "job.sub",
@@ -2126,6 +2172,479 @@ def cmd_ssh(args: argparse.Namespace, runs_root: Path) -> None:
     sys.exit(res.returncode)
 
 
+_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def _bin_series(values: List[float], width: int, agg: str = "mean") -> List[float]:
+    if not values:
+        return []
+    n = len(values)
+    w = max(1, min(width, n))
+    if w == n:
+        return list(values)
+    out: List[float] = []
+    for i in range(w):
+        lo = int(i * n / w)
+        hi = max(lo + 1, int((i + 1) * n / w))
+        chunk = values[lo:hi]
+        out.append(max(chunk) if agg == "max" else sum(chunk) / len(chunk))
+    return out
+
+
+def _render_sparkline_rows(
+    values: List[float],
+    width: int,
+    *,
+    height: int = 2,
+    max_val: Optional[float] = None,
+    color: str = "green",
+) -> List[str]:
+    binned = _bin_series(values, width)
+    if not binned:
+        return [""] * height
+    hi = max_val if (max_val is not None and max_val > 0) else max(binned)
+    if hi <= 0:
+        hi = 1.0
+    total_levels = height * 8
+    rows_out: List[str] = []
+    for row_idx in range(height - 1, -1, -1):
+        row_chars: List[str] = []
+        base_lvl = row_idx * 8
+        for v in binned:
+            norm = max(0.0, min(1.0, v / hi))
+            lvl = int(round(norm * total_levels))
+            if v > 0 and lvl == 0:
+                lvl = 1
+            cell_lvl = max(0, min(8, lvl - base_lvl))
+            row_chars.append(_SPARK_BLOCKS[cell_lvl])
+        rows_out.append(f"[{color}]{''.join(row_chars)}[/{color}]")
+    return rows_out
+
+
+def _series_stats(values: List[float]) -> Tuple[float, float, float, float]:
+    if not values:
+        return 0.0, 0.0, 0.0, 0.0
+    s = sorted(values)
+    p95 = s[min(len(s) - 1, int(0.95 * (len(s) - 1)))]
+    return s[0], sum(values) / len(values), p95, s[-1]
+
+
+def _diagnose_telemetry(summary: Dict[str, Any], is_gpu: bool) -> List[str]:
+    diags: List[str] = []
+    gpu_avg = float(summary.get("gpu_util_avg", 0.0) or 0.0)
+    gpu_bw = float(summary.get("gpu_mem_bw_avg", 0.0) or 0.0)
+    vram_max = float(summary.get("vram_mb_max", 0.0) or 0.0)
+    vram_tot = float(summary.get("vram_total_mb", 0.0) or 0.0)
+    g_temp = float(summary.get("gpu_temp_max_c", 0.0) or 0.0)
+    cpu_avg = float(summary.get("cpu_pct_avg", 0.0) or 0.0)
+    cpu_sys = float(summary.get("cpu_sys_pct_avg", 0.0) or 0.0)
+    iow_pct = float(summary.get("io_wait_pct", 0.0) or 0.0)
+
+    if is_gpu and gpu_avg < 50.0 and (iow_pct > 15.0 or cpu_avg > 90.0):
+        diags.append(
+            f"[bold yellow]⚠ GPU Starvation Detected:[/bold yellow] GPU averaged {gpu_avg:.1f}% utilization "
+            f"while workers spent {iow_pct:.1f}% of samples in Disk/CephFS I/O wait (CPU avg {cpu_avg:.1f}%). "
+            f"Consider increasing DataLoader num_workers, caching dataset in RAM/scratch, or pre-packing files."
+        )
+    if is_gpu and gpu_avg < 60.0 and gpu_bw > 70.0:
+        diags.append(
+            f"[bold cyan]ℹ Memory-Bandwidth Bound:[/bold cyan] High GPU memory controller load ({gpu_bw:.1f}%) "
+            f"with {gpu_avg:.1f}% compute utilization. Consider mixed precision (bf16/fp16) or torch.compile operator fusion."
+        )
+    if is_gpu and vram_tot > 0:
+        vram_pct = vram_max / vram_tot
+        if vram_pct > 0.92:
+            diags.append(
+                f"[bold red]⚠ VRAM OOM Proximity:[/bold red] Peak VRAM reached {vram_max / 1024:.2f}/{vram_tot / 1024:.1f} GB "
+                f"({vram_pct * 100:.0f}%). Reduce batch size or enable gradient checkpointing to avoid OOM."
+            )
+        elif vram_pct < 0.35 and gpu_avg > 20.0:
+            diags.append(
+                f"[cyan]ℹ VRAM Headroom Available:[/cyan] Peak VRAM only used {vram_pct * 100:.0f}% "
+                f"({vram_max / 1024:.2f}/{vram_tot / 1024:.1f} GB). Batch size could potentially be increased."
+            )
+    if is_gpu and g_temp >= 83.0:
+        diags.append(
+            f"[bold red]⚠ Thermal / Clock Throttling Risk:[/bold red] GPU reached {g_temp:.0f}°C."
+        )
+    if cpu_avg > 50.0 and cpu_sys > 0.35 * cpu_avg:
+        diags.append(
+            f"[bold yellow]⚠ Kernel / Syscall Contention:[/bold yellow] System CPU averaged {cpu_sys:.1f}% "
+            f"(>35% of {cpu_avg:.1f}% total CPU), often caused by thread oversubscription or small-file CephFS metadata storms."
+        )
+    if not diags:
+        diags.append("[bold green]✔ Healthy resource utilization profile.[/bold green]")
+    return diags
+
+
+def _build_telemetry_plot_panel(
+    run_dir: Path,
+    data: Dict[str, Any],
+    proc_id: int,
+    rows: List[Dict[str, Any]],
+    width: int = 60,
+) -> Panel:
+    from rich.console import Group
+
+    summary = compute_telemetry_summary(run_dir / "repro" / f"telemetry_{proc_id}.csv", rows=rows) or {}
+    arch = str((data.get("resources_requested") or {}).get("architecture") or "")
+    vtot = float(summary.get("vram_total_mb", 0.0) or 0.0)
+    gmax = float(summary.get("gpu_util_max", 0.0) or 0.0)
+    is_gpu = vtot > 0 or gmax > 0 or arch in ("GPU3090", "A100")
+
+    t_start = str(rows[0].get("timestamp_iso", "") or "")[:19].replace("T", " ")
+    t_end = str(rows[-1].get("timestamp_iso", "") or "")[:19].replace("T", " ")
+    dur_s = max(0.0, float(rows[-1].get("elapsed_s", 0.0) or 0.0) - float(rows[0].get("elapsed_s", 0.0) or 0.0))
+    n_samples = len(rows)
+    cadence = round(dur_s / max(1, n_samples - 1), 1) if n_samples > 1 else 5.0
+    header_line = (
+        f"[bold white]{t_start}[/bold white] [dim]→[/dim] [bold white]{t_end}[/bold white]  "
+        f"[dim]│[/dim]  Duration: [cyan]{format_duration(int(dur_s))}[/cyan]  "
+        f"[dim]│[/dim]  [bold]{n_samples}[/bold] samples @ ~{cadence:g}s"
+    )
+
+    chart_tbl = Table(box=None, show_header=True, header_style="bold dim", pad_edge=False)
+    chart_tbl.add_column("Metric", style="bold cyan", width=18, no_wrap=True)
+    chart_tbl.add_column("Time Series", no_wrap=True)
+    chart_tbl.add_column("Min │ Avg │ P95 │ Max", justify="right", style="white", no_wrap=True)
+
+    def _add_chart(
+        label: str,
+        vals: List[float],
+        color: str,
+        *,
+        max_val: Optional[float] = None,
+        unit: str = "",
+        extra_note: str = "",
+    ) -> None:
+        mn, av, p95, mx = _series_stats(vals)
+        sp_rows = _render_sparkline_rows(vals, width, height=2, max_val=max_val, color=color)
+        stats_str = f"{mn:.1f} │ [bold]{av:.1f}[/bold] │ {p95:.1f} │ {mx:.1f}{unit}"
+        if extra_note:
+            stats_str += f"\n[dim]{extra_note}[/dim]"
+        chart_tbl.add_row(label, "\n".join(sp_rows), stats_str)
+
+    if is_gpu:
+        _add_chart("GPU Compute (%)", [r.get("gpu_util_pct", 0.0) for r in rows], "green", max_val=100.0, unit="%")
+        _add_chart("GPU Mem BW (%)", [r.get("gpu_mem_bw_pct", 0.0) for r in rows], "cyan", max_val=100.0, unit="%")
+        vram_gb = [r.get("vram_used_mb", 0.0) / 1024.0 for r in rows]
+        vtot_gb = vtot / 1024.0 if vtot > 0 else None
+        peak_pct_note = f"Peak {max(vram_gb) / vtot_gb * 100:.0f}% of {vtot_gb:.1f} GB" if vtot_gb else ""
+        _add_chart("GPU VRAM (GB)", vram_gb, "magenta", max_val=vtot_gb, unit="G", extra_note=peak_pct_note)
+        temps = [r.get("gpu_temp_c", 0.0) for r in rows]
+        pwrs = [r.get("gpu_power_w", 0.0) for r in rows]
+        clks = [r.get("gpu_sm_clock_mhz", 0.0) for r in rows]
+        _add_chart(
+            "GPU Power (W)",
+            pwrs,
+            "yellow",
+            unit="W",
+            extra_note=f"Temp max {max(temps):.0f}°C · SM {min(clks):.0f}-{max(clks):.0f} MHz",
+        )
+
+    cpu_tot = [r.get("cpu_total_pct", 0.0) for r in rows]
+    cpu_usr_avg = sum(r.get("cpu_user_pct", 0.0) for r in rows) / n_samples
+    cpu_sys_avg = sum(r.get("cpu_sys_pct", 0.0) for r in rows) / n_samples
+    _add_chart(
+        "CPU Usage (%)",
+        cpu_tot,
+        "blue",
+        unit="%",
+        extra_note=f"usr {cpu_usr_avg:.1f}% / sys {cpu_sys_avg:.1f}%",
+    )
+
+    pss_gb = [r.get("pss_mb", 0.0) / 1024.0 for r in rows]
+    rss_max_gb = max(r.get("rss_mb", 0.0) for r in rows) / 1024.0
+    avail_gb = rows[-1].get("node_ram_avail_mb", 0.0) / 1024.0
+    _add_chart(
+        "Host RAM PSS (GB)",
+        pss_gb,
+        "bright_cyan",
+        unit="G",
+        extra_note=f"RSS max {rss_max_gb:.2f}G · Node free {avail_gb:.1f}G",
+    )
+
+    disk_tot = [r.get("disk_read_mb_s", 0.0) + r.get("disk_write_mb_s", 0.0) for r in rows]
+    iow_pct = float(summary.get("io_wait_pct", 0.0) or 0.0)
+    _add_chart(
+        "Disk I/O (MB/s)",
+        disk_tot,
+        "yellow",
+        unit="M/s",
+        extra_note=f"D-state wait {iow_pct:.1f}% · R {summary.get('disk_read_mb_total', 0.0):.0f}M / W {summary.get('disk_write_mb_total', 0.0):.0f}M",
+    )
+
+    diags = _diagnose_telemetry(summary, is_gpu)
+    diag_panel = Panel(
+        "\n".join(diags),
+        title="[bold cyan]🩺 Automated Bottleneck Diagnosis[/bold cyan]",
+        border_style="dim",
+        expand=True,
+    )
+
+    status_str = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+    return Panel(
+        Group(header_line, "", chart_tbl, "", diag_panel),
+        title=f"[bold cyan]📈 Telemetry — {_format_run_short(run_dir, data)} [proc {proc_id}] ({style_status(status_str)})[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    )
+
+
+def _find_matplotlib_python(data: Dict[str, Any], runs_root: Path) -> Optional[str]:
+    from hermes_tools.core import discover_project_venv, resolve_submit_python
+
+    candidates: List[str] = [sys.executable]
+    sub_venv = (data.get("submission") or {}).get("venv")
+    if sub_venv:
+        vp = Path(str(sub_venv))
+        for py in (vp / "bin" / "python", vp / "Scripts" / "python.exe"):
+            if py.is_file():
+                candidates.append(str(py))
+    env_venv = os.environ.get("VIRTUAL_ENV")
+    if env_venv:
+        vp = Path(env_venv)
+        for py in (vp / "bin" / "python", vp / "Scripts" / "python.exe"):
+            if py.is_file():
+                candidates.append(str(py))
+    proj_venv = discover_project_venv(runs_root.parent)
+    if proj_venv:
+        for py in (proj_venv / "bin" / "python", proj_venv / "Scripts" / "python.exe"):
+            if py.is_file():
+                candidates.append(str(py))
+    sub_py = resolve_submit_python()
+    if sub_py:
+        candidates.append(sub_py)
+
+    seen = set()
+    for py in candidates:
+        if not py or py in seen:
+            continue
+        seen.add(py)
+        try:
+            chk = subprocess.run(
+                [py, "-c", "import matplotlib"],
+                capture_output=True,
+                timeout=5,
+            )
+            if chk.returncode == 0:
+                return py
+        except Exception:
+            continue
+    return None
+
+
+def _save_telemetry_matplotlib(
+    csv_path: Path,
+    out_path: Path,
+    title: str,
+    is_gpu: bool,
+    data: Dict[str, Any],
+    runs_root: Path,
+) -> bool:
+    py_exe = _find_matplotlib_python(data, runs_root)
+    if not py_exe:
+        console.print(
+            "[bold red]✘ Could not find `matplotlib` in the current or project Python environment.[/bold red]\n"
+            "  Install it (`uv pip install matplotlib`) to enable `--save`."
+        )
+        return False
+
+    plot_script = """
+import csv, sys
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+csv_path, out_path, title, is_gpu_str = sys.argv[1:5]
+is_gpu = is_gpu_str == "1"
+with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+    rows = list(csv.DictReader(fh))
+if not rows:
+    sys.exit(2)
+
+def col(k):
+    return [float(r.get(k, 0.0) or 0.0) for r in rows]
+
+t_min = [x / 60.0 for x in col("elapsed_s")]
+n_panels = 5 if is_gpu else 3
+fig, axes = plt.subplots(n_panels, 1, figsize=(12, 10), dpi=200, sharex=True)
+fig.suptitle(title, fontsize=13, fontweight="bold")
+ax_i = 0
+
+if is_gpu:
+    ax = axes[ax_i]; ax_i += 1
+    ax.plot(t_min, col("gpu_util_pct"), label="GPU Compute %", color="#2ca02c", lw=1.6)
+    ax.plot(t_min, col("gpu_mem_bw_pct"), label="GPU Mem BW %", color="#17becf", lw=1.2, alpha=0.85)
+    ax.set_ylim(0, 105)
+    ax.set_ylabel("GPU %")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right", fontsize=8)
+
+ax = axes[ax_i]; ax_i += 1
+if is_gpu:
+    vram_gb = [x / 1024.0 for x in col("vram_used_mb")]
+    vtot_gb = max(col("vram_total_mb")) / 1024.0
+    ax.plot(t_min, vram_gb, label="VRAM Used (GB)", color="#9467bd", lw=1.6)
+    if vtot_gb > 0:
+        ax.axhline(vtot_gb, color="#9467bd", ls="--", lw=1.0, alpha=0.6, label=f"VRAM Limit ({vtot_gb:.1f} GB)")
+ax.plot(t_min, [x / 1024.0 for x in col("pss_mb")], label="Host PSS (GB)", color="#1f77b4", lw=1.4)
+ax.plot(t_min, [x / 1024.0 for x in col("rss_mb")], label="Host RSS (GB)", color="#aec7e8", lw=1.0, ls=":")
+ax.set_ylabel("Memory (GB)")
+ax.grid(True, alpha=0.25)
+ax.legend(loc="upper right", fontsize=8)
+
+ax = axes[ax_i]; ax_i += 1
+ax.plot(t_min, col("cpu_total_pct"), label="CPU Total %", color="#1f77b4", lw=1.5)
+ax.plot(t_min, col("cpu_sys_pct"), label="CPU Sys %", color="#ff7f0e", lw=1.2, alpha=0.85)
+ax2 = ax.twinx()
+ax2.plot(t_min, col("node_load_1m"), label="Load 1m", color="#7f7f7f", lw=1.0, ls="--", alpha=0.7)
+ax.set_ylabel("CPU %")
+ax2.set_ylabel("Load 1m")
+ax.grid(True, alpha=0.25)
+ax.legend(loc="upper left", fontsize=8)
+ax2.legend(loc="upper right", fontsize=8)
+
+ax = axes[ax_i]; ax_i += 1
+ax.plot(t_min, col("disk_read_mb_s"), label="Disk Read (MB/s)", color="#2ca02c", lw=1.4)
+ax.plot(t_min, col("disk_write_mb_s"), label="Disk Write (MB/s)", color="#d62728", lw=1.2)
+iow = col("io_wait_procs")
+for idx_i, w in enumerate(iow):
+    if w > 0 and idx_i + 1 < len(t_min):
+        ax.axvspan(t_min[idx_i], t_min[idx_i + 1], color="#ff9896", alpha=0.25)
+ax.set_ylabel("Disk I/O (MB/s)")
+ax.grid(True, alpha=0.25)
+ax.legend(loc="upper right", fontsize=8)
+
+if is_gpu:
+    ax = axes[ax_i]; ax_i += 1
+    ax.plot(t_min, col("gpu_power_w"), label="Power (W)", color="#ff7f0e", lw=1.4)
+    ax.plot(t_min, col("gpu_temp_c"), label="Temp (°C)", color="#d62728", lw=1.2)
+    ax2 = ax.twinx()
+    ax2.plot(t_min, col("gpu_sm_clock_mhz"), label="SM Clock (MHz)", color="#8c564b", lw=1.0, alpha=0.8)
+    ax.set_ylabel("Power / Temp")
+    ax2.set_ylabel("Clock (MHz)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left", fontsize=8)
+    ax2.legend(loc="upper right", fontsize=8)
+
+axes[-1].set_xlabel("Elapsed Time (minutes)")
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+fig.savefig(out_path, dpi=200)
+"""
+    res = subprocess.run(
+        [py_exe, "-c", plot_script, str(csv_path), str(out_path), title, "1" if is_gpu else "0"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if res.returncode != 0:
+        console.print(f"[bold red]✘ Matplotlib export failed:[/bold red] {(res.stderr or res.stdout).strip()}")
+        return False
+    console.print(f"[bold green]✔ Saved telemetry figure:[/bold green] {out_path.resolve()}")
+    return True
+
+
+def cmd_plot(args: argparse.Namespace, runs_root: Path) -> None:
+    run_dir = resolve_run_dir(runs_root, getattr(args, "run", None) or "latest")
+    proc_id = int(getattr(args, "proc", 0) or 0)
+    width = int(getattr(args, "width", 60) or 60)
+    watch = bool(getattr(args, "watch", False))
+    interval = max(1, int(getattr(args, "interval", 5) or 5))
+    save_arg = getattr(args, "save", None)
+
+    raw_data = load_run_json(run_dir)
+    if run_needs_live_reconcile(raw_data):
+        data = reconcile_run(run_dir, raw_data, query_live_condor_clusters())
+    else:
+        data = raw_data
+
+    telem_csv = run_dir / "repro" / f"telemetry_{proc_id}.csv"
+    status_str = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+    is_active = status_str.startswith(("WAITING", "QUEUED", "RUNNING", "HELD"))
+
+    if not telem_csv.is_file():
+        if watch and is_active:
+            console.print(
+                f"[cyan]⏳ Waiting for first telemetry flush ([bold]{telem_csv.name}[/bold], flushes every 60s)...[/cyan]"
+            )
+            try:
+                while not telem_csv.is_file():
+                    time.sleep(interval)
+                    raw_d = load_run_json(run_dir)
+                    if run_needs_live_reconcile(raw_d):
+                        data = reconcile_run(run_dir, raw_d, query_live_condor_clusters())
+                    st_now = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+                    if not st_now.startswith(("WAITING", "QUEUED", "RUNNING", "HELD")) and not telem_csv.is_file():
+                        console.print(f"[yellow]Run finished ({st_now}) with no telemetry CSV recorded.[/yellow]")
+                        return
+            except KeyboardInterrupt:
+                return
+        else:
+            if is_active:
+                console.print(
+                    f"[yellow]⏳ Telemetry file [bold]{telem_csv.name}[/bold] not flushed yet (syncs every 60s).[/yellow]\n"
+                    f"  Run with [bold cyan]--watch[/bold cyan] to wait and stream live charts."
+                )
+            else:
+                console.print(f"[yellow]No telemetry CSV found at {telem_csv}.[/yellow]")
+            return
+
+    if watch:
+        from rich.live import Live
+
+        try:
+            with Live(console=console, auto_refresh=False) as live:
+                while True:
+                    raw_d = load_run_json(run_dir)
+                    if run_needs_live_reconcile(raw_d):
+                        data = reconcile_run(run_dir, raw_d, query_live_condor_clusters())
+                    else:
+                        data = raw_d
+                    rows = read_telemetry_csv(telem_csv)
+                    if rows:
+                        live.update(
+                            _build_telemetry_plot_panel(run_dir, data, proc_id, rows, width=width),
+                            refresh=True,
+                        )
+                    st_now = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+                    if not st_now.startswith(("WAITING", "QUEUED", "RUNNING", "HELD")):
+                        break
+                    time.sleep(interval)
+        except KeyboardInterrupt:
+            return
+    else:
+        rows = read_telemetry_csv(telem_csv)
+        if not rows:
+            console.print(f"[yellow]Telemetry file {telem_csv.name} has no samples yet.[/yellow]")
+            return
+        console.print(_build_telemetry_plot_panel(run_dir, data, proc_id, rows, width=width))
+
+    if save_arg is not None:
+        out_path = (
+            run_dir / f"telemetry_{proc_id}.png"
+            if save_arg == "__AUTO__"
+            else Path(save_arg)
+        )
+        plain_label, _, short_date = _extract_run_display_parts(run_dir, data)
+        arch = str((data.get("resources_requested") or {}).get("architecture") or "")
+        rows_for_save = read_telemetry_csv(telem_csv)
+        is_gpu = (
+            any(float(r.get("vram_total_mb", 0.0) or 0.0) > 0 or float(r.get("gpu_util_pct", 0.0) or 0.0) > 0 for r in rows_for_save)
+            or arch in ("GPU3090", "A100")
+        )
+        _save_telemetry_matplotlib(
+            telem_csv,
+            out_path,
+            f"{plain_label} ({short_date}) — proc {proc_id}",
+            is_gpu,
+            data,
+            runs_root,
+        )
+
+
 def cmd_path(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(runs_root, getattr(args, "run", None) or "latest")
     if getattr(args, "code", False):
@@ -2134,6 +2653,10 @@ def cmd_path(args: argparse.Namespace, runs_root: Path) -> None:
         target_path = run_dir / "repro"
     elif getattr(args, "json", False):
         target_path = run_dir / "run.json"
+    elif getattr(args, "telemetry", False):
+        proc_idx = getattr(args, "proc", None)
+        proc_id = 0 if proc_idx is None else int(proc_idx)
+        target_path = run_dir / "repro" / f"telemetry_{proc_id}.csv"
     elif getattr(args, "out", False) or getattr(args, "err", False) or getattr(args, "condor", False):
         data = load_run_json(run_dir)
         target_path = _resolve_run_log_file(
@@ -2243,7 +2766,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_path.add_argument("-e", "--err", action="store_true", help="Print path to stderr (.err) log file")
     p_path.add_argument("--condor", action="store_true", help="Print path to repro/condor.log")
     p_path.add_argument("-j", "--json", action="store_true", help="Print path to run.json")
+    p_path.add_argument("-t", "--telemetry", action="store_true", help="Print path to repro/telemetry_<proc>.csv")
     p_path.add_argument("-p", "--proc", type=int, help="Process index for sweep log files")
+
+    p_plot = sub.add_parser(
+        "plot",
+        aliases=["telemetry", "chart"],
+        help="Visualize 5s hardware & I/O telemetry time-series with bottleneck diagnosis",
+    )
+    p_plot.add_argument(
+        "run", nargs="?", default="latest", help="Run ID, index (#), cluster ID, or 'latest' (default)"
+    )
+    p_plot.add_argument("-p", "--proc", type=int, default=0, help="Process index for sweeps (default: 0)")
+    p_plot.add_argument("-w", "--watch", action="store_true", help="Live-refresh terminal plot while active")
+    p_plot.add_argument("-i", "--interval", type=int, default=5, help="Refresh interval for --watch (default: 5s)")
+    p_plot.add_argument("--width", type=int, default=60, help="Width of terminal charts in characters (default: 60)")
+    p_plot.add_argument(
+        "-s",
+        "--save",
+        nargs="?",
+        const="__AUTO__",
+        default=None,
+        help="Save high-res multi-panel figure via matplotlib (default: <run_dir>/telemetry_<proc>.png)",
+    )
 
     p_log = sub.add_parser("logs", aliases=["tail"], help="View or follow stdout/stderr/condor logs")
     p_log.add_argument("run", nargs="?", default="latest", help="Run ID, index (#), or 'latest'")
@@ -2388,6 +2933,8 @@ def main() -> None:
         cmd_ssh(args, runs_root)
     elif cmd in ("path", "dir", "where"):
         cmd_path(args, runs_root)
+    elif cmd in ("plot", "telemetry", "chart"):
+        cmd_plot(args, runs_root)
     elif cmd in ("logs", "tail"):
         cmd_logs(args, runs_root)
     elif cmd in ("retry", "resume", "continue"):

@@ -2181,3 +2181,104 @@ def test_dagman_survives_site_condor_submit_wrapper(tmp_path: Path) -> None:
     dag_lines = dag.splitlines()
     assert dag_lines[1].startswith("CONFIG ") and dag_lines[1].endswith("dagman.config")
     assert dag_lines[2].startswith("JOB main ")
+
+
+def test_job_sh_contains_telemetry_daemon_and_teardown(tmp_path: Path) -> None:
+    from hermes_tools.condor import generate_bash_wrapper
+
+    run_dir = tmp_path / "runs" / "2026-11-13_12-00-00_telem_GPU3090"
+    repro_dir = run_dir / "repro"
+    repro_dir.mkdir(parents=True)
+    sh = generate_bash_wrapper(
+        exec_type="python",
+        target_exec_path=repro_dir / "code" / "train.py",
+        venv_path=None,
+        pythonpath_dir=repro_dir / "code",
+        project_cwd=tmp_path,
+        run_dir=run_dir,
+        repro_dir=repro_dir,
+        submit_epoch=1700000000,
+        sweep_count=1,
+        requested_cpus=4,
+    )
+    assert "TELEM_TMP=" in sh
+    assert "TELEM_PID=$!" in sh
+    assert 'kill -TERM "${TELEM_PID}"' in sh
+    assert 'wait "${TELEM_PID}"' in sh
+    assert "timestamp_iso,epoch,elapsed_s,num_procs,num_threads,io_wait_procs" in sh
+    assert "gpu_sm_clock_mhz" in sh
+    assert sh.index('wait "${TELEM_PID}"') < sh.index("UPD_RUN_JSON")
+
+
+def test_runs_plot_and_path_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    import argparse
+    import hermes_tools.condor as condor
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "2026-11-13_12-10-00_train_GPU3090_exp1"
+    repro = run_dir / "repro"
+    repro.mkdir(parents=True)
+
+    header = (
+        "timestamp_iso,epoch,elapsed_s,num_procs,num_threads,io_wait_procs,"
+        "cpu_total_pct,cpu_user_pct,cpu_sys_pct,rss_mb,pss_mb,node_ram_avail_mb,"
+        "node_load_1m,io_read_mb_s,io_write_mb_s,disk_read_mb_s,disk_write_mb_s,"
+        "maj_faults_delta,gpu_util_pct,gpu_mem_bw_pct,vram_used_mb,vram_total_mb,"
+        "gpu_temp_c,gpu_power_w,gpu_sm_clock_mhz\n"
+    )
+    rows_txt = []
+    for i in range(15):
+        rows_txt.append(
+            f"2026-11-13T12:10:{i * 5:02d}+01:00,{1700000000 + i * 5:.1f},{i * 5:.1f},5,16,1,"
+            f"145.0,110.0,35.0,4096.0,2048.0,64000.0,4.20,120.000,5.000,85.000,2.000,0,"
+            f"28.0,22.0,6144.0,24576.0,61.0,145.0,1695.0\n"
+        )
+    telem_csv = repro / "telemetry_0.csv"
+    telem_csv.write_text(header + "".join(rows_txt), encoding="utf-8")
+
+    summary = condor.compute_telemetry_summary(telem_csv)
+    assert summary is not None
+    assert summary["samples"] == 15
+    assert summary["gpu_util_avg"] == 28.0
+    assert summary["io_wait_pct"] == 100.0
+
+    rj = {
+        "run_id": run_dir.name,
+        "status": "COMPLETED",
+        "submission": {"target": "train.py", "tag": "exp1", "cluster_id": 9001},
+        "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+        "executions": [
+            {
+                "process_id": 0,
+                "exit_code": 0,
+                "runtime_seconds": 75,
+                "peak_ram_mb": 2048.0,
+                "telemetry_file": "repro/telemetry_0.csv",
+                "telemetry_summary": summary,
+            }
+        ],
+    }
+    atomic_write_json(run_dir / "run.json", rj, repro)
+
+    # Test `runs path -t`
+    runs_cli.cmd_path(
+        argparse.Namespace(run="1", code=False, repro=False, json=False, out=False, err=False, condor=False, telemetry=True, proc=0),
+        runs_root,
+    )
+    path_out = capsys.readouterr().out.strip()
+    assert Path(path_out).resolve() == telem_csv.resolve()
+
+    # Test `runs plot 1`
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+    runs_cli.cmd_plot(
+        argparse.Namespace(run="1", proc=0, watch=False, interval=5, width=40, save=None),
+        runs_root,
+    )
+    plot_out = capsys.readouterr().out
+    assert "GPU Compute (%)" in plot_out
+    assert "Host RAM PSS (GB)" in plot_out
+    assert "Disk I/O (MB/s)" in plot_out
+    assert "GPU Starvation Detected" in plot_out
