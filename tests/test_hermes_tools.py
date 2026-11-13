@@ -304,9 +304,12 @@ def test_end_to_end_send_dry_run_and_runs_cli(tmp_path: Path) -> None:
     assert rj["resources_requested"]["sweep_count"] == 1
 
     # Verify `runs ls` and `runs inspect`
+    import os
+
     res_ls = subprocess.run(
         [sys.executable, "-m", "hermes_tools.runs_cli", "ls"],
         cwd=tmp_path,
+        env={**os.environ, "COLUMNS": "140"},
         capture_output=True,
         text=True,
         encoding="utf-8",

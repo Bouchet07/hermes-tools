@@ -52,7 +52,6 @@ from hermes_tools.core import (
     set_execution_records,
     style_status,
     summarize_metrics,
-    sync_live_update,
     tail_file_lines,
     update_latest_symlink,
     write_text_lf,
@@ -240,20 +239,20 @@ def _build_ls_table_with_state(
         header_style="bold cyan",
     )
     table.add_column("#", style="dim", justify="right", no_wrap=True)
-    table.add_column("Run")
+    table.add_column("Run", no_wrap=True, overflow="ellipsis", max_width=32)
     table.add_column("Submitted", style="dim", no_wrap=True)
     table.add_column("Cluster", style="cyan", justify="right", no_wrap=True)
     table.add_column("Arch", style="magenta", no_wrap=True)
     table.add_column("Status", no_wrap=True)
-    table.add_column("Tasks", justify="center")
-    table.add_column("Host(s)", style="dim")
-    table.add_column("Wall Time", justify="right")
-    table.add_column("Peak RAM", justify="right")
+    table.add_column("Tasks", justify="center", no_wrap=True)
+    table.add_column("Host(s)", style="dim", no_wrap=True, overflow="ellipsis", max_width=18)
+    table.add_column("Wall Time", justify="right", no_wrap=True)
+    table.add_column("Peak RAM", justify="right", no_wrap=True)
 
     shown = 0
     limit = getattr(args, "limit", 25)
     if getattr(args, "watch", False) and limit:
-        limit = get_watch_row_limit(limit, chrome_lines=7)
+        limit = get_watch_row_limit(limit, chrome_lines=6)
     status_filter = getattr(args, "status", None)
     status_upper = status_filter.upper() if status_filter else None
     tag_filter = getattr(args, "tag", None)
@@ -332,7 +331,7 @@ def _build_ls_table_with_state(
 
         host_str, dur_str, ram_str = summarize_metrics(data)
         name_label = (
-            f"{rich_label} [bold yellow]★[/bold yellow]" if d == latest_target else rich_label
+            f"[bold yellow]★[/bold yellow] {rich_label}" if d == latest_target else rich_label
         )
 
         row_cells = (
@@ -375,13 +374,13 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
         initial_table, last_sig = _build_ls_table_with_state(
             args, runs_root, terminal_cache
         )
+        current_view = initial_table
         try:
             with Live(
                 initial_table,
                 console=console,
+                screen=True,
                 auto_refresh=False,
-                screen=False,
-                vertical_overflow="crop",
             ) as live:
                 while True:
                     time.sleep(interval)
@@ -390,8 +389,10 @@ def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
                     )
                     if new_sig != last_sig:
                         last_sig = new_sig
-                        sync_live_update(live, new_table)
+                        current_view = new_table
+                        live.update(new_table, refresh=True)
         except KeyboardInterrupt:
+            console.print(current_view)
             return
     else:
         console.print(_build_ls_table(args, runs_root))
@@ -1707,12 +1708,13 @@ def cmd_nodes(args: argparse.Namespace, runs_root: Optional[Path] = None) -> Non
 
         interval = max(1, int(getattr(args, "interval", 2) or 2))
         initial_view, last_sig = _build_nodes_view(args, nodes, cluster_map=cluster_map)
+        current_view = initial_view
         try:
             with Live(
                 initial_view,
                 console=console,
+                screen=True,
                 auto_refresh=False,
-                vertical_overflow="crop",
             ) as live:
                 while True:
                     time.sleep(interval)
@@ -1726,8 +1728,10 @@ def cmd_nodes(args: argparse.Namespace, runs_root: Optional[Path] = None) -> Non
                     new_view, new_sig = _build_nodes_view(args, fresh_nodes, cluster_map=cluster_map)
                     if new_sig != last_sig:
                         last_sig = new_sig
-                        sync_live_update(live, new_view)
+                        current_view = new_view
+                        live.update(new_view, refresh=True)
         except KeyboardInterrupt:
+            console.print(current_view)
             return
     else:
         view, _ = _build_nodes_view(args, nodes, cluster_map=cluster_map)
@@ -2172,19 +2176,25 @@ def cmd_top(args: argparse.Namespace, runs_root: Path) -> None:
         console.print(
             f"[dim]Connecting live telemetry stream to Job {job_target} via condor_ssh_to_job (Ctrl-C to exit)...[/dim]"
         )
+        current_view: Optional[Panel] = None
+        got_any = False
         try:
-            with Live(console=console, auto_refresh=False, vertical_overflow="crop") as live:
-                got_any = False
+            with Live(console=console, screen=True, auto_refresh=False) as live:
                 for frame in stream_job_live_telemetry(job_target, interval=interval):
                     got_any = True
                     panel = _build_live_telemetry_panel(job_target, frame, run_name=run_name, arch=arch)
-                    sync_live_update(live, panel)
-                if not got_any:
-                    console.print(
-                        f"[yellow]⚠ Could not establish telemetry stream to Job {job_target} (job may have finished).[/yellow]"
-                    )
+                    current_view = panel
+                    live.update(panel, refresh=True)
         except KeyboardInterrupt:
+            if current_view is not None:
+                console.print(current_view)
             return
+        if current_view is not None:
+            console.print(current_view)
+        elif not got_any:
+            console.print(
+                f"[yellow]⚠ Could not establish telemetry stream to Job {job_target} (job may have finished).[/yellow]"
+            )
     else:
         try:
             frame = query_job_live_telemetry(job_target)
@@ -2635,8 +2645,9 @@ def cmd_plot(args: argparse.Namespace, runs_root: Path) -> None:
     if watch:
         from rich.live import Live
 
+        current_view: Optional[Panel] = None
         try:
-            with Live(console=console, auto_refresh=False, vertical_overflow="crop") as live:
+            with Live(console=console, screen=True, auto_refresh=False) as live:
                 while True:
                     raw_d = load_run_json(run_dir)
                     if run_needs_live_reconcile(raw_d):
@@ -2645,16 +2656,20 @@ def cmd_plot(args: argparse.Namespace, runs_root: Path) -> None:
                         data = raw_d
                     rows = read_telemetry_csv(telem_csv)
                     if rows:
-                        sync_live_update(
-                            live,
-                            _build_telemetry_plot_panel(run_dir, data, proc_id, rows, width=width),
+                        current_view = _build_telemetry_plot_panel(
+                            run_dir, data, proc_id, rows, width=width
                         )
+                        live.update(current_view, refresh=True)
                     st_now = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
                     if not st_now.startswith(("WAITING", "QUEUED", "RUNNING", "HELD")):
                         break
                     time.sleep(interval)
         except KeyboardInterrupt:
+            if current_view is not None:
+                console.print(current_view)
             return
+        if current_view is not None:
+            console.print(current_view)
     else:
         rows = read_telemetry_csv(telem_csv)
         if not rows:
