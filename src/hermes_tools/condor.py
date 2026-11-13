@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from hermes_tools.core import (
     console,
@@ -1095,7 +1095,8 @@ def build_send_command_tokens(
     cpus: Optional[int] = None,
     mem_mb: Optional[int] = None,
     gpus: Optional[int] = None,
-    tag: Optional[str] = None,
+    tag: Optional[Union[str, List[str]]] = None,
+    no_tag: bool = False,
     no_venv: bool = False,
     venv: Optional[str] = None,
     nodes_include: Optional[List[str]] = None,
@@ -1122,7 +1123,13 @@ def build_send_command_tokens(
         cmd.extend(["-m", mem_str])
     if gpus and arch != "GPU3090":
         cmd.extend(["-g", str(gpus)])
-    if tag:
+    if no_tag:
+        cmd.append("--no-tag")
+    elif isinstance(tag, list):
+        for t_item in tag:
+            if t_item:
+                cmd.extend(["-t", str(t_item)])
+    elif tag:
         cmd.extend(["-t", str(tag)])
     if no_venv:
         cmd.append("--no-venv")

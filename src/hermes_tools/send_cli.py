@@ -120,7 +120,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Split sweep into separate sequential runs chained via --after (one run per sweep item)",
     )
     parser.add_argument(
-        "-t", "--tag", type=str, default="", help="Optional tag appended to the run directory name"
+        "-t",
+        "--tag",
+        action="append",
+        default=[],
+        help="Optional tag(s) for run directory (repeatable or '{a,b,c}' / 'a,b,c' for --chain)",
+    )
+    parser.add_argument(
+        "--no-tag",
+        action="store_true",
+        help="Do not auto-derive tags from sweep arguments when using --chain",
     )
     parser.add_argument(
         "--venv", type=str, help="Explicit path to virtual environment (auto-detected by default)"
@@ -501,8 +510,8 @@ def _resolve_sweeps_and_tag(
     proj_cfg: Dict[str, Any],
     passthrough_args: str,
     interactive_mode: bool,
-) -> tuple[str, List[str], List[str], List[str], str]:
-    """Resolves single/sweep arguments and run tag, returning (combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, tag)."""
+) -> tuple[str, List[str], List[str], List[str], str, List[str]]:
+    """Resolves single/sweep arguments and run tag(s), returning (combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, base_tag, tag_list)."""
     combined_single_args = " ".join(
         x for x in [args.args.strip(), passthrough_args.strip()] if x
     ).strip()
@@ -555,8 +564,17 @@ def _resolve_sweeps_and_tag(
         if s_arg:
             format_condor_arg_line(s_arg)
 
-    raw_tag = args.tag.strip() or str(proj_cfg.get("tag", "")).strip()
-    if interactive_mode and not raw_tag:
+    no_tag_requested = bool(getattr(args, "no_tag", False))
+    raw_tag_inputs: List[str] = list(args.tag) if isinstance(args.tag, list) else ([args.tag] if args.tag else [])
+    if len(raw_tag_inputs) == 1 and raw_tag_inputs[0].strip().lower() in ("none", ""):
+        no_tag_requested = True
+
+    if not raw_tag_inputs and not no_tag_requested:
+        cfg_tag = str(proj_cfg.get("tag", "")).strip()
+        if cfg_tag:
+            raw_tag_inputs = [cfg_tag]
+
+    if interactive_mode and not raw_tag_inputs and not no_tag_requested:
         import questionary
 
         ans_tag = questionary.text(
@@ -566,9 +584,37 @@ def _resolve_sweeps_and_tag(
         ).ask()
         if ans_tag is None:
             sys.exit(0)
-        raw_tag = ans_tag.strip()
+        if ans_tag.strip():
+            raw_tag_inputs = [ans_tag.strip()]
 
-    return combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, sanitize_tag(raw_tag)
+    tag_list: List[str] = []
+    if not no_tag_requested:
+        for t_raw in raw_tag_inputs:
+            t_str = str(t_raw).strip()
+            if not t_str or t_str.lower() == "none":
+                continue
+            if "{" in t_str or ";" in t_str:
+                expanded_t = expand_arg_sweeps(t_str)
+            elif "," in t_str:
+                expanded_t = [p.strip() for p in t_str.split(",")]
+            else:
+                expanded_t = [t_str]
+            for tok in expanded_t:
+                cleaned = sanitize_tag(tok)
+                if cleaned:
+                    tag_list.append(cleaned)
+
+    if no_tag_requested:
+        tag_list = []
+        base_tag = ""
+    else:
+        base_tag = (
+            tag_list[0]
+            if len(tag_list) == 1
+            else ("_".join(tag_list) if tag_list and not getattr(args, "chain", False) else "")
+        )
+
+    return combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, base_tag, tag_list
 
 
 def _render_submission_summary(
@@ -968,8 +1014,12 @@ def main() -> None:
         args, proj_cfg, interactive_mode
     )
 
-    combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, tag = _resolve_sweeps_and_tag(
+    combined_single_args, sweep_list, raw_sweep_items, cli_sweep_specs, tag, tag_list = _resolve_sweeps_and_tag(
         args, proj_cfg, passthrough_args, interactive_mode
+    )
+    no_tag_flag = bool(
+        getattr(args, "no_tag", False)
+        or (len(args.tag) == 1 and str(args.tag[0]).strip().lower() in ("none", ""))
     )
 
     if source_run_dir is not None and source_data is not None:
@@ -996,7 +1046,8 @@ def main() -> None:
         cpus=cpus,
         mem_mb=mem_mb,
         gpus=gpus,
-        tag=tag or None,
+        tag=(tag_list if (is_chained_sweep and len(tag_list) > 1) else (tag or None)),
+        no_tag=no_tag_flag,
         no_venv=no_venv_flag,
         venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
         nodes_include=nodes_include,
@@ -1049,13 +1100,37 @@ def main() -> None:
     step_tags: List[str] = []
     step_run_ids: List[str] = []
     if is_chained_sweep:
+        if not no_tag_flag and len(tag_list) > 1 and len(tag_list) != len(sweep_list):
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Provided {len(tag_list)} tags {tag_list}, "
+                f"but sweep has {len(sweep_list)} items."
+            )
+            sys.exit(1)
+
         used_ids = set()
         for idx in range(len(sweep_list)):
             raw_item = raw_sweep_items[idx] if idx < len(raw_sweep_items) else sweep_list[idx]
-            st_tag = _derive_sweep_item_tag(tag, raw_item, idx)
-            cand_id = f"{ts_str}_{target_path.stem}_{arch}_{st_tag}"
-            if cand_id in used_ids or (runs_root / cand_id).exists():
-                cand_id = f"{cand_id}_{idx}"
+            if no_tag_flag:
+                st_tag = ""
+            elif len(tag_list) > 1:
+                st_tag = tag_list[idx]
+            else:
+                st_tag = _derive_sweep_item_tag(tag, raw_item, idx)
+
+            if st_tag:
+                cand_id = f"{ts_str}_{target_path.stem}_{arch}_{st_tag}"
+                if cand_id in used_ids or (runs_root / cand_id).exists():
+                    cand_id = f"{cand_id}_{idx}"
+            else:
+                offset_sec = idx
+                while True:
+                    step_ts = (now + datetime.timedelta(seconds=offset_sec)).strftime(
+                        "%Y-%m-%d_%H-%M-%S"
+                    )
+                    cand_id = f"{step_ts}_{target_path.stem}_{arch}"
+                    if cand_id not in used_ids and not (runs_root / cand_id).exists():
+                        break
+                    offset_sec += 1
             used_ids.add(cand_id)
             step_tags.append(st_tag)
             step_run_ids.append(cand_id)
@@ -1164,6 +1239,7 @@ def main() -> None:
                 mem_mb=mem_mb,
                 gpus=gpus,
                 tag=step_tag or None,
+                no_tag=no_tag_flag if not step_tag else False,
                 no_venv=no_venv_flag,
                 venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
                 nodes_include=nodes_include,
@@ -1327,8 +1403,9 @@ def main() -> None:
         for idx, (r_dir, cid, st, s_tag) in enumerate(created_runs, start=1):
             cid_disp = f"#{cid}" if cid else "dry"
             st_color = "cyan" if st == "QUEUED" else ("blue" if st == "WAITING" else "yellow")
+            tag_part = f" ({s_tag})" if s_tag else ""
             chain_lines.append(
-                f"  {idx}. [bold]{r_dir.name}[/bold] ({s_tag}) — [{st_color}]{st}[/{st_color}] [{cid_disp}]"
+                f"  {idx}. [bold]{r_dir.name}[/bold]{tag_part} — [{st_color}]{st}[/{st_color}] [{cid_disp}]"
             )
         console.print(
             Panel(

@@ -90,7 +90,8 @@ send train.py -a GPU3090 --dry-run                  # Generate capsule without s
 | `--sweep-file` | `path` | `None` | Text file with one argument string per line (`#` comments and blank lines ignored). |
 | `-j`, `--max-parallel` | `int` | `None` | Limit concurrent sweep processes in a single array (`max_idle = K` in `job.sub`). |
 | `--chain`, `--seq` | `flag` | `False` | Split sweep into separate sequential runs chained via `--after` (one run directory per sweep item, with auto-derived tags). |
-| `-t`, `--tag` | `str` | `""` | Optional suffix sanitized and appended to the run folder: `<timestamp>_<script>_<arch>_<tag>`. |
+| `-t`, `--tag` | `str` (repeatable) | `[]` | Optional tag(s) appended to run folder (`<timestamp>_<script>_<arch>_<tag>`). Supports `-t 'a,b,c'`, `-t '{a,b,c}'`, or repeatable `-t` for `--chain`. |
+| `--no-tag` | `flag` | `False` | Do not auto-derive tags from sweep arguments when using `--chain` (produces clean `<timestamp>_<script>_<arch>` folders). |
 | `--venv` | `path` | Auto-discovered | Explicit path to a Python virtual environment or Conda environment. |
 | `--no-venv` | `flag` | `False` | Do not activate a virtual environment; run with the submitter's default Python 3. |
 | `--node` | `str` (repeatable) | `[]` | Restrict execution to specific worker node(s), e.g. `--node nv3090-01` (auto-appends `.i3a.es`). |
@@ -144,9 +145,11 @@ Use `-s` / `--sweep` or `--sweep-file` to queue a single HTCondor cluster with m
   ```bash
   send train.py -a GPU3090 -s '--lr {1e-3,1e-4} --bs {32,64}' -j 2
   ```
-- **Sequential chained sweeps (`--chain` / `--seq`)**: Split a sweep into separate single-job run directories with auto-derived tags (`age`, `lab`, `survival`) and chain them sequentially via DAGMan (add `--after-ok` to stop the chain on failure):
+- **Sequential chained sweeps (`--chain` / `--seq`)**: Split a sweep into separate single-job run directories with auto-derived tags (`age`, `lab`, `survival`), custom per-run tags (`-t 't1,t2,t3'` / `-t '{t1,t2,t3}'`), or no tags (`--no-tag`), and chain them sequentially via DAGMan (add `--after-ok` to stop the chain on failure):
   ```bash
   send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain --after-ok -y
+  send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain -t 'prep,train,eval'
+  send all_pipeline.py -a GPU3090 -s '--task {age,lab,survival}' --chain --no-tag
   ```
 
 ### 2.5 Passing Script Arguments Safely (`--` vs `--args` vs `-s`)

@@ -2782,4 +2782,78 @@ def test_stop_cascades_to_downstream_chained_runs(
     assert load_run_json(run2)["status"].startswith("CANCELLED")
 
 
+def test_send_chain_explicit_tags_and_no_tag(tmp_path: Path) -> None:
+    """Verifies send --chain supports explicit per-run tag lists (-t 'a,b,c') and --no-tag clean folders."""
+    from hermes_tools.runs_cli import _extract_run_display_parts
+
+    script = tmp_path / "all_pipeline.py"
+    script.write_text("print('pipeline')\n", encoding="utf-8")
+
+    # 1. Explicit per-run comma-separated tags
+    proj1 = tmp_path / "proj_explicit"
+    proj1.mkdir()
+    res1 = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            str(script),
+            "-a",
+            "GPU3090",
+            "-s",
+            "--task {age,lab,survival}",
+            "--chain",
+            "-t",
+            "t_age,t_lab,t_surv",
+            "--dry-run",
+            "--no-venv",
+        ],
+        cwd=proj1,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res1.returncode == 0, res1.stderr
+    dirs1 = sorted(d for d in (proj1 / "runs").iterdir() if d.is_dir())
+    assert len(dirs1) == 3
+    tags1 = {load_run_json(d)["submission"]["tag"] for d in dirs1}
+    assert tags1 == {"t_age", "t_lab", "t_surv"}
+
+    # 2. --no-tag produces untagged folder names ending in _GPU3090 with no (tag) suffix in runs ls
+    proj2 = tmp_path / "proj_notag"
+    proj2.mkdir()
+    res2 = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            str(script),
+            "-a",
+            "GPU3090",
+            "-s",
+            "--task {age,lab,survival}",
+            "--chain",
+            "--no-tag",
+            "--dry-run",
+            "--no-venv",
+        ],
+        cwd=proj2,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res2.returncode == 0, res2.stderr
+    dirs2 = sorted(d for d in (proj2 / "runs").iterdir() if d.is_dir())
+    assert len(dirs2) == 3
+    for d in dirs2:
+        rj = load_run_json(d)
+        assert rj["submission"]["tag"] is None
+        assert d.name.endswith("_GPU3090")
+        plain_label, _, _ = _extract_run_display_parts(d, rj)
+        assert plain_label == "all_pipeline"
+
+
+
 
