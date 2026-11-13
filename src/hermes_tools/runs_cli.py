@@ -104,9 +104,9 @@ def _extract_run_display_parts(
 
     raw_iso = str(sub.get("submitted_at") or "").strip()
     if len(raw_iso) >= 16:
-        short_date = raw_iso[:16].replace("T", " ")
+        short_date = raw_iso[5:16].replace("T", " ")
     elif len(run_dir.name) >= 16 and run_dir.name[4:5] == "-" and run_dir.name[10:11] == "_":
-        short_date = f"{run_dir.name[:10]} {run_dir.name[11:16].replace('-', ':')}"
+        short_date = f"{run_dir.name[5:10]} {run_dir.name[11:16].replace('-', ':')}"
     else:
         short_date = "—"
 
@@ -238,16 +238,16 @@ def _build_ls_table_with_state(
         box=box.ROUNDED,
         header_style="bold cyan",
     )
-    table.add_column("#", style="dim", justify="right", no_wrap=True)
-    table.add_column("Run", no_wrap=True, overflow="ellipsis", max_width=32)
-    table.add_column("Submitted", style="dim", no_wrap=True)
-    table.add_column("Cluster", style="cyan", justify="right", no_wrap=True)
-    table.add_column("Arch", style="magenta", no_wrap=True)
-    table.add_column("Status", no_wrap=True)
-    table.add_column("Tasks", justify="center", no_wrap=True)
-    table.add_column("Host(s)", style="dim", no_wrap=True, overflow="ellipsis", max_width=18)
-    table.add_column("Wall Time", justify="right", no_wrap=True)
-    table.add_column("Peak RAM", justify="right", no_wrap=True)
+    table.add_column("#", style="dim", justify="right", no_wrap=True, min_width=2)
+    table.add_column("Run", no_wrap=True, overflow="ellipsis")
+    table.add_column("Submitted", style="dim", no_wrap=True, min_width=11)
+    table.add_column("Cluster", style="cyan", justify="right", no_wrap=True, min_width=7)
+    table.add_column("Arch", style="magenta", no_wrap=True, min_width=7)
+    table.add_column("Status", no_wrap=True, min_width=9)
+    table.add_column("Tasks", justify="center", no_wrap=True, min_width=5)
+    table.add_column("Host(s)", style="dim", no_wrap=True, min_width=9)
+    table.add_column("Wall Time", justify="right", no_wrap=True, min_width=10)
+    table.add_column("Peak RAM", justify="right", no_wrap=True, min_width=9)
 
     shown = 0
     limit = getattr(args, "limit", 25)

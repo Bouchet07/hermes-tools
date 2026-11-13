@@ -1317,7 +1317,7 @@ def test_send_after_dependency_workflow_e2e(tmp_path: Path, monkeypatch: pytest.
         2000: {"total": 1, "running": 1, "idle": 0, "held": 0, "child_clusters": []},
     }
     rec_wait = reconcile_run(child_dir, child_rj, live_wait)
-    assert rec_wait["_live_badge"] == "WAITING (after #1000)"
+    assert rec_wait["_live_badge"] == "WAITING (#1000)"
 
     # Test `runs why` on WAITING run
     monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: live_wait)
@@ -1928,7 +1928,7 @@ def test_guard_waiting_and_cancelled_runs(tmp_path: Path, monkeypatch: pytest.Mo
     # Retrying a WAITING run should be disallowed
     retry_args = argparse.Namespace(run=wait_run.name, all=False, in_place=False, new_run=False, update_code=False)
     runs_cli.cmd_retry(retry_args, runs_root)
-    out = capsys.readouterr().out
+    out = " ".join(capsys.readouterr().out.split())
     assert "retry a waiting run" in out
 
     # Stopping a WAITING run should remove DAGMan cluster and set status ABORTED
@@ -2014,7 +2014,7 @@ def test_reconcile_waiting_race_and_terminal_skip(tmp_path: Path, monkeypatch: p
     # Even if condor_q temporarily misses dagman_cid while dagman.out has not exited, keep WAITING
     rec = condor.reconcile_run(child_dir, dict(child_rj), {})
     assert rec["status"] == "WAITING"
-    assert rec["_live_badge"] == "WAITING (after #1074962)"
+    assert rec["_live_badge"] == "WAITING (#1074962)"
     assert json.loads((child_dir / "run.json").read_text(encoding="utf-8"))["status"] == "WAITING"
 
     # If wait_parent.py already wrote CANCELLED (parent failed) on disk, sync from disk

@@ -1983,7 +1983,7 @@ def reconcile_run(
                     data["status"] = disk_status
                     return data
             if is_dag_active or (dag_out.is_file() and not dag_has_exited) or (not dag_has_exited and parent_active):
-                parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
+                parent_tag = f"#{parent_cid}" if parent_cid else "parent"
                 data["_live_badge"] = f"WAITING ({parent_tag})"
                 return data
 
@@ -2094,7 +2094,7 @@ def reconcile_run(
                 if parent_cid is not None and live_clusters and parent_cid in live_clusters:
                     parent_active = True
                 if parent_active:
-                    parent_tag = f"after #{parent_cid}" if parent_cid else "after parent"
+                    parent_tag = f"#{parent_cid}" if parent_cid else "parent"
                     data["_live_badge"] = f"WAITING ({parent_tag})"
                     return data
                 if require_ok and not parent_ok:
