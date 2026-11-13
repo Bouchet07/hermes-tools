@@ -110,6 +110,12 @@ def _extract_run_display_parts(
     return plain_label, rich_label, short_date
 
 
+def _format_run_short(run_dir: Path, data: Optional[Dict[str, Any]] = None) -> str:
+    d = data if data is not None else load_run_json(run_dir)
+    _, rich_label, short_date = _extract_run_display_parts(run_dir, d)
+    return f"{rich_label} [dim]({short_date})[/dim]"
+
+
 def resolve_run_dir(
     runs_root: Path,
     query: Optional[str],
@@ -224,16 +230,17 @@ def _build_ls_table_with_state(
     latest_target = resolve_latest_symlink(runs_root)
 
     table = Table(
-        title=f"📊 Hermes 2 Runs ({runs_root})",
+        title="📊 Hermes 2 Runs",
         title_style="bold cyan",
         box=box.ROUNDED,
         header_style="bold cyan",
     )
-    table.add_column("#", style="dim", justify="right")
-    table.add_column("Run ID", style="bold white")
-    table.add_column("Cluster", style="cyan", justify="right")
-    table.add_column("Arch", style="magenta")
-    table.add_column("Status")
+    table.add_column("#", style="dim", justify="right", no_wrap=True)
+    table.add_column("Run")
+    table.add_column("Submitted", style="dim", no_wrap=True)
+    table.add_column("Cluster", style="cyan", justify="right", no_wrap=True)
+    table.add_column("Arch", style="magenta", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
     table.add_column("Tasks", justify="center")
     table.add_column("Host(s)", style="dim")
     table.add_column("Wall Time", justify="right")
@@ -251,9 +258,6 @@ def _build_ls_table_with_state(
     row_signatures: List[Tuple[str, ...]] = []
 
     for idx, d in enumerate(dirs, start=1):
-        if tag_lower and tag_lower not in d.name.lower():
-            continue
-
         rj_stat_key: Optional[Tuple[int, int, int]] = None
         if terminal_cache is not None:
             try:
@@ -294,6 +298,10 @@ def _build_ls_table_with_state(
         if status_upper and status_upper not in display_status.upper():
             continue
 
+        plain_label, rich_label, short_date = _extract_run_display_parts(d, data)
+        if tag_lower and tag_lower not in d.name.lower() and tag_lower not in plain_label.lower():
+            continue
+
         req = data.get("resources_requested", {})
         arch = str(req.get("architecture", "—"))
         sweep_cnt = int(req.get("sweep_count", 1) or 1)
@@ -317,17 +325,14 @@ def _build_ls_table_with_state(
             tasks_str = "1"
 
         host_str, dur_str, ram_str = summarize_metrics(data)
-        if len(d.name) > 20 and d.name[4:5] == "-" and d.name[19:20] == "_":
-            styled_name = f"[dim]{d.name[:20]}[/dim][bold white]{d.name[20:]}[/bold white]"
-        else:
-            styled_name = f"[bold white]{d.name}[/bold white]"
         name_label = (
-            f"{styled_name} [bold yellow]★[/bold yellow]" if d == latest_target else styled_name
+            f"{rich_label} [bold yellow]★[/bold yellow]" if d == latest_target else rich_label
         )
 
         row_cells = (
             str(idx),
             name_label,
+            short_date,
             cid_str,
             arch,
             style_status(display_status),
@@ -353,7 +358,7 @@ def _build_ls_table(args: argparse.Namespace, runs_root: Path) -> Table:
 def cmd_ls(args: argparse.Namespace, runs_root: Path) -> None:
     dirs = list_run_dirs(runs_root)
     if not dirs:
-        console.print(f"[dim]No runs found in {runs_root}[/dim]")
+        console.print("[dim]No runs found.[/dim]")
         return
 
     if getattr(args, "watch", False):
@@ -402,20 +407,28 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
     cids = get_all_cluster_ids(data)
 
+    plain_label, rich_label, short_date = _extract_run_display_parts(run_dir, data)
+
     meta = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     meta.add_column("Key", style="bold cyan", width=20)
     meta.add_column("Val", style="white")
 
-    meta.add_row("Run ID", f"[bold]{run_dir.name}[/bold]")
+    meta.add_row("Run", f"{rich_label} [dim]({run_dir.name})[/dim]")
     meta.add_row("Status", style_status(display_status))
     dep = data.get("dependency")
     if isinstance(dep, dict) and dep.get("parent_run_id"):
         p_id = dep.get("parent_run_id")
+        p_dir = dep.get("parent_run_dir")
         p_cid = dep.get("parent_cluster_id")
         r_ok = dep.get("require_ok", False)
+        if p_dir and Path(p_dir).is_dir():
+            p_label = _format_run_short(Path(p_dir))
+        else:
+            _, p_rich, _ = _extract_run_display_parts(Path(str(p_id)), {})
+            p_label = p_rich
         cid_part = f" (#{p_cid})" if p_cid else ""
         cond_part = " [bold yellow][exit 0 required][/bold yellow]" if r_ok else ""
-        meta.add_row("Dependency", f"After [bold]{p_id}[/bold]{cid_part}{cond_part}")
+        meta.add_row("Dependency", f"After {p_label}{cid_part}{cond_part}")
     hold_reasons = data.get("_hold_reasons") or []
     if hold_reasons:
         meta.add_row(
@@ -423,14 +436,15 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
             f"[bold magenta]{' ; '.join(str(r) for r in hold_reasons)}[/bold magenta]",
         )
     meta.add_row("HTCondor Cluster(s)", ", ".join(str(c) for c in cids) if cids else "—")
-    submitted_fmt = str(sub.get("submitted_at", "—")).replace("T", " ")
+    raw_sub_at = str(sub.get("submitted_at", "") or "").strip()
+    submitted_fmt = raw_sub_at.replace("T", " ")[:19] if raw_sub_at else short_date
     meta.add_row(
         "Submitted At",
         f"{submitted_fmt} by {sub.get('user', '—')}@{sub.get('submit_host', '—')}",
     )
     meta.add_row(
         "Target Script",
-        f"{sub.get('target', '—')} (Snapshot: [cyan]{sub.get('snapshot_executable', '—')}[/cyan])",
+        f"[bold]{sub.get('target', '—')}[/bold]",
     )
     meta.add_row(
         "Architecture",
@@ -452,7 +466,7 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
             "Git Provenance",
             f"{git.get('branch')} @ {str(git.get('commit'))[:8]} ({dirty_str}){sync_note}",
         )
-    meta.add_row("Disk Footprint", f"{dir_size_mb(run_dir):.2f} MB in [dim]{run_dir}[/dim]")
+    meta.add_row("Disk Footprint", f"{dir_size_mb(run_dir):.2f} MB")
     meta.add_row("Repro CLI", f"[bold green]{sub.get('equivalent_cli', '—')}[/bold green]")
 
     console.print(
@@ -807,7 +821,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             console.print("[dim]No runs found.[/dim]")
             return
         live_clusters = query_live_condor_clusters()
-        active_targets: List[Tuple[Path, List[int], bool, str]] = []
+        active_targets: List[Tuple[Path, List[int], bool, str, Dict[str, Any]]] = []
         for d in dirs:
             raw_data = load_run_json(d)
             if not run_needs_live_reconcile(raw_data):
@@ -820,15 +834,15 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             is_act = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING"))
             act_cids = [c for c in cids if live_clusters is None or c in live_clusters]
             if act_cids or is_act:
-                active_targets.append((d, act_cids or cids, is_act, st))
+                active_targets.append((d, act_cids or cids, is_act, st, data))
 
         if not active_targets:
             console.print("[green]No active (QUEUED/RUNNING/HELD/WAITING) runs found.[/green]")
             return
 
-        for d, tcids, _, st in active_targets:
+        for d, tcids, _, st, rdata in active_targets:
             console.print(
-                f"  • [bold]{d.name}[/bold] ({style_status(st)} — cluster(s) {tcids})"
+                f"  • {_format_run_short(d, rdata)} ({style_status(st)} — cluster(s) {tcids})"
             )
         if not args.yes:
             import questionary
@@ -840,7 +854,7 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             ).ask():
                 return
 
-        for d, tcids, is_act, _ in active_targets:
+        for d, tcids, is_act, _, _ in active_targets:
             _stop_single_run(d, tcids, is_act)
         return
 
@@ -1194,7 +1208,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 
     total_mb = sum(x[2] for x in candidates)
     for d, st, mb in candidates:
-        console.print(f"  • [bold]{d.name}[/bold] ({style_status(st)} — {mb:.2f} MB)")
+        console.print(f"  • {_format_run_short(d)} ({style_status(st)} — {mb:.2f} MB)")
 
     if not args.yes:
         import questionary
@@ -1244,9 +1258,11 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
         box=box.ROUNDED,
         header_style="bold cyan",
     )
+    plain_a, _, date_a = _extract_run_display_parts(dir_a, da)
+    plain_b, _, date_b = _extract_run_display_parts(dir_b, db)
     t.add_column("Field", style="bold cyan")
-    t.add_column(f"Run A: {dir_a.name}", style="white")
-    t.add_column(f"Run B: {dir_b.name}", style="white")
+    t.add_column(f"Run A: {plain_a} ({date_a})", style="white")
+    t.add_column(f"Run B: {plain_b} ({date_b})", style="white")
 
     t.add_row("Status", style_status(st_a), style_status(st_b))
     fields = [
@@ -1811,6 +1827,7 @@ def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
         r_ok = dep.get("require_ok", False)
 
         p_status = "UNKNOWN"
+        p_data: Optional[Dict[str, Any]] = None
         if p_dir:
             try:
                 p_data = load_run_json(Path(p_dir))
@@ -1820,11 +1837,12 @@ def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
                 pass
 
         p_cid_str = f" (#{p_cid})" if p_cid else ""
+        p_run_disp = _format_run_short(Path(p_dir), p_data) if p_dir else f"[bold]{p_id}[/bold]"
         info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
         info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
         info_tbl.add_column("V", style="white")
         info_tbl.add_row("Verdict", "[bold blue]WAITING FOR PARENT RUN[/bold blue]")
-        info_tbl.add_row("Parent Run", f"[bold]{p_id}[/bold]{p_cid_str}")
+        info_tbl.add_row("Parent Run", f"{p_run_disp}{p_cid_str}")
         info_tbl.add_row("Parent Status", style_status(p_status))
         info_tbl.add_row(
             "Condition",
@@ -1847,7 +1865,7 @@ def cmd_why(args: argparse.Namespace, runs_root: Path) -> None:
         return
 
     console.print(
-        f"[dim]Analyzing run[/dim] [bold white]{run_dir.name}[/bold white] "
+        f"[dim]Analyzing run[/dim] {_format_run_short(run_dir, data)} "
         f"[dim](Job {job_target}, Status:[/dim] {style_status(cur_status)}[dim])[/dim]"
     )
     _render_queue_analysis_panel(job_target, raw_mode=raw_mode)
@@ -1922,7 +1940,8 @@ def _resolve_running_job_context(
         sys.exit(1)
 
     arch = str((data.get("resources_requested") or {}).get("architecture") or "—")
-    return f"{cids[-1]}.{proc_idx}", run_dir.name, arch
+    plain_label, _, _ = _extract_run_display_parts(run_dir, data)
+    return f"{cids[-1]}.{proc_idx}", plain_label, arch
 
 
 def _build_live_telemetry_panel(

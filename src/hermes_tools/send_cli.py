@@ -479,6 +479,7 @@ def _render_submission_summary(
     exec_type: str,
     cwd: Path,
     run_id: str,
+    tag: Optional[str] = None,
     venv_path: Optional[Path],
     arch: str,
     cpus: Optional[int],
@@ -495,14 +496,16 @@ def _render_submission_summary(
     summary_table.add_column("Value", style="white")
 
     summary_table.add_row("Target Executable", f"[bold]{rel_target}[/bold] ({exec_type})")
-    summary_table.add_row("Working Directory", str(cwd))
-    summary_table.add_row(
-        "Run Output Folder",
-        f"[green]runs/{run_id}/[/green] (exported as [bold]$HERMES_RUN_DIR[/bold])",
-    )
-    summary_table.add_row(
-        "Python Venv", str(venv_path) if venv_path else "[dim]None (System)[/dim]"
-    )
+    run_tag_disp = f"[bold cyan]{tag}[/bold cyan] [dim]({run_id})[/dim]" if tag else f"[dim]{run_id}[/dim]"
+    summary_table.add_row("Run Tag / ID", run_tag_disp)
+    if venv_path:
+        try:
+            venv_disp = venv_path.relative_to(cwd).as_posix()
+        except ValueError:
+            venv_disp = venv_path.name
+    else:
+        venv_disp = "[dim]None (System)[/dim]"
+    summary_table.add_row("Python Venv", venv_disp)
     summary_table.add_row("Architecture", f"[bold magenta]{arch}[/bold magenta]")
 
     if arch == "GPU3090":
@@ -758,6 +761,7 @@ def main() -> None:
         exec_type=exec_type,
         cwd=cwd,
         run_id=run_id,
+        tag=tag or None,
         venv_path=venv_path,
         arch=arch,
         cpus=cpus,
