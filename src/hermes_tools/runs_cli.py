@@ -238,17 +238,19 @@ def _build_ls_table_with_state(
         title_style="bold cyan",
         box=box.ROUNDED,
         header_style="bold cyan",
+        padding=(0, 1),
     )
-    table.add_column("#", style="dim", justify="right", no_wrap=True, min_width=2)
-    table.add_column("Run", no_wrap=True, overflow="ellipsis")
-    table.add_column("Submitted", style="dim", no_wrap=True, min_width=11)
-    table.add_column("Cluster", style="cyan", justify="right", no_wrap=True, min_width=7)
-    table.add_column("Arch", style="magenta", no_wrap=True, min_width=7)
-    table.add_column("Status", no_wrap=True, min_width=9)
-    table.add_column("Tasks", justify="center", no_wrap=True, min_width=5)
-    table.add_column("Host(s)", style="dim", no_wrap=True, min_width=9)
-    table.add_column("Wall Time", justify="right", no_wrap=True, min_width=10)
-    table.add_column("Peak RAM", justify="right", no_wrap=True, min_width=9)
+    max_run_width = max(14, console.width - 102)
+    table.add_column("#", style="dim", justify="right", no_wrap=True)
+    table.add_column("Run", no_wrap=True, overflow="ellipsis", max_width=max_run_width)
+    table.add_column("Submitted", style="dim", no_wrap=True)
+    table.add_column("Cluster", style="cyan", justify="right", no_wrap=True)
+    table.add_column("Arch", style="magenta", no_wrap=True)
+    table.add_column("Status", no_wrap=True, overflow="ellipsis")
+    table.add_column("Tasks", justify="center", no_wrap=True)
+    table.add_column("Host(s)", style="dim", no_wrap=True)
+    table.add_column("Wall Time", justify="right", no_wrap=True)
+    table.add_column("Peak RAM", justify="right", no_wrap=True)
 
     shown = 0
     limit = getattr(args, "limit", 25)

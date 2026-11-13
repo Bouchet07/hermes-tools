@@ -2855,5 +2855,62 @@ def test_send_chain_explicit_tags_and_no_tag(tmp_path: Path) -> None:
         assert plain_label == "all_pipeline"
 
 
+def test_runs_ls_table_never_clips_right_border(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies _build_ls_table fits within 120 and 140 column terminals without clipping the right border."""
+    import argparse
+    from io import StringIO
+    from rich.console import Console
+    import hermes_tools.runs_cli as runs_cli
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+    r1 = runs_root / "2026-11-13_10-00-00_all_pipeline_GPU3090_survival_long_tag"
+    (r1 / "repro").mkdir(parents=True)
+    atomic_write_json(
+        r1 / "run.json",
+        {
+            "run_id": r1.name,
+            "status": "COMPLETED",
+            "submission": {
+                "cluster_id": 1074999,
+                "target": "all_pipeline.py",
+                "tag": "survival_long_tag",
+            },
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [
+                {
+                    "proc_id": 0,
+                    "exit_code": 0,
+                    "hostname": "nv3090-08.i3a.es",
+                    "runtime_seconds": 3665,
+                    "peak_ram_mb": 143052.8,
+                }
+            ],
+        },
+        r1 / "repro",
+    )
+
+    args = argparse.Namespace(limit=25, status=None, tag=None, pinned=False, watch=False, interval=2)
+    for width in (140, 120):
+        monkeypatch.setattr(runs_cli.console, "_width", width)
+        table = runs_cli._build_ls_table(args, runs_root)
+        buf = StringIO()
+        test_console = Console(file=buf, width=width, force_terminal=False)
+        test_console.print(table)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        box_lines = [ln for ln in lines if ln.startswith(("╭", "┌", "├", "│", "╰", "└"))]
+        assert box_lines
+        for ln in box_lines:
+            assert len(ln) <= width
+            assert ln[-1] in ("╮", "┐", "┤", "│", "╯", "┘")
+        rendered = buf.getvalue()
+        assert "1074999" in rendered
+        assert "nv3090-08" in rendered
+        assert "139.70 GB" in rendered
+
+
+
 
 
