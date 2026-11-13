@@ -55,7 +55,12 @@ from hermes_tools.core import (
     update_latest_symlink,
     write_text_lf,
 )
-from hermes_tools.snapshot import create_code_snapshot, freeze_python_env, get_git_info
+from hermes_tools.snapshot import (
+    clone_code_snapshot,
+    create_code_snapshot,
+    freeze_python_env,
+    get_git_info,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -143,6 +148,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="When used with --after, only run if parent succeeds (exit 0); cancel if parent fails",
     )
     parser.add_argument(
+        "--from-run",
+        type=str,
+        help="Clone frozen repro/code/ snapshot and provenance from an existing run",
+    )
+    parser.add_argument(
         "-f",
         "--follow",
         action="store_true",
@@ -171,10 +181,13 @@ def _resolve_target_and_venv(
     args: argparse.Namespace,
     proj_cfg: Dict[str, Any],
     cwd: Path,
+    source_run_dir: Optional[Path] = None,
+    source_data: Optional[Dict[str, Any]] = None,
 ) -> tuple[Path, str, Optional[Path], bool, bool, bool]:
     """Resolves the target executable and virtual environment, returning (target_path, exec_type, venv_path, explicit_venv_used, no_venv_flag, interactive_mode)."""
     interactive_mode = False
-    target_str = args.target or proj_cfg.get("target")
+    src_sub = (source_data.get("submission") or {}) if source_data else {}
+    target_str = args.target or (src_sub.get("target") if source_run_dir else None) or proj_cfg.get("target")
     if not target_str:
         import questionary
 
@@ -210,10 +223,25 @@ def _resolve_target_and_venv(
         if not target_str:
             sys.exit(0)
 
-    target_path = Path(str(target_str)).expanduser().resolve()
-    if not target_path.is_file():
-        console.print(f"[bold red]✘ Error:[/bold red] Target file '{target_str}' does not exist.")
-        sys.exit(1)
+    if source_run_dir is not None:
+        src_code = source_run_dir / "repro" / "code"
+        snap_rel = src_sub.get("snapshot_executable")
+        cands = [src_code / str(target_str)]
+        if snap_rel:
+            cands.append(source_run_dir / str(snap_rel))
+        cands.append(src_code / Path(str(target_str)).name)
+        found = next((c for c in cands if c.is_file()), None)
+        if not found:
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Target '{target_str}' was not found inside frozen snapshot {src_code}."
+            )
+            sys.exit(1)
+        target_path = found
+    else:
+        target_path = Path(str(target_str)).expanduser().resolve()
+        if not target_path.is_file():
+            console.print(f"[bold red]✘ Error:[/bold red] Target file '{target_str}' does not exist.")
+            sys.exit(1)
 
     exec_type = (
         "python"
@@ -221,8 +249,18 @@ def _resolve_target_and_venv(
         else ("bash" if target_path.suffix == ".sh" else "binary")
     )
 
-    venv_arg = args.venv if args.venv is not None else proj_cfg.get("venv")
-    no_venv_flag = bool(args.no_venv or proj_cfg.get("no_venv", False))
+    src_venv = src_sub.get("venv") if source_run_dir else None
+    if args.venv is not None:
+        venv_arg = args.venv
+    elif source_run_dir and not args.no_venv and src_venv and Path(str(src_venv)).is_dir():
+        venv_arg = str(src_venv)
+    else:
+        venv_arg = proj_cfg.get("venv")
+    no_venv_flag = bool(
+        args.no_venv
+        or (src_sub.get("no_venv", False) if (source_run_dir and args.venv is None) else False)
+        or proj_cfg.get("no_venv", False)
+    )
     venv_path: Optional[Path] = None
     explicit_venv_used = bool(venv_arg)
     if not no_venv_flag:
@@ -490,6 +528,7 @@ def _render_submission_summary(
     env_vars: Dict[str, str],
     equivalent_cli: str,
     dependency_info: Optional[str] = None,
+    cloned_from_label: Optional[str] = None,
 ) -> None:
     summary_table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     summary_table.add_column("Property", style="bold cyan", width=20)
@@ -536,7 +575,11 @@ def _render_submission_summary(
     if dependency_info:
         summary_table.add_row("Dependency", dependency_info)
 
-    if git_info["is_git"]:
+    if cloned_from_label:
+        summary_table.add_row(
+            "Code Snapshot", f"[cyan]Frozen snapshot from[/cyan] {cloned_from_label}"
+        )
+    elif git_info["is_git"]:
         dirty_badge = (
             "[yellow](+ repro/uncommitted.patch)[/yellow]"
             if git_info["dirty"]
@@ -586,6 +629,19 @@ def main() -> None:
     cwd = Path.cwd()
     runs_root = get_runs_root(cwd).resolve()
     proj_cfg = load_project_config(cwd)
+
+    source_run_dir: Optional[Path] = None
+    source_data: Optional[Dict[str, Any]] = None
+    cloned_from_label: Optional[str] = None
+    if getattr(args, "from_run", None):
+        from hermes_tools.runs_cli import _format_run_short, resolve_run_dir
+
+        source_run_dir = resolve_run_dir(runs_root, args.from_run)
+        source_data = load_run_json(source_run_dir)
+        cloned_from_label = _format_run_short(source_run_dir, source_data)
+        src_arch = (source_data.get("resources_requested") or {}).get("architecture")
+        if src_arch and args.arch is None:
+            proj_cfg = {**proj_cfg, "arch": src_arch}
 
     parent_run_dir: Optional[Path] = None
     parent_data: Optional[Dict[str, Any]] = None
@@ -662,6 +718,12 @@ def main() -> None:
     scratch_files = list(args.scratch) or _as_str_list(proj_cfg.get("scratch"))
 
     env_vars: Dict[str, str] = {}
+    if source_data is not None:
+        src_env = (source_data.get("resources_requested") or {}).get("env")
+        if isinstance(src_env, dict):
+            for k, v in src_env.items():
+                if k and v is not None:
+                    env_vars[str(k).strip()] = str(v)
     cfg_env = proj_cfg.get("env")
     if isinstance(cfg_env, dict):
         for k, v in cfg_env.items():
@@ -683,7 +745,7 @@ def main() -> None:
         explicit_venv_used,
         no_venv_flag,
         interactive_mode,
-    ) = _resolve_target_and_venv(args, proj_cfg, cwd)
+    ) = _resolve_target_and_venv(args, proj_cfg, cwd, source_run_dir=source_run_dir, source_data=source_data)
 
     arch, cpus, mem_mb, gpus, interactive_mode = _resolve_hardware_resources(
         args, proj_cfg, interactive_mode
@@ -693,11 +755,14 @@ def main() -> None:
         args, proj_cfg, passthrough_args, interactive_mode
     )
 
-    rel_target = (
-        target_path.relative_to(cwd).as_posix()
-        if target_path.is_relative_to(cwd)
-        else target_path.as_posix()
-    )
+    if source_run_dir is not None and source_data is not None:
+        rel_target = str(args.target or (source_data.get("submission") or {}).get("target") or target_path.name)
+    else:
+        rel_target = (
+            target_path.relative_to(cwd).as_posix()
+            if target_path.is_relative_to(cwd)
+            else target_path.as_posix()
+        )
     resolved_after_id: Optional[str] = None
     if parent_run_dir is not None:
         resolved_after_id = parent_run_dir.name
@@ -725,6 +790,7 @@ def main() -> None:
         sweep_specs=cli_sweep_specs,
         after=resolved_after_id,
         after_ok=bool(args.after_ok),
+        from_run=source_run_dir.name if source_run_dir else None,
     )
     cli_parts = [base_tokens[0]] + [shlex.quote(t) for t in base_tokens[1:]]
     if len(sweep_list) > 1:
@@ -743,7 +809,11 @@ def main() -> None:
     run_dir = runs_root / run_id
     repro_dir = run_dir / "repro"
 
-    git_info = get_git_info(cwd)
+    if source_run_dir is not None and source_data is not None:
+        git_info = dict(source_data.get("git") or {})
+        git_info["cloned_from_run"] = source_run_dir.name
+    else:
+        git_info = get_git_info(cwd)
 
     dep_info: Optional[str] = None
     if parent_run_dir is not None:
@@ -772,6 +842,7 @@ def main() -> None:
         env_vars=env_vars,
         equivalent_cli=equivalent_cli,
         dependency_info=dep_info,
+        cloned_from_label=cloned_from_label,
     )
 
     if not args.yes and not args.dry_run:
@@ -788,12 +859,16 @@ def main() -> None:
     repro_dir.mkdir(parents=True, exist_ok=True)
     freeze_python_env(venv_path, repro_dir, detach=True)
 
-    snap_exec_path, snap_py_root = create_code_snapshot(target_path, cwd, repro_dir, git_info)
-
     patch_rel_path: Optional[str] = None
-    if git_info.get("is_git") and git_info.get("diff"):
-        write_text_lf(repro_dir / "uncommitted.patch", str(git_info["diff"]))
-        patch_rel_path = "repro/uncommitted.patch"
+    if source_run_dir is not None:
+        snap_exec_path, snap_py_root = clone_code_snapshot(source_run_dir, rel_target, repro_dir)
+        if (repro_dir / "uncommitted.patch").is_file():
+            patch_rel_path = "repro/uncommitted.patch"
+    else:
+        snap_exec_path, snap_py_root = create_code_snapshot(target_path, cwd, repro_dir, git_info)
+        if git_info.get("is_git") and git_info.get("diff"):
+            write_text_lf(repro_dir / "uncommitted.patch", str(git_info["diff"]))
+            patch_rel_path = "repro/uncommitted.patch"
 
     sh_path = repro_dir / "job.sh"
     sh_content = generate_bash_wrapper(
@@ -882,6 +957,7 @@ def main() -> None:
             "no_venv": no_venv_flag,
             "equivalent_cli": equivalent_cli,
             "cluster_id": None,
+            **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
         },
         "resources_requested": {
             "architecture": arch,
@@ -897,11 +973,12 @@ def main() -> None:
             "env": env_vars,
         },
         "git": {
-            "is_git": git_info["is_git"],
-            "branch": git_info["branch"],
-            "commit": git_info["commit"],
-            "dirty": git_info["dirty"],
+            "is_git": git_info.get("is_git", False),
+            "branch": git_info.get("branch"),
+            "commit": git_info.get("commit"),
+            "dirty": git_info.get("dirty", False),
             "patch_file": patch_rel_path,
+            **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
         },
         "executions": [],
     }

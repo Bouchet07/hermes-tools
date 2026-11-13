@@ -1100,6 +1100,7 @@ def build_send_command_tokens(
     args_flag_val: Optional[str] = None,
     after: Optional[str] = None,
     after_ok: bool = False,
+    from_run: Optional[str] = None,
     yes: bool = False,
 ) -> List[str]:
     """Builds the canonical list of CLI tokens for `send` (used by both `send` and `runs retry --new-run`)."""
@@ -1138,6 +1139,8 @@ def build_send_command_tokens(
         cmd.extend(["--after", str(after)])
     if after_ok:
         cmd.append("--after-ok")
+    if from_run:
+        cmd.extend(["--from-run", str(from_run)])
     if yes:
         cmd.append("-y")
     return cmd

@@ -190,6 +190,56 @@ def _copy_or_link_entry(
     return True, st.st_size
 
 
+def clone_code_snapshot(
+    source_run_dir: Path, target_rel: str, dest_repro_dir: Path
+) -> Tuple[Path, Path]:
+    """
+    Clones a frozen `repro/code/` snapshot (and optional `repro/uncommitted.patch`)
+    from an existing run into `dest_repro_dir / "code"` without touching `cwd`.
+    """
+    src_code = source_run_dir / "repro" / "code"
+    if not src_code.is_dir():
+        console.print(
+            f"[bold red]✘ Error:[/bold red] Source run '{source_run_dir.name}' has no frozen snapshot at {src_code}."
+        )
+        sys.exit(1)
+
+    dest_code = dest_repro_dir / "code"
+    if dest_code.exists():
+        shutil.rmtree(dest_code, ignore_errors=True)
+    shutil.copytree(src_code, dest_code, symlinks=True)
+
+    src_patch = source_run_dir / "repro" / "uncommitted.patch"
+    if src_patch.is_file():
+        shutil.copy2(src_patch, dest_repro_dir / "uncommitted.patch")
+
+    candidates: List[Path] = [dest_code / target_rel]
+    src_rj = source_run_dir / "run.json"
+    if src_rj.is_file():
+        try:
+            rj = json.loads(src_rj.read_text(encoding="utf-8"))
+            snap_rel = (rj.get("submission") or {}).get("snapshot_executable")
+            if snap_rel:
+                candidates.append(dest_repro_dir.parent / str(snap_rel))
+        except Exception:
+            pass
+    candidates.append(dest_code / Path(target_rel).name)
+
+    resolved_code = dest_code.resolve()
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                if cand.resolve().is_relative_to(resolved_code):
+                    return cand, dest_code
+            except OSError:
+                continue
+
+    console.print(
+        f"[bold red]✘ Error:[/bold red] Target '{target_rel}' was not found inside frozen snapshot {src_code}."
+    )
+    sys.exit(1)
+
+
 def create_code_snapshot(
     target_path: Path, cwd: Path, repro_dir: Path, git_info: Dict[str, object]
 ) -> Tuple[Path, Optional[Path]]:

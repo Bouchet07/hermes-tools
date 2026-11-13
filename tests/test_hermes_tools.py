@@ -2282,3 +2282,99 @@ def test_runs_plot_and_path_telemetry(
     assert "Host RAM PSS (GB)" in plot_out
     assert "Disk I/O (MB/s)" in plot_out
     assert "GPU Starvation Detected" in plot_out
+
+
+def test_send_from_run_and_retry_new_run_preserves_frozen_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    script = tmp_path / "train.py"
+    helper = tmp_path / "helper.py"
+    script.write_text('print("v1_historical")\n', encoding="utf-8")
+    helper.write_text("VAL = 1\n", encoding="utf-8")
+
+    # 1. Submit initial run (dry-run)
+    res1 = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            "train.py",
+            "-a",
+            "GPU3090",
+            "--dry-run",
+            "--no-venv",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res1.returncode == 0, res1.stderr
+    runs_root = tmp_path / "runs"
+    orig_dirs = sorted(runs_root.iterdir())
+    assert len(orig_dirs) == 1
+    orig_dir = orig_dirs[0]
+
+    # Mark original run COMPLETED so `runs retry --new-run` also exercises COMPLETED support
+    orig_rj = load_run_json(orig_dir)
+    orig_rj["status"] = "COMPLETED"
+    orig_rj["executions"] = [{"process_id": 0, "exit_code": 0}]
+    atomic_write_json(orig_dir / "run.json", orig_rj, orig_dir / "repro")
+
+    # 2. Mutate working tree and delete helper.py
+    script.write_text('print("v2_modified")\n', encoding="utf-8")
+    helper.unlink()
+
+    # 3. Clone via `send --from-run 1 --dry-run --no-venv -t cloned`
+    res2 = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            "--from-run",
+            "1",
+            "--dry-run",
+            "--no-venv",
+            "-t",
+            "cloned",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res2.returncode == 0, res2.stderr
+    cloned_dirs = [d for d in runs_root.iterdir() if d.is_dir() and d != orig_dir and "cloned" in d.name]
+    assert len(cloned_dirs) == 1
+    cloned_dir = cloned_dirs[0]
+    assert 'print("v1_historical")' in (cloned_dir / "repro" / "code" / "train.py").read_text(encoding="utf-8")
+    assert (cloned_dir / "repro" / "code" / "helper.py").is_file()
+    cloned_rj = load_run_json(cloned_dir)
+    assert cloned_rj["submission"]["cloned_from_run"] == orig_dir.name
+    assert cloned_rj["git"]["cloned_from_run"] == orig_dir.name
+
+    # 4. Verify `runs retry <completed_run> --new-run` passes `--from-run` when `-u` is omitted
+    execv_calls = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runs_cli, "query_live_condor_clusters", lambda: {})
+    monkeypatch.setattr(runs_cli.os, "execv", lambda exe, cmd: execv_calls.append(cmd))
+    runs_cli.cmd_retry(
+        argparse.Namespace(
+            run=orig_dir.name,
+            all=False,
+            in_place=False,
+            new_run=True,
+            update_code=False,
+            force=False,
+            yes=True,
+        ),
+        runs_root,
+    )
+    assert len(execv_calls) == 1
+    assert "--from-run" in execv_calls[0]
+    assert orig_dir.name in execv_calls[0]

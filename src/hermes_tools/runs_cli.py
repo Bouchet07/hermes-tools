@@ -416,6 +416,15 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
     meta.add_column("Val", style="white")
 
     meta.add_row("Run", f"{rich_label} [dim]({run_dir.name})[/dim]")
+    cloned_from = sub.get("cloned_from_run")
+    if cloned_from:
+        cloned_dir = runs_root / str(cloned_from)
+        if cloned_dir.is_dir():
+            cloned_disp = _format_run_short(cloned_dir)
+        else:
+            _, c_rich, _ = _extract_run_display_parts(Path(str(cloned_from)), {})
+            cloned_disp = c_rich
+        meta.add_row("Cloned From", cloned_disp)
     meta.add_row("Status", style_status(display_status))
     dep = data.get("dependency")
     if isinstance(dep, dict) and dep.get("parent_run_id"):
@@ -988,10 +997,24 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     else:
         targets = get_failed_or_missing_procs(data)
         if not targets:
-            console.print(
-                "[yellow]All processes in this run completed with exit_code 0. Use `--all` to force re-run.[/yellow]"
-            )
-            return
+            if args.new_run:
+                targets = list(enumerate(sweep_args))
+            elif not args.in_place and sys.stdin.isatty():
+                import questionary
+
+                if questionary.confirm(
+                    "All processes in this run completed with exit 0. Re-run all processes?",
+                    default=True,
+                    style=get_prompt_style(),
+                ).ask():
+                    targets = list(enumerate(sweep_args))
+                else:
+                    return
+            else:
+                console.print(
+                    "[yellow]All processes in this run completed with exit_code 0. Use `--all` or `--new-run` to force re-run.[/yellow]"
+                )
+                return
 
     mode = "in_place" if args.in_place else ("new_run" if args.new_run else None)
     update_code = args.update_code
@@ -1003,16 +1026,20 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             f"Found {len(targets)}/{len(sweep_args)} process(es) to retry. Choose recovery mode:",
             choices=[
                 questionary.Choice(
-                    "1. In-Place Continuation + Update Code Snapshot (Fixes bug & keeps same $HERMES_RUN_DIR)",
-                    value=("in_place", True),
+                    "1. New Run with Frozen Snapshot (Re-runs exact historical code in a new run folder)",
+                    value=("new_run", False),
                 ),
                 questionary.Choice(
-                    "2. In-Place Continuation with Frozen Snapshot (Transient node/OOM failure)",
+                    "2. New Run with Current Working Tree (Snapshots current workspace files into a new run folder)",
+                    value=("new_run", True),
+                ),
+                questionary.Choice(
+                    "3. In-Place Continuation with Frozen Snapshot (Re-runs inside same $HERMES_RUN_DIR)",
                     value=("in_place", False),
                 ),
                 questionary.Choice(
-                    "3. Launch New Run via `send` (Creates fresh timestamped run folder)",
-                    value=("new_run", True),
+                    "4. In-Place Continuation + Update Code Snapshot (Syncs current workspace into same $HERMES_RUN_DIR)",
+                    value=("in_place", True),
                 ),
             ],
             style=get_prompt_style(),
@@ -1044,6 +1071,7 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             env_items=[f"{ek}={ev}" for ek, ev in (req.get("env") or {}).items()],
             sweep_specs=[arg_line for _, arg_line in targets] if is_sweep else None,
             args_flag_val=targets[0][1] if (not is_sweep and targets[0][1]) else None,
+            from_run=run_dir.name if not update_code else None,
             yes=bool(args.yes),
         )
 
@@ -1052,6 +1080,7 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
         )
         os.chdir(cwd)
         os.execv(send_bin, cmd)
+        return
 
     if live_clusters is not None and not args.force:
         active_cids = [c for c in get_all_cluster_ids(data) if c in live_clusters]

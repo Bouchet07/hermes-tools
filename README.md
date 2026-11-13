@@ -388,7 +388,9 @@ Recovers failed, interrupted, or incomplete runs/sweeps. Automatically detects w
 runs retry latest              # Interactive recovery mode selector
 runs retry latest --in-place -u -y  # Update code snapshot & retry failed processes in-place
 runs retry latest --in-place -y     # Retry failed processes with frozen code snapshot
-runs retry latest --new-run -y      # Relaunch failed processes as a brand-new run via `send`
+runs retry latest --new-run -y      # Relaunch as a brand-new run using the frozen historical snapshot (works on COMPLETED runs too!)
+runs retry latest --new-run -u -y   # Relaunch as a brand-new run using the current working tree
+send --from-run 1 -t cloned         # Clone an existing run's frozen snapshot & provenance into a new run
 runs retry latest --all             # Force re-run of all processes (even exit_code 0)
 runs retry latest --force           # Allow retry even if cluster still appears in condor_q
 ```
