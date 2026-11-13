@@ -2533,7 +2533,7 @@ def _find_matplotlib_python(data: Dict[str, Any], runs_root: Path) -> Optional[s
                 candidates.append(str(py))
     sub_py = resolve_submit_python()
     if sub_py:
-        candidates.append(sub_py)
+        candidates.append(str(sub_py))
 
     seen = set()
     for py in candidates:

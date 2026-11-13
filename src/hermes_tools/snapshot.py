@@ -5,6 +5,7 @@ snapshot.py — Fast Git provenance, environment freezing, and source code snaps
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import shutil
 import stat

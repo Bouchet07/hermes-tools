@@ -2504,6 +2504,46 @@ def test_send_sweep_max_parallel_throttling(tmp_path: Path) -> None:
     assert "max_idle" in sub_txt
     assert "= 1" in sub_txt
 
+    # Verify generate_retry_sub_file preserves max_idle when len(targets) > 1
+    from hermes_tools.condor import generate_retry_sub_file
+
+    retry_sub_multi = generate_retry_sub_file(
+        run_dir=run_dir,
+        repro_dir=run_dir / "repro",
+        script_stem="train",
+        is_sweep=True,
+        targets=[(0, "--lr 1e-3 --bs 32"), (1, "--lr 1e-4 --bs 64")],
+        retry_epoch=12345,
+        run_data=rj,
+    )
+    assert "max_idle" in retry_sub_multi
+    assert "= 1" in retry_sub_multi
+
+    # Verify combining --chain and -j 2 exits with non-zero status code
+    bad_res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_tools.send_cli",
+            str(script),
+            "-a",
+            "GPU3090",
+            "-s",
+            "--lr {1e-3,1e-4}",
+            "--chain",
+            "-j",
+            "2",
+            "--dry-run",
+            "--no-venv",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert bad_res.returncode != 0
+
 
 def test_send_sweep_chain_creates_separate_linked_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

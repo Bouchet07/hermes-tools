@@ -632,7 +632,6 @@ export UPD_FAULTS="${MAJ_FAULTS:-0}"
 "${UPDATER_PYTHON}" - <<'PYEOF'
 import csv
 import fcntl
-import csv
 import json
 import os
 import random
@@ -991,7 +990,10 @@ def generate_sub_file(
         lines.append(f"transfer_input_files    = {', '.join(clean_scratch)}")
         lines.append('transfer_output_files   = ""')
 
-    if is_sweep and max_parallel is not None and int(max_parallel) >= 1:
+    should_emit_max_idle = (
+        len(retry_targets) > 1 if retry_targets is not None else is_sweep
+    )
+    if should_emit_max_idle and max_parallel is not None and int(max_parallel) >= 1:
         lines.append("")
         lines.append("# --- Sweep Concurrency Limit ---")
         lines.append(f"max_idle                = {int(max_parallel)}")
@@ -1163,7 +1165,6 @@ _WAIT_PARENT_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import shutil
@@ -1638,6 +1639,7 @@ def generate_retry_sub_file(
         scratch_files=list(req.get("scratch_files") or []),
         retry_targets=targets,
         retry_epoch=retry_epoch,
+        max_parallel=req.get("max_parallel"),
     )
 
 

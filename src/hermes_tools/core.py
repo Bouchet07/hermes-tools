@@ -568,10 +568,3 @@ def discover_project_venv(cwd: Path, explicit_venv: Optional[str] = None) -> Opt
             return p
 
     return None
-
-
-def get_watch_row_limit(requested_limit: int, chrome_lines: int = 7) -> int:
-    """Clamps `--watch` table row counts to fit the visible terminal height without scroll jumps."""
-    if not console.is_terminal:
-        return requested_limit
-    return min(requested_limit, max(5, console.size.height - chrome_lines))
