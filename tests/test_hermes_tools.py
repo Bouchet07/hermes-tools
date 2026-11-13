@@ -2637,3 +2637,149 @@ def test_send_sweep_chain_creates_separate_linked_runs(
     assert rj3["dependency"]["dagman_cluster_id"] == 1003
 
 
+def test_stop_cascades_to_downstream_chained_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies runs stop cascades to downstream waiting runs (unless --single) and wait_parent.py aborts when parent is ABORTED even without --require-ok."""
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.condor import generate_wait_parent_script
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+
+    run1 = runs_root / "2026-11-13_10-00-00_step1_GPU3090"
+    run2 = runs_root / "2026-11-13_10-00-01_step2_GPU3090"
+    run3 = runs_root / "2026-11-13_10-00-02_step3_GPU3090"
+
+    for d in (run1, run2, run3):
+        (d / "repro").mkdir(parents=True)
+
+    def _write_chain() -> None:
+        atomic_write_json(
+            run1 / "run.json",
+            {
+                "run_id": run1.name,
+                "status": "QUEUED",
+                "submission": {"cluster_id": 1001},
+                "resources_requested": {"sweep_count": 1},
+                "executions": [],
+            },
+            run1 / "repro",
+        )
+        atomic_write_json(
+            run2 / "run.json",
+            {
+                "run_id": run2.name,
+                "status": "WAITING",
+                "submission": {"cluster_id": 1002},
+                "resources_requested": {"sweep_count": 1},
+                "dependency": {
+                    "parent_run_id": run1.name,
+                    "parent_run_dir": str(run1),
+                    "parent_cluster_id": 1001,
+                    "require_ok": False,
+                    "dagman_cluster_id": 1002,
+                },
+                "executions": [],
+            },
+            run2 / "repro",
+        )
+        atomic_write_json(
+            run3 / "run.json",
+            {
+                "run_id": run3.name,
+                "status": "WAITING",
+                "submission": {"cluster_id": 1003},
+                "resources_requested": {"sweep_count": 1},
+                "dependency": {
+                    "parent_run_id": run2.name,
+                    "parent_run_dir": str(run2),
+                    "parent_cluster_id": 1002,
+                    "require_ok": False,
+                    "dagman_cluster_id": 1003,
+                },
+                "executions": [],
+            },
+            run3 / "repro",
+        )
+
+    _write_chain()
+
+    monkeypatch.setattr(
+        runs_cli,
+        "query_live_condor_clusters",
+        lambda: {
+            1001: {"total": 1, "running": 0, "idle": 1, "held": 0},
+            1002: {"total": 1, "running": 1, "idle": 0, "held": 0},
+            1003: {"total": 1, "running": 1, "idle": 0, "held": 0},
+        },
+    )
+
+    real_subprocess_run = subprocess.run
+    rm_calls: list[str] = []
+
+    def fake_condor_rm(cmd, **kwargs):
+        rm_calls.append(str(cmd[1]))
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"Cluster {cmd[1]} marked for removal.\n", stderr="")
+
+    monkeypatch.setattr(runs_cli.subprocess, "run", fake_condor_rm)
+
+    # 1. With single=True, only 1001 is removed
+    runs_cli.cmd_stop(
+        argparse.Namespace(run=run1.name, yes=True, all=False, single=True),
+        runs_root,
+    )
+    assert rm_calls == ["1001"]
+    assert load_run_json(run1)["status"] == "ABORTED"
+    assert load_run_json(run2)["status"] == "WAITING"
+    assert load_run_json(run3)["status"] == "WAITING"
+
+    # 2. Reset chain and stop without --single -> cascades to 1001, 1002, and 1003
+    _write_chain()
+    rm_calls.clear()
+    runs_cli.cmd_stop(
+        argparse.Namespace(run=run1.name, yes=True, all=False, single=False),
+        runs_root,
+    )
+    assert rm_calls == ["1001", "1002", "1003"]
+    assert load_run_json(run1)["status"] == "ABORTED"
+    assert load_run_json(run2)["status"] == "ABORTED"
+    assert load_run_json(run3)["status"] == "ABORTED"
+
+    # 3. Verify wait_parent.py aborts when parent is ABORTED even WITHOUT --require-ok
+    _write_chain()
+    atomic_write_json(
+        run1 / "run.json",
+        {
+            "run_id": run1.name,
+            "status": "ABORTED",
+            "submission": {"cluster_id": 1001},
+            "resources_requested": {"sweep_count": 1},
+            "executions": [],
+        },
+        run1 / "repro",
+    )
+    wait_py = run2 / "repro" / "wait_parent.py"
+    wait_py.write_text(generate_wait_parent_script(), encoding="utf-8")
+    res = real_subprocess_run(
+        [
+            sys.executable,
+            str(wait_py),
+            "--parent-dir",
+            str(run1),
+            "--child-dir",
+            str(run2),
+            "--poll-interval",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert res.returncode == 1
+    assert load_run_json(run2)["status"].startswith("CANCELLED")
+
+
+

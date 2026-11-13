@@ -889,6 +889,63 @@ def _stop_single_run(
         console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
 
 
+def _find_downstream_waiting_runs(
+    runs_root: Path,
+    root_run_dir: Path,
+    root_cids: List[int],
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
+) -> List[Tuple[Path, List[int], Dict[str, Any]]]:
+    """Finds transitive downstream active/waiting runs depending on root_run_dir or root_cids."""
+    dirs = list_run_dirs(runs_root)
+    if not dirs:
+        return []
+
+    loaded: List[Tuple[Path, Dict[str, Any], List[int], bool]] = []
+    for d in dirs:
+        if d == root_run_dir:
+            continue
+        raw_data = load_run_json(d)
+        if not raw_data:
+            continue
+        dep = raw_data.get("dependency")
+        if not isinstance(dep, dict):
+            continue
+        data = reconcile_run(d, raw_data, live_clusters) if run_needs_live_reconcile(raw_data) else raw_data
+        st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+        cids = get_all_cluster_ids(data)
+        act_cids = [c for c in cids if live_clusters is None or c in live_clusters]
+        is_active = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or bool(act_cids)
+        if not is_active:
+            continue
+        loaded.append((d, data, act_cids or cids, is_active))
+
+    downstream: List[Tuple[Path, List[int], Dict[str, Any]]] = []
+    frontier_names = {root_run_dir.name}
+    frontier_cids = set(root_cids)
+    visited: set[Path] = {root_run_dir}
+
+    changed = True
+    while changed:
+        changed = False
+        for d, data, tcids, _ in loaded:
+            if d in visited:
+                continue
+            dep = data.get("dependency") or {}
+            p_run_id = dep.get("parent_run_id")
+            p_cid = dep.get("parent_cluster_id")
+            matches_parent = (p_run_id and str(p_run_id) in frontier_names) or (
+                p_cid is not None and int(p_cid) in frontier_cids
+            )
+            if matches_parent:
+                visited.add(d)
+                downstream.append((d, tcids, data))
+                frontier_names.add(d.name)
+                frontier_cids.update(tcids)
+                changed = True
+
+    return downstream
+
+
 def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
     if getattr(args, "all", False):
         dirs = list_run_dirs(runs_root)
@@ -962,8 +1019,45 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
         return
 
     target_cids = active_cids or cids
+    downstream = (
+        []
+        if getattr(args, "single", False)
+        else _find_downstream_waiting_runs(runs_root, run_dir, cids, live_clusters)
+    )
 
-    if not args.yes:
+    stop_downstream = bool(downstream)
+    if downstream:
+        console.print(
+            f"[yellow]🔗 Found {len(downstream)} downstream chained run(s) waiting on {_format_run_short(run_dir, data)}:[/yellow]"
+        )
+        for dep_dir, dep_cids, dep_data in downstream:
+            dep_st = str(dep_data.get("_live_badge") or dep_data.get("status", "UNKNOWN"))
+            console.print(
+                f"  • {_format_run_short(dep_dir, dep_data)} ({style_status(dep_st)} — cluster(s) {dep_cids})"
+            )
+
+        if not args.yes and sys.stdin.isatty():
+            import questionary
+
+            choice = questionary.select(
+                "How would you like to stop this chain?",
+                choices=[
+                    questionary.Choice(
+                        f"1. Stop entire chain ({1 + len(downstream)} runs)",
+                        value="chain",
+                    ),
+                    questionary.Choice(
+                        f"2. Stop only this run ({run_dir.name})",
+                        value="single",
+                    ),
+                    questionary.Choice("3. Cancel", value="cancel"),
+                ],
+                style=get_prompt_style(),
+            ).ask()
+            if not choice or choice == "cancel":
+                return
+            stop_downstream = choice == "chain"
+    elif not args.yes:
         import questionary
 
         if not questionary.confirm(
@@ -974,6 +1068,9 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
             return
 
     _stop_single_run(run_dir, target_cids, is_active_status)
+    if stop_downstream:
+        for dep_dir, dep_cids, _ in downstream:
+            _stop_single_run(dep_dir, dep_cids, True)
 
 
 # ---------------------------------------------------------------------------
@@ -2967,6 +3064,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_stop = sub.add_parser("stop", aliases=["kill", "rm"], help="Abort active HTCondor job (condor_rm)")
     p_stop.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
     p_stop.add_argument("-a", "--all", action="store_true", help="Abort all currently active runs")
+    p_stop.add_argument(
+        "--single",
+        "--no-cascade",
+        dest="single",
+        action="store_true",
+        help="Stop only the specified run without stopping downstream chained runs",
+    )
     p_stop.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
     p_cln = sub.add_parser(

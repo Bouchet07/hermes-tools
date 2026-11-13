@@ -1458,6 +1458,17 @@ def main() -> None:
 
             # Strict success check: MUST be COMPLETED
             is_ok = (final_fate == "COMPLETED")
+            parent_aborted = final_fate == "ABORTED" or final_fate.startswith("CANCELLED")
+
+            if parent_aborted:
+                print(
+                    f"[WAIT_PARENT] Parent run was {final_fate}. "
+                    f"Aborting dependent job.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                record_child_cancelled(child_dir, parent_label, final_fate)
+                sys.exit(1)
 
             if require_ok and not is_ok:
                 print(
