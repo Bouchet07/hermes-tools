@@ -2381,3 +2381,83 @@ def test_send_from_run_and_retry_new_run_preserves_frozen_snapshot(
     assert len(execv_calls) == 1
     assert "--from-run" in execv_calls[0]
     assert orig_dir.name in execv_calls[0]
+
+
+def test_runs_pin_unpin_and_clean_protection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verifies runs pin/unpin, note attachment, runs ls --pinned, runs inspect, and runs clean protection."""
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+
+    monkeypatch.setattr(runs_cli.console, "_width", 160)
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir(parents=True)
+
+    r1 = runs_root / "2026-11-12_10-00-00_baseline_GPU3090"
+    r2 = runs_root / "2026-11-12_09-00-00_scratch_GPU3090"
+    for r_dir, cid, tag in ((r1, 1001, "baseline"), (r2, 1002, "scratch")):
+        repro = r_dir / "repro"
+        repro.mkdir(parents=True)
+        atomic_write_json(
+            r_dir / "run.json",
+            {
+                "run_id": r_dir.name,
+                "status": "FAILED",
+                "submission": {"cluster_id": cid, "target": "train.py", "tag": tag},
+                "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+                "executions": [{"proc_id": 0, "exit_code": 1}],
+            },
+            repro,
+        )
+
+    # 1. Pin r1 with a note
+    runs_cli.cmd_pin(
+        argparse.Namespace(run="1", note="Golden baseline", unpin=False),
+        runs_root,
+    )
+    capsys.readouterr()
+    rj1 = load_run_json(r1)
+    assert rj1["pinned"] is True
+    assert rj1["note"] == "Golden baseline"
+
+    # 2. Verify `runs ls --pinned` shows r1 and not r2
+    runs_cli.cmd_ls(
+        argparse.Namespace(limit=25, status=None, tag=None, pinned=True, watch=False, interval=2),
+        runs_root,
+    )
+    ls_out = capsys.readouterr().out
+    assert "baseline" in ls_out
+    assert "scratch" not in ls_out
+
+    # 3. Verify `runs inspect 1` outputs PINNED and the note
+    runs_cli.cmd_inspect(argparse.Namespace(run="1"), runs_root)
+    ins_out = " ".join(capsys.readouterr().out.split())
+    assert "PINNED" in ins_out
+    assert "Golden baseline" in ins_out
+
+    # 4. Run `runs clean --failed -y` -> deletes r2, preserves pinned r1
+    runs_cli.cmd_clean(
+        argparse.Namespace(failed=True, aborted=False, dry=False, older_than=None, yes=True),
+        runs_root,
+    )
+    capsys.readouterr()
+    assert not r2.exists()
+    assert r1.is_dir()
+
+    # 5. Unpin r1, then clean again -> r1 is deleted
+    runs_cli.cmd_pin(
+        argparse.Namespace(run="1", note=None, unpin=True),
+        runs_root,
+        unpin=True,
+    )
+    capsys.readouterr()
+    assert load_run_json(r1)["pinned"] is False
+
+    runs_cli.cmd_clean(
+        argparse.Namespace(failed=True, aborted=False, dry=False, older_than=None, yes=True),
+        runs_root,
+    )
+    capsys.readouterr()
+    assert not r1.exists()
+

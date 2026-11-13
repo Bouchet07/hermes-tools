@@ -334,6 +334,7 @@ runs ls                        # Show latest 25 runs (★ marks `runs/latest`)
 runs ls -n 50                  # Show latest 50 runs
 runs ls -s RUNNING             # Filter by status substring (RUNNING, FAILED, QUEUED, etc.)
 runs ls -t baseline            # Filter by run ID / tag substring
+runs ls -p                     # Show only pinned runs (`--pinned`)
 runs watch                     # Flicker-free live dashboard (refreshes only when state changes)
 runs watch -i 5 -s RUNNING     # Poll every 5s, showing only running jobs
 ```
@@ -420,9 +421,9 @@ runs stop 1071044 -y
 runs stop --all -y             # Abort all currently QUEUED / RUNNING / HELD runs
 ```
 
-### 6.8 `runs clean` (`prune`)
+### 6.8 `runs clean` (`prune`), `runs pin` & `runs unpin`
 
-Deletes inactive run directories and repairs the `runs/latest` symlink (active `QUEUED`, `RUNNING`, or `HELD` runs are never deleted):
+Deletes inactive run directories and repairs the `runs/latest` symlink (active `QUEUED`, `RUNNING`, `HELD`, `WAITING` runs and **pinned** runs are never deleted):
 
 ```bash
 runs clean                     # Interactive multi-select checkbox TUI
@@ -430,6 +431,9 @@ runs clean --failed -y         # Delete FAILED, SUBMIT_FAILED, and VANISHED runs
 runs clean --aborted -y        # Delete ABORTED and INTERRUPTED runs
 runs clean --dry -y            # Delete DRY_RUN capsules
 runs clean --older-than 7d -y  # Delete inactive runs older than 7 days (supports d, h, m)
+
+runs pin 1 -n "Golden baseline"  # Pin run #1 (protects from `runs clean`) and attach a note
+runs unpin 1                     # Unpin run #1 so it becomes eligible for `runs clean`
 ```
 
 ### 6.9 `runs nodes` (`cluster`, `pools`)

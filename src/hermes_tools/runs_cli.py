@@ -195,7 +195,8 @@ def resolve_run_dir(
         raw_cid = rj.get("submission", {}).get("cluster_id")
         cid_str = f"#{raw_cid}" if raw_cid else "—"
         star = " ★" if d == latest_target else ""
-        rows.append((i, d, plain_label, arch, st, dur_str, short_date, f"{cid_str}{star}"))
+        pin_mark = " 📌" if rj.get("pinned") else ""
+        rows.append((i, d, plain_label, arch, st, dur_str, short_date, f"{cid_str}{star}{pin_mark}"))
 
     name_w = max((len(r[2]) for r in rows), default=14)
     arch_w = max((len(r[3]) for r in rows), default=6)
@@ -257,6 +258,7 @@ def _build_ls_table_with_state(
     status_upper = status_filter.upper() if status_filter else None
     tag_filter = getattr(args, "tag", None)
     tag_lower = tag_filter.lower() if tag_filter else None
+    pinned_only = bool(getattr(args, "pinned", False))
 
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, int]]] = None
@@ -299,6 +301,9 @@ def _build_ls_table_with_state(
             elif terminal_cache is not None:
                 terminal_cache.pop(d, None)
 
+        if pinned_only and not bool(data.get("pinned", False)):
+            continue
+
         display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         if status_upper and status_upper not in display_status.upper():
             continue
@@ -330,9 +335,13 @@ def _build_ls_table_with_state(
             tasks_str = "1"
 
         host_str, dur_str, ram_str = summarize_metrics(data)
-        name_label = (
-            f"[bold yellow]★[/bold yellow] {rich_label}" if d == latest_target else rich_label
-        )
+        is_pinned = bool(data.get("pinned", False))
+        prefix_badges: List[str] = []
+        if d == latest_target:
+            prefix_badges.append("[bold yellow]★[/bold yellow]")
+        if is_pinned:
+            prefix_badges.append("[bold magenta]📌[/bold magenta]")
+        name_label = f"{' '.join(prefix_badges)} {rich_label}" if prefix_badges else rich_label
 
         row_cells = (
             str(idx),
@@ -432,7 +441,12 @@ def cmd_inspect(args: argparse.Namespace, runs_root: Path) -> None:
             _, c_rich, _ = _extract_run_display_parts(Path(str(cloned_from)), {})
             cloned_disp = c_rich
         meta.add_row("Cloned From", cloned_disp)
-    meta.add_row("Status", style_status(display_status))
+    status_val = style_status(display_status)
+    if bool(data.get("pinned", False)):
+        status_val = f"{status_val} [bold magenta][📌 PINNED][/bold magenta]"
+    meta.add_row("Status", status_val)
+    if data.get("note"):
+        meta.add_row("Note", f"[italic bright_white]{data['note']}[/italic bright_white]")
     dep = data.get("dependency")
     if isinstance(dep, dict) and dep.get("parent_run_id"):
         p_id = dep.get("parent_run_id")
@@ -1216,6 +1230,7 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
     now = datetime.datetime.now()
     inactive_runs: List[Tuple[Path, str, str, str, str]] = []
     candidates: List[Tuple[Path, str, float]] = []
+    skipped_pinned = 0
 
     for d in dirs:
         raw_data = load_run_json(d)
@@ -1229,6 +1244,9 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 
         st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         if st.startswith(("RUNNING", "QUEUED", "HELD", "WAITING")):
+            continue
+        if bool(data.get("pinned", False)):
+            skipped_pinned += 1
             continue
 
         if not has_filters:
@@ -1262,6 +1280,8 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
     if not has_filters:
         if not inactive_runs:
             console.print("[green]No inactive runs eligible for deletion.[/green]")
+            if skipped_pinned > 0:
+                console.print(f"[dim]ℹ Skipped {skipped_pinned} pinned run(s).[/dim]")
             return
         import questionary
 
@@ -1286,6 +1306,8 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
 
     if not candidates:
         console.print("[green]No matching runs found to clean.[/green]")
+        if skipped_pinned > 0:
+            console.print(f"[dim]ℹ Skipped {skipped_pinned} pinned run(s).[/dim]")
         return
 
     total_mb = sum(x[2] for x in candidates)
@@ -1308,6 +1330,43 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
     console.print(
         f"[bold green]✔ Deleted {len(candidates)} run(s) ({total_mb:.2f} MB freed).[/bold green]"
     )
+    if skipped_pinned > 0:
+        console.print(f"[dim]ℹ Skipped {skipped_pinned} pinned run(s).[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: `runs pin` & `runs unpin`
+# ---------------------------------------------------------------------------
+
+
+def cmd_pin(args: argparse.Namespace, runs_root: Path, unpin: bool = False) -> None:
+    """Pin or unpin a run to protect it from `runs clean` and attach an optional note."""
+    run_dir = resolve_run_dir(
+        runs_root,
+        getattr(args, "run", None),
+        prompt_title="Select run to unpin:" if unpin else "Select run to pin:",
+    )
+    note_arg = getattr(args, "note", None)
+
+    def _mutate(d: Dict[str, Any]) -> None:
+        if unpin:
+            d["pinned"] = False
+            if note_arg == "":
+                d.pop("note", None)
+        else:
+            if getattr(args, "run", None) is not None or not bool(d.get("pinned", False)) or note_arg is not None:
+                d["pinned"] = True
+            if note_arg is not None:
+                d["note"] = note_arg.strip() or None
+
+    updated_data = locked_mutate_run_json(run_dir / "run.json", run_dir / "repro", _mutate)
+    short_run = _format_run_short(run_dir, updated_data)
+    if unpin:
+        console.print(f"[yellow]Unpinned[/yellow] {short_run} — eligible for 'runs clean' again")
+    else:
+        console.print(f"[bold green]📌 Pinned[/bold green] {short_run} — protected from 'runs clean'")
+        if updated_data.get("note"):
+            console.print(f'   [dim]Note: "{updated_data["note"]}"[/dim]')
 
 
 # ---------------------------------------------------------------------------
@@ -1377,6 +1436,13 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
         ("Peak RAM", summarize_metrics(da)[2], summarize_metrics(db)[2]),
         ("Wall Time", summarize_metrics(da)[1], summarize_metrics(db)[1]),
     ]
+    if da.get("pinned") or db.get("pinned") or da.get("note") or db.get("note"):
+        def _format_pin_note(d: Dict[str, Any]) -> str:
+            pin_str = "📌 Pinned" if d.get("pinned") else "No"
+            note_val = d.get("note")
+            return f"{pin_str} ({note_val})" if note_val else pin_str
+
+        fields.append(("Pinned / Note", _format_pin_note(da), _format_pin_note(db)))
     for label, va, vb in fields:
         style_b = "bold yellow" if va != vb else "white"
         t.add_row(label, str(va), f"[{style_b}]{vb}[/{style_b}]")
@@ -2742,6 +2808,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls.add_argument("-n", "--limit", type=int, default=25, help="Max runs to display (default: 25)")
     p_ls.add_argument("-s", "--status", type=str, help="Filter by status (e.g. RUNNING, FAILED)")
     p_ls.add_argument("-t", "--tag", type=str, help="Filter by substring/tag in run ID")
+    p_ls.add_argument("-p", "--pinned", action="store_true", help="Show only pinned runs")
     p_ls.add_argument("-w", "--watch", action="store_true", help="Live-refresh table every N seconds")
     p_ls.add_argument("-i", "--interval", type=int, default=2, help="Refresh interval in seconds for --watch")
 
@@ -2749,6 +2816,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("-n", "--limit", type=int, default=25, help="Max runs to display (default: 25)")
     p_watch.add_argument("-s", "--status", type=str, help="Filter by status (e.g. RUNNING, FAILED)")
     p_watch.add_argument("-t", "--tag", type=str, help="Filter by substring/tag in run ID")
+    p_watch.add_argument("-p", "--pinned", action="store_true", help="Show only pinned runs")
     p_watch.add_argument("-i", "--interval", type=int, default=2, help="Refresh interval in seconds (default: 2)")
 
     p_ins = sub.add_parser(
@@ -2911,6 +2979,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cln.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
+    p_pin = sub.add_parser(
+        "pin",
+        aliases=["star", "keep", "lock"],
+        help="Pin a run to protect it from 'runs clean' and attach an optional note",
+    )
+    p_pin.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
+    p_pin.add_argument(
+        "-n", "--note", type=str, default=None, help="Optional note/description to attach to the run"
+    )
+    p_pin.add_argument("-u", "--unpin", action="store_true", help="Unpin the specified run")
+
+    p_unpin = sub.add_parser(
+        "unpin",
+        aliases=["unstar", "unlock"],
+        help="Unpin a run so it becomes eligible for 'runs clean'",
+    )
+    p_unpin.add_argument("run", nargs="?", help="Run ID, index (#), cluster ID, or 'latest'")
+
     p_diff = sub.add_parser("diff", help="Compare provenance and code snapshots between two runs")
     p_diff.add_argument("run_a", nargs="?", help="First run ID or index")
     p_diff.add_argument("run_b", nargs="?", help="Second run ID or index")
@@ -2974,6 +3060,8 @@ def main() -> None:
     if cmd == "ls":
         if not hasattr(args, "limit"):
             args.limit, args.status, args.tag, args.watch, args.interval = 25, None, None, False, 2
+        if not hasattr(args, "pinned"):
+            args.pinned = False
         cmd_ls(args, runs_root)
     elif cmd == "watch":
         args.watch = True
@@ -3000,6 +3088,10 @@ def main() -> None:
         cmd_stop(args, runs_root)
     elif cmd in ("clean", "prune"):
         cmd_clean(args, runs_root)
+    elif cmd in ("pin", "star", "keep", "lock"):
+        cmd_pin(args, runs_root, unpin=bool(getattr(args, "unpin", False)))
+    elif cmd in ("unpin", "unstar", "unlock"):
+        cmd_pin(args, runs_root, unpin=True)
     elif cmd == "diff":
         cmd_diff(args, runs_root)
     elif cmd in ("nodes", "cluster", "pools"):
