@@ -1168,6 +1168,13 @@ def _emit_manifest(obj):
     sys.stdout.buffer.flush()
 
 
+def _strip_git_suffix(url):
+    s = (url or "").strip().rstrip("/")
+    if s.lower().endswith(".git"):
+        s = s[:-4]
+    return s.lower()
+
+
 def _read_git_origin(repo_dir):
     cfg = repo_dir / ".git" / "config"
     if not cfg.is_file():
@@ -1176,7 +1183,7 @@ def _read_git_origin(repo_dir):
         for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
             s = line.strip()
             if s.startswith("url =") or s.startswith("url="):
-                return s.split("=", 1)[1].strip().rstrip("/").removesuffix(".git").lower()
+                return _strip_git_suffix(s.split("=", 1)[1])
     except OSError:
         pass
     return ""
@@ -1226,7 +1233,7 @@ def _resolve_runs_root(req):
                 return (hp / "runs").resolve(), None, True
 
     proj_name = (req.get("project_name") or "").strip().lower()
-    git_origin = (req.get("git_remote_url") or "").strip().rstrip("/").removesuffix(".git").lower()
+    git_origin = _strip_git_suffix(req.get("git_remote_url") or "")
 
     search_roots = []
     home = Path.home()
@@ -1390,14 +1397,17 @@ def main():
 
     try:
         import hermes_tools.condor as _ht_condor
-    except ImportError:
+    except Exception:
         _ht_condor = None
-        for sp in glob.glob(os.path.expanduser("~/.local/share/uv/tools/hermes-tools/lib/python*/site-packages")):
+        py_ver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+        for sp in glob.glob(
+            os.path.expanduser(f"~/.local/share/uv/tools/hermes-tools/lib/{py_ver}/site-packages")
+        ):
             if sp not in sys.path:
                 sys.path.insert(0, sp)
         try:
             import hermes_tools.condor as _ht_condor
-        except ImportError:
+        except Exception:
             _ht_condor = None
 
     runs_root, forced_queries, auto_discovered = _resolve_runs_root(req)
@@ -1875,7 +1885,9 @@ def _spawn_pull_process(host: str, req: Dict[str, Any]) -> subprocess.Popen[byte
             sys.exit(1)
         remote_sh = (
             'export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"; '
-            f'python3 -u -c "{py_one_liner}"'
+            'PY_BIN="$HOME/.local/share/uv/tools/hermes-tools/bin/python"; '
+            'if [ ! -x "$PY_BIN" ]; then PY_BIN="python3"; fi; '
+            f'"$PY_BIN" -u -c "{py_one_liner}"'
         )
         cmd = [ssh_bin, host, remote_sh]
 
