@@ -29,6 +29,7 @@ from hermes_tools.condor import (
     generate_sub_file,
     generate_wait_parent_script,
     get_all_cluster_ids,
+    materialize_dag_files,
     query_condor_nodes,
     query_live_condor_clusters,
     reconcile_run,
@@ -41,6 +42,7 @@ from hermes_tools.core import (
     console,
     discover_project_venv,
     expand_arg_sweeps,
+    format_run_short,
     get_hostname,
     get_prompt_style,
     get_runs_root,
@@ -862,6 +864,201 @@ def _submit_direct_run(
         sys.exit(1)
 
 
+def _materialize_run_capsule(
+    *,
+    run_id: str,
+    run_dir: Path,
+    repro_dir: Path,
+    now: datetime.datetime,
+    submit_epoch: int,
+    cwd: Path,
+    target_path: Path,
+    rel_target: str,
+    exec_type: str,
+    venv_path: Optional[Path],
+    no_venv_flag: bool,
+    arch: str,
+    cpus: Optional[int],
+    mem_mb: Optional[int],
+    gpus: Optional[int],
+    sweep_args: List[str],
+    max_parallel: Optional[int],
+    nodes_include: List[str],
+    nodes_exclude: List[str],
+    project_code: Optional[str],
+    scratch_files: List[str],
+    env_vars: Dict[str, str],
+    tag: Optional[str],
+    equivalent_cli: str,
+    git_info: Dict[str, object],
+    source_run_dir: Optional[Path],
+    clone_from_dir: Optional[Path],
+    has_dep: bool,
+    submit_via_dag: bool,
+    dry_run: bool,
+    parent_dir: Optional[Path],
+    parent_cid: Optional[int],
+    resolved_after_id: Optional[str],
+    after_raw: Optional[str],
+    require_ok: bool,
+    chain_index: Optional[int] = None,
+    chain_total: Optional[int] = None,
+) -> Tuple[Path, str, Optional[Path], Optional[str], str]:
+    """
+    Materializes `repro/` (`env.txt`, `code/`, `uncommitted.patch`, `job.sh`, `job.sub`,
+    optional `job.dag`) and `run.json`, returning `(sub_path, sub_content, dag_path, dag_content, status)`.
+    """
+    repro_dir.mkdir(parents=True, exist_ok=True)
+    patch_rel_path: Optional[str] = None
+
+    if clone_from_dir is not None and clone_from_dir != source_run_dir:
+        first_env = clone_from_dir / "repro" / "env.txt"
+        if first_env.is_file():
+            shutil.copy2(first_env, repro_dir / "env.txt")
+        snap_exec_path, snap_py_root = clone_code_snapshot(
+            clone_from_dir, rel_target, repro_dir
+        )
+        if (repro_dir / "uncommitted.patch").is_file():
+            patch_rel_path = "repro/uncommitted.patch"
+    else:
+        freeze_python_env(venv_path, repro_dir, detach=True)
+        if source_run_dir is not None:
+            snap_exec_path, snap_py_root = clone_code_snapshot(
+                source_run_dir, rel_target, repro_dir
+            )
+            if (repro_dir / "uncommitted.patch").is_file():
+                patch_rel_path = "repro/uncommitted.patch"
+        else:
+            snap_exec_path, snap_py_root = create_code_snapshot(
+                target_path, cwd, repro_dir, git_info
+            )
+            if git_info.get("is_git") and git_info.get("diff"):
+                write_text_lf(repro_dir / "uncommitted.patch", str(git_info["diff"]))
+                patch_rel_path = "repro/uncommitted.patch"
+
+    sh_path = repro_dir / "job.sh"
+    sh_content = generate_bash_wrapper(
+        exec_type=exec_type,
+        target_exec_path=snap_exec_path,
+        venv_path=venv_path,
+        pythonpath_dir=snap_py_root,
+        project_cwd=cwd,
+        run_dir=run_dir,
+        repro_dir=repro_dir,
+        submit_epoch=submit_epoch,
+        sweep_count=len(sweep_args),
+        requested_cpus=cpus,
+        env_vars=env_vars,
+    )
+    write_text_lf(sh_path, sh_content)
+    try:
+        sh_path.chmod(0o755)
+    except OSError:
+        pass
+
+    sub_path = repro_dir / "job.sub"
+    sub_content = generate_sub_file(
+        sh_path=sh_path,
+        project_cwd=cwd,
+        run_dir=run_dir,
+        repro_dir=repro_dir,
+        script_stem=target_path.stem,
+        arch=arch,
+        cpus=cpus,
+        mem_mb=mem_mb,
+        gpus=gpus,
+        sweep_args=sweep_args,
+        nodes_include=nodes_include,
+        nodes_exclude=nodes_exclude,
+        project_code=str(project_code) if project_code else None,
+        scratch_files=scratch_files,
+        max_parallel=max_parallel,
+    )
+    write_text_lf(sub_path, sub_content)
+
+    dag_path: Optional[Path] = None
+    dag_content: Optional[str] = None
+    if has_dep:
+        dag_path, dag_content = materialize_dag_files(
+            run_dir=run_dir,
+            repro_dir=repro_dir,
+            sub_path=sub_path,
+            parent_dir=parent_dir,
+            parent_cluster_id=parent_cid,
+            require_ok=require_ok,
+            condor_submit_exe=shutil.which("condor_submit"),
+        )
+
+    status = "DRY_RUN" if dry_run else ("WAITING" if submit_via_dag else "QUEUED")
+    sub_meta: Dict[str, Any] = {
+        "submitted_at": now.isoformat(timespec="seconds"),
+        "user": get_username(),
+        "submit_host": get_hostname(),
+        "target": rel_target,
+        "tag": tag or None,
+        "snapshot_executable": snap_exec_path.relative_to(run_dir).as_posix(),
+        "working_directory": str(cwd),
+        "run_directory": str(run_dir),
+        "venv": str(venv_path) if venv_path else None,
+        "no_venv": no_venv_flag,
+        "equivalent_cli": equivalent_cli,
+        "cluster_id": None,
+    }
+    if chain_index is not None and chain_total is not None:
+        sub_meta["chain_index"] = chain_index
+        sub_meta["chain_total"] = chain_total
+    if source_run_dir is not None:
+        sub_meta["cloned_from_run"] = source_run_dir.name
+
+    req_meta: Dict[str, Any] = {
+        "architecture": arch,
+        "cpus": cpus,
+        "memory_mb": mem_mb,
+        "gpus": 1 if arch == "GPU3090" else gpus,
+        "sweep_count": len(sweep_args),
+        **({"max_parallel": max_parallel} if chain_index is None else {}),
+        "sweep_arguments": sweep_args,
+        "node_include": nodes_include,
+        "node_exclude": nodes_exclude,
+        "project_code": str(project_code) if project_code else None,
+        "scratch_files": scratch_files,
+        "env": env_vars,
+    }
+
+    run_json_data: Dict[str, Any] = {
+        "run_id": run_id,
+        "status": status,
+        "submission": sub_meta,
+        "resources_requested": req_meta,
+        "git": {
+            "is_git": git_info.get("is_git", False),
+            "branch": git_info.get("branch"),
+            "commit": git_info.get("commit"),
+            "dirty": git_info.get("dirty", False),
+            "patch_file": patch_rel_path,
+            **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
+        },
+        "executions": [],
+    }
+    if has_dep:
+        run_json_data["dependency"] = {
+            "parent_run_id": resolved_after_id
+            or (
+                parent_dir.name
+                if parent_dir
+                else (str(parent_cid) if parent_cid else str(after_raw or ""))
+            ),
+            "parent_run_dir": str(parent_dir) if parent_dir else None,
+            "parent_cluster_id": parent_cid,
+            "require_ok": require_ok,
+            "dagman_cluster_id": None,
+            "job_cluster_id": None,
+        }
+
+    atomic_write_json(run_dir / "run.json", run_json_data, repro_dir)
+    return sub_path, sub_content, dag_path, dag_content, status
+
+
 def main() -> None:
     argv = sys.argv[1:]
     passthrough_args = ""
@@ -897,83 +1094,30 @@ def main() -> None:
     source_data: Optional[Dict[str, Any]] = None
     cloned_from_label: Optional[str] = None
     if getattr(args, "from_run", None):
-        from hermes_tools.runs_cli import _format_run_short, resolve_run_dir
+        from hermes_tools.runs_cli import resolve_run_dir
 
         source_run_dir = resolve_run_dir(runs_root, args.from_run)
         source_data = load_run_json(source_run_dir)
-        cloned_from_label = _format_run_short(source_run_dir, source_data)
+        cloned_from_label = format_run_short(source_run_dir, source_data)
         src_arch = (source_data.get("resources_requested") or {}).get("architecture")
         if src_arch and args.arch is None:
             proj_cfg = {**proj_cfg, "arch": src_arch}
 
     parent_run_dir: Optional[Path] = None
-    parent_data: Optional[Dict[str, Any]] = None
     parent_cid: Optional[int] = None
     submit_via_dag = False
+    resolved_after_id: Optional[str] = None
 
     if args.after:
-        from hermes_tools.runs_cli import resolve_run_dir
+        from hermes_tools.runs_cli import resolve_after_parent
 
-        parent_run_dir = resolve_run_dir(runs_root, args.after, exit_on_fail=False)
-        if parent_run_dir and parent_run_dir.is_dir():
-            parent_data = load_run_json(parent_run_dir)
-            if not parent_data:
-                console.print(
-                    f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
-                )
-                sys.exit(1)
-
-            live_clusters = query_live_condor_clusters()
-            if run_needs_live_reconcile(parent_data):
-                parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
-            p_cids = get_all_cluster_ids(parent_data)
-            parent_cid = p_cids[-1] if p_cids else None
-            parent_status = str(parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN"))
-            is_parent_active = parent_status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or (
-                live_clusters is not None and parent_cid is not None and parent_cid in live_clusters
-            )
-
-            if not is_parent_active:
-                if parent_status == "COMPLETED":
-                    console.print(
-                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
-                        f"Submitting directly without DAGMan delay...[/dim]"
-                    )
-                    submit_via_dag = False
-                elif args.after_ok:
-                    console.print(
-                        f"[bold red]✘ Cannot submit:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
-                        f"with status '{parent_status}'. Aborting because --after-ok was specified."
-                    )
-                    sys.exit(1)
-                else:
-                    console.print(
-                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
-                        f"Proceeding with direct submission...[/dim]"
-                    )
-                    submit_via_dag = False
-            else:
-                submit_via_dag = True
-        elif args.after.strip().isdigit():
-            raw_cid = int(args.after.strip())
-            live_clusters = query_live_condor_clusters()
-            if args.dry_run or (live_clusters is not None and raw_cid in live_clusters):
-                parent_cid = raw_cid
-                parent_run_dir = None
-                parent_data = None
-                submit_via_dag = True
-                if not args.dry_run:
-                    console.print(
-                        f"[dim]Parent job [bold]#{parent_cid}[/bold] detected as active raw HTCondor cluster in condor_q.[/dim]"
-                    )
-            else:
-                console.print(
-                    f"[bold red]✘ Error:[/bold red] Cluster ID #{raw_cid} is not active in HTCondor (condor_q) and does not match any local run in {runs_root}."
-                )
-                sys.exit(1)
-        else:
-            console.print(f"[bold red]✘ Error:[/bold red] Parent run '{args.after}' could not be resolved.")
-            sys.exit(1)
+        parent_run_dir, parent_cid, submit_via_dag, resolved_after_id = resolve_after_parent(
+            runs_root,
+            args.after,
+            bool(args.after_ok),
+            query_live_condor_clusters(),
+            dry_run=bool(args.dry_run),
+        )
 
     project_code = args.project if args.project is not None else proj_cfg.get("project")
     nodes_include = list(args.node) or _as_str_list(proj_cfg.get("node"))
@@ -1030,13 +1174,6 @@ def main() -> None:
             if target_path.is_relative_to(cwd)
             else target_path.as_posix()
         )
-    resolved_after_id: Optional[str] = None
-    if parent_run_dir is not None:
-        resolved_after_id = parent_run_dir.name
-    elif parent_cid is not None:
-        resolved_after_id = str(parent_cid)
-    elif args.after:
-        resolved_after_id = str(args.after)
 
     is_chained_sweep = bool(args.chain and len(sweep_list) > 1)
     base_tokens = build_send_command_tokens(
@@ -1177,44 +1314,12 @@ def main() -> None:
         prev_run_dir: Optional[Path] = None
         prev_cid: Optional[int] = None
         created_runs: List[Tuple[Path, Optional[int], str, str]] = []
-        patch_rel_path: Optional[str] = None
 
         for idx, single_arg in enumerate(sweep_list):
             step_tag = step_tags[idx]
             step_run_id = step_run_ids[idx]
             step_run_dir = runs_root / step_run_id
             step_repro_dir = step_run_dir / "repro"
-            step_repro_dir.mkdir(parents=True, exist_ok=True)
-
-            if idx == 0:
-                freeze_python_env(venv_path, step_repro_dir, detach=True)
-                if source_run_dir is not None:
-                    snap_exec_path, snap_py_root = clone_code_snapshot(
-                        source_run_dir, rel_target, step_repro_dir
-                    )
-                    if (step_repro_dir / "uncommitted.patch").is_file():
-                        patch_rel_path = "repro/uncommitted.patch"
-                else:
-                    snap_exec_path, snap_py_root = create_code_snapshot(
-                        target_path, cwd, step_repro_dir, git_info
-                    )
-                    if git_info.get("is_git") and git_info.get("diff"):
-                        write_text_lf(step_repro_dir / "uncommitted.patch", str(git_info["diff"]))
-                        patch_rel_path = "repro/uncommitted.patch"
-                first_run_dir = step_run_dir
-            else:
-                assert first_run_dir is not None
-                first_env = first_run_dir / "repro" / "env.txt"
-                if first_env.is_file():
-                    shutil.copy2(first_env, step_repro_dir / "env.txt")
-                snap_exec_path, snap_py_root = clone_code_snapshot(
-                    first_run_dir, rel_target, step_repro_dir
-                )
-                patch_rel_path = (
-                    "repro/uncommitted.patch"
-                    if (step_repro_dir / "uncommitted.patch").is_file()
-                    else None
-                )
 
             if idx == 0:
                 step_parent_dir = parent_run_dir
@@ -1255,137 +1360,49 @@ def main() -> None:
             step_equivalent_cli = " ".join(
                 [step_tokens[0]] + [shlex.quote(t) for t in step_tokens[1:]]
             )
+            step_has_dep = step_submit_via_dag or (args.dry_run and (idx > 0 or bool(args.after)))
 
-            sh_path = step_repro_dir / "job.sh"
-            sh_content = generate_bash_wrapper(
-                exec_type=exec_type,
-                target_exec_path=snap_exec_path,
-                venv_path=venv_path,
-                pythonpath_dir=snap_py_root,
-                project_cwd=cwd,
+            sub_path, _, dag_path, _, step_status = _materialize_run_capsule(
+                run_id=step_run_id,
                 run_dir=step_run_dir,
                 repro_dir=step_repro_dir,
+                now=now,
                 submit_epoch=submit_epoch,
-                sweep_count=1,
-                requested_cpus=cpus,
-                env_vars=env_vars,
-            )
-            write_text_lf(sh_path, sh_content)
-            try:
-                sh_path.chmod(0o755)
-            except OSError:
-                pass
-
-            sub_path = step_repro_dir / "job.sub"
-            sub_content = generate_sub_file(
-                sh_path=sh_path,
-                project_cwd=cwd,
-                run_dir=step_run_dir,
-                repro_dir=step_repro_dir,
-                script_stem=target_path.stem,
+                cwd=cwd,
+                target_path=target_path,
+                rel_target=rel_target,
+                exec_type=exec_type,
+                venv_path=venv_path,
+                no_venv_flag=no_venv_flag,
                 arch=arch,
                 cpus=cpus,
                 mem_mb=mem_mb,
                 gpus=gpus,
                 sweep_args=[single_arg],
+                max_parallel=None,
                 nodes_include=nodes_include,
                 nodes_exclude=nodes_exclude,
                 project_code=str(project_code) if project_code else None,
                 scratch_files=scratch_files,
+                env_vars=env_vars,
+                tag=step_tag or None,
+                equivalent_cli=step_equivalent_cli,
+                git_info=git_info,
+                source_run_dir=source_run_dir,
+                clone_from_dir=first_run_dir if idx > 0 else None,
+                has_dep=step_has_dep,
+                submit_via_dag=step_submit_via_dag,
+                dry_run=bool(args.dry_run),
+                parent_dir=step_parent_dir,
+                parent_cid=step_parent_cid,
+                resolved_after_id=step_resolved_after,
+                after_raw=str(args.after) if args.after else None,
+                require_ok=bool(args.after_ok),
+                chain_index=idx,
+                chain_total=len(sweep_list),
             )
-            write_text_lf(sub_path, sub_content)
-
-            step_has_dep = step_submit_via_dag or (args.dry_run and (idx > 0 or bool(args.after)))
-            dag_path: Optional[Path] = None
-            if step_has_dep:
-                wait_script_path = step_repro_dir / "wait_parent.py"
-                write_text_lf(wait_script_path, generate_wait_parent_script())
-                try:
-                    wait_script_path.chmod(0o755)
-                except OSError:
-                    pass
-                dag_path = step_repro_dir / "job.dag"
-                submit_py = resolve_submit_python()
-                dagman_cfg_path: Optional[Path] = None
-                dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
-                if dagman_cfg:
-                    dagman_cfg_path = step_repro_dir / "dagman.config"
-                    write_text_lf(dagman_cfg_path, dagman_cfg)
-                dag_content = generate_dag_file(
-                    sub_path=sub_path,
-                    wait_script_path=wait_script_path,
-                    python_bin=submit_py,
-                    child_dir=step_run_dir,
-                    parent_dir=step_parent_dir,
-                    parent_cluster_id=step_parent_cid,
-                    require_ok=bool(args.after_ok),
-                    config_path=dagman_cfg_path,
-                )
-                write_text_lf(dag_path, dag_content)
-
-            step_status = (
-                "DRY_RUN"
-                if args.dry_run
-                else ("WAITING" if step_submit_via_dag else "QUEUED")
-            )
-            step_run_json: Dict[str, Any] = {
-                "run_id": step_run_id,
-                "status": step_status,
-                "submission": {
-                    "submitted_at": now.isoformat(timespec="seconds"),
-                    "user": get_username(),
-                    "submit_host": get_hostname(),
-                    "target": rel_target,
-                    "tag": step_tag or None,
-                    "snapshot_executable": snap_exec_path.relative_to(step_run_dir).as_posix(),
-                    "working_directory": str(cwd),
-                    "run_directory": str(step_run_dir),
-                    "venv": str(venv_path) if venv_path else None,
-                    "no_venv": no_venv_flag,
-                    "equivalent_cli": step_equivalent_cli,
-                    "cluster_id": None,
-                    "chain_index": idx,
-                    "chain_total": len(sweep_list),
-                    **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
-                },
-                "resources_requested": {
-                    "architecture": arch,
-                    "cpus": cpus,
-                    "memory_mb": mem_mb,
-                    "gpus": 1 if arch == "GPU3090" else gpus,
-                    "sweep_count": 1,
-                    "sweep_arguments": [single_arg],
-                    "node_include": nodes_include,
-                    "node_exclude": nodes_exclude,
-                    "project_code": str(project_code) if project_code else None,
-                    "scratch_files": scratch_files,
-                    "env": env_vars,
-                },
-                "git": {
-                    "is_git": git_info.get("is_git", False),
-                    "branch": git_info.get("branch"),
-                    "commit": git_info.get("commit"),
-                    "dirty": git_info.get("dirty", False),
-                    "patch_file": patch_rel_path,
-                    **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
-                },
-                "executions": [],
-            }
-            if step_has_dep:
-                step_run_json["dependency"] = {
-                    "parent_run_id": step_resolved_after
-                    or (
-                        step_parent_dir.name
-                        if step_parent_dir
-                        else (str(step_parent_cid) if step_parent_cid else str(args.after))
-                    ),
-                    "parent_run_dir": str(step_parent_dir) if step_parent_dir else None,
-                    "parent_cluster_id": step_parent_cid,
-                    "require_ok": bool(args.after_ok),
-                    "dagman_cluster_id": None,
-                    "job_cluster_id": None,
-                }
-            atomic_write_json(step_run_dir / "run.json", step_run_json, step_repro_dir)
+            if idx == 0:
+                first_run_dir = step_run_dir
 
             submitted_cid: Optional[int] = None
             if not args.dry_run:
@@ -1422,146 +1439,45 @@ def main() -> None:
         return
 
     # 7. Materialize Run Directory & Repro Capsule (Cached/detached env freeze)
-    repro_dir.mkdir(parents=True, exist_ok=True)
-    freeze_python_env(venv_path, repro_dir, detach=True)
-
-    patch_rel_path: Optional[str] = None
-    if source_run_dir is not None:
-        snap_exec_path, snap_py_root = clone_code_snapshot(source_run_dir, rel_target, repro_dir)
-        if (repro_dir / "uncommitted.patch").is_file():
-            patch_rel_path = "repro/uncommitted.patch"
-    else:
-        snap_exec_path, snap_py_root = create_code_snapshot(target_path, cwd, repro_dir, git_info)
-        if git_info.get("is_git") and git_info.get("diff"):
-            write_text_lf(repro_dir / "uncommitted.patch", str(git_info["diff"]))
-            patch_rel_path = "repro/uncommitted.patch"
-
-    sh_path = repro_dir / "job.sh"
-    sh_content = generate_bash_wrapper(
-        exec_type=exec_type,
-        target_exec_path=snap_exec_path,
-        venv_path=venv_path,
-        pythonpath_dir=snap_py_root,
-        project_cwd=cwd,
+    is_sweep = len(sweep_list) > 1
+    has_dep = submit_via_dag or bool(args.dry_run and args.after)
+    sub_path, sub_content, dag_path, dag_content, _ = _materialize_run_capsule(
+        run_id=run_id,
         run_dir=run_dir,
         repro_dir=repro_dir,
+        now=now,
         submit_epoch=submit_epoch,
-        sweep_count=len(sweep_list),
-        requested_cpus=cpus,
-        env_vars=env_vars,
-    )
-    write_text_lf(sh_path, sh_content)
-    try:
-        sh_path.chmod(0o755)
-    except OSError:
-        pass
-
-    sub_path = repro_dir / "job.sub"
-    sub_content = generate_sub_file(
-        sh_path=sh_path,
-        project_cwd=cwd,
-        run_dir=run_dir,
-        repro_dir=repro_dir,
-        script_stem=target_path.stem,
+        cwd=cwd,
+        target_path=target_path,
+        rel_target=rel_target,
+        exec_type=exec_type,
+        venv_path=venv_path,
+        no_venv_flag=no_venv_flag,
         arch=arch,
         cpus=cpus,
         mem_mb=mem_mb,
         gpus=gpus,
         sweep_args=sweep_list,
+        max_parallel=max_parallel,
         nodes_include=nodes_include,
         nodes_exclude=nodes_exclude,
         project_code=str(project_code) if project_code else None,
         scratch_files=scratch_files,
-        max_parallel=max_parallel,
+        env_vars=env_vars,
+        tag=tag or None,
+        equivalent_cli=equivalent_cli,
+        git_info=git_info,
+        source_run_dir=source_run_dir,
+        clone_from_dir=None,
+        has_dep=has_dep,
+        submit_via_dag=submit_via_dag,
+        dry_run=bool(args.dry_run),
+        parent_dir=parent_run_dir,
+        parent_cid=parent_cid,
+        resolved_after_id=resolved_after_id,
+        after_raw=str(args.after) if args.after else None,
+        require_ok=bool(args.after_ok),
     )
-    write_text_lf(sub_path, sub_content)
-
-    is_sweep = len(sweep_list) > 1
-
-    dag_path: Optional[Path] = None
-    dag_content: Optional[str] = None
-    if submit_via_dag or (args.dry_run and args.after):
-        wait_script_path = repro_dir / "wait_parent.py"
-        write_text_lf(wait_script_path, generate_wait_parent_script())
-        try:
-            wait_script_path.chmod(0o755)
-        except OSError:
-            pass
-
-        dag_path = repro_dir / "job.dag"
-        submit_py = resolve_submit_python()
-        dagman_cfg_path: Optional[Path] = None
-        dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
-        if dagman_cfg:
-            dagman_cfg_path = repro_dir / "dagman.config"
-            write_text_lf(dagman_cfg_path, dagman_cfg)
-        dag_content = generate_dag_file(
-            sub_path=sub_path,
-            wait_script_path=wait_script_path,
-            python_bin=submit_py,
-            child_dir=run_dir,
-            parent_dir=parent_run_dir,
-            parent_cluster_id=parent_cid,
-            require_ok=bool(args.after_ok),
-            config_path=dagman_cfg_path,
-        )
-        write_text_lf(dag_path, dag_content)
-
-    initial_status = "DRY_RUN" if args.dry_run else ("WAITING" if submit_via_dag else "QUEUED")
-    run_json_data: Dict[str, Any] = {
-        "run_id": run_id,
-        "status": initial_status,
-        "submission": {
-            "submitted_at": now.isoformat(timespec="seconds"),
-            "user": get_username(),
-            "submit_host": get_hostname(),
-            "target": rel_target,
-            "tag": tag or None,
-            "snapshot_executable": snap_exec_path.relative_to(run_dir).as_posix(),
-            "working_directory": str(cwd),
-            "run_directory": str(run_dir),
-            "venv": str(venv_path) if venv_path else None,
-            "no_venv": no_venv_flag,
-            "equivalent_cli": equivalent_cli,
-            "cluster_id": None,
-            **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
-        },
-        "resources_requested": {
-            "architecture": arch,
-            "cpus": cpus,
-            "memory_mb": mem_mb,
-            "gpus": 1 if arch == "GPU3090" else gpus,
-            "sweep_count": len(sweep_list),
-            "max_parallel": max_parallel,
-            "sweep_arguments": sweep_list,
-            "node_include": nodes_include,
-            "node_exclude": nodes_exclude,
-            "project_code": str(project_code) if project_code else None,
-            "scratch_files": scratch_files,
-            "env": env_vars,
-        },
-        "git": {
-            "is_git": git_info.get("is_git", False),
-            "branch": git_info.get("branch"),
-            "commit": git_info.get("commit"),
-            "dirty": git_info.get("dirty", False),
-            "patch_file": patch_rel_path,
-            **({"cloned_from_run": source_run_dir.name} if source_run_dir else {}),
-        },
-        "executions": [],
-    }
-    if submit_via_dag or (args.dry_run and args.after):
-        run_json_data["dependency"] = {
-            "parent_run_id": resolved_after_id or (parent_run_dir.name if parent_run_dir else (str(parent_cid) if parent_cid else str(args.after))),
-            "parent_run_dir": str(parent_run_dir) if parent_run_dir else None,
-            "parent_cluster_id": parent_cid,
-            "require_ok": bool(args.after_ok),
-            "dagman_cluster_id": None,
-            "job_cluster_id": None,
-        }
-
-    run_json_path = run_dir / "run.json"
-    atomic_write_json(run_json_path, run_json_data, repro_dir)
 
     if args.dry_run:
         from rich.syntax import Syntax

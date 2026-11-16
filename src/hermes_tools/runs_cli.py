@@ -5,7 +5,6 @@ runs_cli.py — HTCondor Run Manager, Telemetry Inspector & Recovery CLI entrypo
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime
 import json
 import os
@@ -14,7 +13,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,12 +24,10 @@ from rich.table import Table
 from hermes_tools.condor import (
     build_send_command_tokens,
     compute_telemetry_summary,
-    generate_dag_file,
-    generate_dagman_config,
     generate_retry_sub_file,
-    generate_wait_parent_script,
     get_all_cluster_ids,
     get_failed_or_missing_procs,
+    materialize_dag_files,
     query_condor_better_analyze,
     query_condor_nodes,
     query_job_live_telemetry,
@@ -46,18 +42,18 @@ from hermes_tools.condor import (
 from hermes_tools.core import (
     console,
     dir_size_mb,
+    extract_run_display_parts as _extract_run_display_parts,
     format_duration,
+    format_run_short as _format_run_short,
     get_execution_records,
     get_prompt_style,
     get_runs_root,
     get_username,
     get_watch_row_limit,
     list_run_dirs,
-    load_project_config,
     load_run_json,
     locked_mutate_run_json,
     resolve_latest_symlink,
-    resolve_submit_python,
     set_execution_records,
     style_status,
     summarize_metrics,
@@ -65,67 +61,21 @@ from hermes_tools.core import (
     update_latest_symlink,
     write_text_lf,
 )
+from hermes_tools.pull import (  # noqa: F401
+    _REMOTE_PULL_SCRIPT,
+    _parse_remote_spec,
+    _resolve_pull_target,
+    cmd_pull,
+)
 from hermes_tools.snapshot import (
     diff_directories as _diff_directories,
     refresh_code_snapshot,
 )
-
-
-def _extract_run_display_parts(
-    run_dir: Path, data: Dict[str, Any]
-) -> Tuple[str, str, str]:
-    """
-    Returns (plain_label, rich_label, short_date) for a run:
-      - plain_label: e.g. 'r_peak_pipeline' or 'train (exp1)'
-      - rich_label : e.g. '[bold white]train[/bold white] [cyan](exp1)[/cyan]'
-      - short_date : e.g. '2026-11-03 15:22'
-    """
-    sub = data.get("submission", {})
-    req = data.get("resources_requested", {})
-    arch = str(req.get("architecture", "—"))
-    target_str = str(sub.get("target") or "").strip()
-    tag_str = str(sub.get("tag") or "").strip()
-
-    if target_str:
-        stem = Path(target_str).stem
-        if tag_str:
-            plain_label = f"{stem} ({tag_str})"
-            rich_label = f"[bold white]{stem}[/bold white] [cyan]({tag_str})[/cyan]"
-        else:
-            plain_label = stem
-            rich_label = f"[bold white]{stem}[/bold white]"
-    elif len(run_dir.name) > 20 and run_dir.name[4:5] == "-" and run_dir.name[19:20] == "_":
-        rest = run_dir.name[20:]
-        if arch != "—" and rest.endswith(f"_{arch}"):
-            rest = rest[: -(len(arch) + 1)]
-            plain_label = rest
-            rich_label = f"[bold white]{rest}[/bold white]"
-        elif arch != "—" and f"_{arch}_" in rest:
-            stem_part, tag_part = rest.split(f"_{arch}_", 1)
-            plain_label = f"{stem_part} ({tag_part})"
-            rich_label = f"[bold white]{stem_part}[/bold white] [cyan]({tag_part})[/cyan]"
-        else:
-            plain_label = rest
-            rich_label = f"[bold white]{rest}[/bold white]"
-    else:
-        plain_label = run_dir.name
-        rich_label = f"[bold white]{run_dir.name}[/bold white]"
-
-    raw_iso = str(sub.get("submitted_at") or "").strip()
-    if len(raw_iso) >= 16:
-        short_date = raw_iso[5:16].replace("T", " ")
-    elif len(run_dir.name) >= 16 and run_dir.name[4:5] == "-" and run_dir.name[10:11] == "_":
-        short_date = f"{run_dir.name[5:10]} {run_dir.name[11:16].replace('-', ':')}"
-    else:
-        short_date = "—"
-
-    return plain_label, rich_label, short_date
-
-
-def _format_run_short(run_dir: Path, data: Optional[Dict[str, Any]] = None) -> str:
-    d = data if data is not None else load_run_json(run_dir)
-    _, rich_label, short_date = _extract_run_display_parts(run_dir, d)
-    return f"{rich_label} [dim]({short_date})[/dim]"
+from hermes_tools.telemetry import (
+    _build_live_telemetry_panel,
+    _build_telemetry_plot_panel,
+    _save_telemetry_matplotlib,
+)
 
 
 def resolve_run_dir(
@@ -900,18 +850,27 @@ def _stop_single_run(
         console.print(f"[cyan]Updated {run_dir.name}/run.json status -> ABORTED[/cyan]")
 
 
-def _find_downstream_waiting_runs(
+def _find_downstream_runs(
     runs_root: Path,
     root_run_dir: Path,
     root_cids: List[int],
     live_clusters: Optional[Dict[int, Dict[str, Any]]],
+    *,
+    active_only: bool,
+    include_completed: bool = False,
 ) -> List[Tuple[Path, List[int], Dict[str, Any]]]:
-    """Finds transitive downstream active/waiting runs depending on root_run_dir or root_cids."""
+    """
+    Finds transitive downstream runs depending on `root_run_dir` or `root_cids`.
+    When `active_only=True` (for `runs stop`), returns active/waiting downstream runs.
+    When `active_only=False` (for `runs retry`), returns inactive downstream runs in pipeline order.
+    """
     dirs = list_run_dirs(runs_root)
     if not dirs:
         return []
+    if not active_only:
+        dirs = list(reversed(dirs))
 
-    loaded: List[Tuple[Path, Dict[str, Any], List[int], bool]] = []
+    loaded: List[Tuple[Path, Dict[str, Any], List[int], List[int], str, bool]] = []
     for d in dirs:
         if d == root_run_dir:
             continue
@@ -921,14 +880,23 @@ def _find_downstream_waiting_runs(
         dep = raw_data.get("dependency")
         if not isinstance(dep, dict):
             continue
-        data = reconcile_run(d, raw_data, live_clusters) if run_needs_live_reconcile(raw_data) else raw_data
+        data = (
+            reconcile_run(d, raw_data, live_clusters)
+            if run_needs_live_reconcile(raw_data)
+            else raw_data
+        )
         st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
         cids = get_all_cluster_ids(data)
-        act_cids = [c for c in cids if live_clusters is None or c in live_clusters]
+        act_cids = [
+            c
+            for c in cids
+            if (live_clusters is None if active_only else False)
+            or (live_clusters is not None and c in live_clusters)
+        ]
         is_active = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or bool(act_cids)
-        if not is_active:
+        if active_only and not is_active:
             continue
-        loaded.append((d, data, act_cids or cids, is_active))
+        loaded.append((d, data, cids, act_cids or cids, st, is_active))
 
     downstream: List[Tuple[Path, List[int], Dict[str, Any]]] = []
     frontier_names = {root_run_dir.name}
@@ -938,7 +906,7 @@ def _find_downstream_waiting_runs(
     changed = True
     while changed:
         changed = False
-        for d, data, tcids, _ in loaded:
+        for d, data, cids, tcids, st, is_active in loaded:
             if d in visited:
                 continue
             dep = data.get("dependency") or {}
@@ -949,12 +917,27 @@ def _find_downstream_waiting_runs(
             )
             if matches_parent:
                 visited.add(d)
-                downstream.append((d, tcids, data))
                 frontier_names.add(d.name)
-                frontier_cids.update(tcids)
+                frontier_cids.update(tcids if active_only else cids)
                 changed = True
+                if not active_only:
+                    if is_active or (st == "COMPLETED" and not include_completed):
+                        continue
+                downstream.append((d, tcids, data))
 
     return downstream
+
+
+def _find_downstream_waiting_runs(
+    runs_root: Path,
+    root_run_dir: Path,
+    root_cids: List[int],
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
+) -> List[Tuple[Path, List[int], Dict[str, Any]]]:
+    """Finds transitive downstream active/waiting runs depending on root_run_dir or root_cids."""
+    return _find_downstream_runs(
+        runs_root, root_run_dir, root_cids, live_clusters, active_only=True
+    )
 
 
 def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
@@ -1102,1153 +1085,6 @@ def cmd_sync(args: argparse.Namespace, runs_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: `runs pull` (`fetch`, `download`)
-# ---------------------------------------------------------------------------
-_PULL_MANIFEST_PREFIX = b"HERMES_PULL_MANIFEST:"
-
-_PULL_WEIGHT_EXTENSIONS = {
-    ".pt",
-    ".pth",
-    ".ckpt",
-    ".safetensors",
-    ".bin",
-    ".onnx",
-    ".h5",
-    ".hdf5",
-    ".tar",
-    ".gz",
-    ".tgz",
-    ".bz2",
-    ".xz",
-    ".zip",
-    ".7z",
-    ".zst",
-}
-
-_REMOTE_PULL_SCRIPT = r'''
-import fnmatch
-import glob
-import io
-import json
-import os
-import socket
-import stat
-import sys
-import tarfile
-from pathlib import Path
-
-MANIFEST_PREFIX = b"HERMES_PULL_MANIFEST:"
-WEIGHT_EXTS = {
-    ".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".onnx",
-    ".h5", ".hdf5", ".tar", ".gz", ".tgz", ".bz2", ".xz",
-    ".zip", ".7z", ".zst",
-}
-SKIP_DIRS = {
-    ".git", ".venv", "venv", "env", "conda", "miniconda3", "anaconda3",
-    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    "node_modules", "wandb", ".cache", ".local", ".vscode", ".vscode-server",
-}
-
-
-class _SafeReader:
-    def __init__(self, fh, size):
-        self.fh = fh
-        self.rem = size
-
-    def read(self, n=-1):
-        if self.rem <= 0:
-            return b""
-        to_read = self.rem if (n is None or n < 0 or n > self.rem) else n
-        chunk = self.fh.read(to_read)
-        if not chunk:
-            pad = b"\x00" * to_read
-            self.rem -= to_read
-            return pad
-        self.rem -= len(chunk)
-        return chunk
-
-
-def _emit_manifest(obj):
-    sys.stdout.buffer.write(MANIFEST_PREFIX + json.dumps(obj).encode("utf-8") + b"\n")
-    sys.stdout.buffer.flush()
-
-
-def _strip_git_suffix(url):
-    s = (url or "").strip().rstrip("/")
-    if s.lower().endswith(".git"):
-        s = s[:-4]
-    return s.lower()
-
-
-def _read_git_origin(repo_dir):
-    cfg = repo_dir / ".git" / "config"
-    if not cfg.is_file():
-        return ""
-    try:
-        for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = line.strip()
-            if s.startswith("url =") or s.startswith("url="):
-                return _strip_git_suffix(s.split("=", 1)[1])
-    except OSError:
-        pass
-    return ""
-
-
-def _has_run_subdirs(runs_dir):
-    if not runs_dir.is_dir():
-        return False
-    try:
-        with os.scandir(runs_dir) as it:
-            for e in it:
-                if not e.name.startswith(".") and not e.is_symlink() and e.is_dir(follow_symlinks=False):
-                    if (Path(e.path) / "run.json").is_file():
-                        return True
-    except OSError:
-        pass
-    return False
-
-
-def _resolve_runs_root(req):
-    explicit = (req.get("remote_dir") or "").strip()
-    if explicit:
-        expanded = os.path.expandvars(os.path.expanduser(explicit))
-        p = Path(expanded)
-        if not p.is_absolute():
-            p = Path.home() / p
-        if p.is_dir():
-            if (p / "run.json").is_file():
-                return p.parent.resolve(), [p.name], False
-            if p.name == "runs" or _has_run_subdirs(p):
-                return p.resolve(), None, False
-            if (p / "runs").is_dir():
-                return (p / "runs").resolve(), None, False
-            return (p / "runs").resolve(), None, False
-        return None, None, False
-
-    for hint in req.get("hint_dirs") or []:
-        if not hint:
-            continue
-        hp = Path(os.path.expandvars(os.path.expanduser(str(hint))))
-        if not hp.is_absolute():
-            hp = Path.home() / hp
-        if hp.is_dir():
-            if hp.name == "runs" or _has_run_subdirs(hp):
-                return hp.resolve(), None, True
-            if (hp / "runs").is_dir():
-                return (hp / "runs").resolve(), None, True
-
-    proj_name = (req.get("project_name") or "").strip().lower()
-    git_origin = _strip_git_suffix(req.get("git_remote_url") or "")
-
-    search_roots = []
-    home = Path.home()
-    search_roots.append(home)
-    try:
-        home_real = home.resolve()
-        if home_real != home and home_real not in search_roots:
-            search_roots.append(home_real)
-    except OSError:
-        pass
-
-    candidates = []
-    visited = set()
-
-    def _walk(curr, depth):
-        if depth > 4:
-            return
-        try:
-            real_c = str(curr.resolve())
-        except OSError:
-            return
-        if real_c in visited:
-            return
-        visited.add(real_c)
-
-        runs_sub = curr / "runs"
-        if runs_sub.is_dir() and _has_run_subdirs(runs_sub):
-            score = 0
-            if git_origin and _read_git_origin(curr) == git_origin:
-                score += 100
-            if proj_name and curr.name.lower() == proj_name:
-                score += 50
-            elif proj_name and proj_name in curr.name.lower():
-                score += 20
-            if score > 0:
-                try:
-                    newest_mtime = max(
-                        (e.stat(follow_symlinks=False).st_mtime for e in os.scandir(runs_sub) if not e.name.startswith(".")),
-                        default=0.0,
-                    )
-                except OSError:
-                    newest_mtime = 0.0
-                candidates.append((score, newest_mtime, runs_sub.resolve()))
-                return
-
-        try:
-            with os.scandir(curr) as it:
-                for entry in it:
-                    if entry.name.startswith(".") or entry.name in SKIP_DIRS or entry.name == "runs":
-                        continue
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            _walk(Path(entry.path), depth + 1)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-
-    for sr in search_roots:
-        if proj_name:
-            direct = sr / req.get("project_name", proj_name) / "runs"
-            if direct.is_dir() and _has_run_subdirs(direct):
-                return direct.resolve(), None, True
-        _walk(sr, 0)
-
-    if candidates:
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return candidates[0][2], None, True
-
-    return None, None, False
-
-
-def _get_all_cids(data):
-    sub = data.get("submission") or {}
-    cids = []
-    for raw in sub.get("retry_clusters") or []:
-        try:
-            v = int(raw)
-            if v not in cids:
-                cids.append(v)
-        except Exception:
-            pass
-    mc = sub.get("cluster_id")
-    if mc is not None:
-        try:
-            v = int(mc)
-            if v not in cids:
-                cids.append(v)
-        except Exception:
-            pass
-    dep = data.get("dependency") or {}
-    if isinstance(dep, dict):
-        for k in ("dagman_cluster_id", "job_cluster_id"):
-            rc = dep.get(k)
-            if rc is not None:
-                try:
-                    v = int(rc)
-                    if v not in cids:
-                        cids.append(v)
-                except Exception:
-                    pass
-    return cids
-
-
-def _load_and_reconcile(run_dir, ht_condor, live_clusters_box):
-    rj_path = run_dir / "run.json"
-    try:
-        data = json.loads(rj_path.read_text(encoding="utf-8"))
-    except Exception:
-        data = {"run_id": run_dir.name, "status": "UNKNOWN"}
-
-    if ht_condor is not None:
-        try:
-            if ht_condor.run_needs_live_reconcile(data):
-                if not live_clusters_box[0]:
-                    live_clusters_box[1] = ht_condor.query_live_condor_clusters()
-                    live_clusters_box[0] = True
-                data = ht_condor.reconcile_run(run_dir, data, live_clusters_box[1])
-            return data
-        except Exception:
-            pass
-
-    repro_dir = run_dir / "repro"
-    if repro_dir.is_dir():
-        node_files = sorted(repro_dir.glob("node_*.json"))
-        if node_files:
-            loaded = []
-            for nf in node_files:
-                try:
-                    loaded.append(json.loads(nf.read_text(encoding="utf-8")))
-                except Exception:
-                    pass
-            if loaded:
-                loaded.sort(key=lambda x: int(x.get("process_id", 0)))
-                data["executions"] = loaded
-                data.pop("execution", None)
-    return data
-
-
-def _extract_label(run_dir, data):
-    sub = data.get("submission") or {}
-    target_str = str(sub.get("target") or "").strip()
-    tag_str = str(sub.get("tag") or "").strip()
-    if target_str:
-        stem = Path(target_str).stem
-        return f"{stem} ({tag_str})" if tag_str else stem
-    return run_dir.name
-
-
-def main():
-    try:
-        raw_in = sys.stdin.read()
-        req = json.loads(raw_in) if raw_in.strip() else {}
-    except Exception as exc:
-        _emit_manifest({"ok": False, "error": f"Invalid pull request payload: {exc}"})
-        return
-
-    for p in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/lib/condor/bin", "/usr/local/condor/bin"):
-        if os.path.isdir(p) and p not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = f"{p}:{os.environ.get('PATH', '')}"
-
-    try:
-        import hermes_tools.condor as _ht_condor
-    except Exception:
-        _ht_condor = None
-        py_ver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        for sp in glob.glob(
-            os.path.expanduser(f"~/.local/share/uv/tools/hermes-tools/lib/{py_ver}/site-packages")
-        ):
-            if sp not in sys.path:
-                sys.path.insert(0, sp)
-        try:
-            import hermes_tools.condor as _ht_condor
-        except Exception:
-            _ht_condor = None
-
-    runs_root, forced_queries, auto_discovered = _resolve_runs_root(req)
-    host_label = req.get("host") or socket.gethostname()
-    if runs_root is None:
-        if req.get("remote_dir"):
-            _emit_manifest({
-                "ok": False,
-                "error": f"Remote directory not found on {socket.gethostname()}: {req['remote_dir']}",
-            })
-        else:
-            proj = req.get("project_name") or "current project"
-            _emit_manifest({
-                "ok": False,
-                "error": (
-                    f"Could not auto-discover 'runs/' for '{proj}' on {socket.gethostname()}.\n"
-                    f"Pass `-r {host_label}:/path/to/project` or set `remote_dir = \"/path/to/project\"` in .hermes.toml."
-                ),
-            })
-        return
-
-    try:
-        with os.scandir(runs_root) as it:
-            dirs = [
-                Path(e.path)
-                for e in it
-                if not e.name.startswith(".") and not e.is_symlink() and e.is_dir(follow_symlinks=False)
-            ]
-    except OSError:
-        dirs = []
-    dirs.sort(key=lambda p: p.name, reverse=True)
-
-    latest_dir = None
-    latest_link = runs_root / "latest"
-    try:
-        if latest_link.is_symlink():
-            t = (runs_root / os.readlink(latest_link)).resolve()
-            if t.is_dir():
-                latest_dir = t
-    except OSError:
-        pass
-    if latest_dir is None:
-        dot_latest = runs_root / ".latest"
-        try:
-            if dot_latest.is_file():
-                t = (runs_root / dot_latest.read_text(encoding="utf-8").strip()).resolve()
-                if t.is_dir():
-                    latest_dir = t
-        except OSError:
-            pass
-    if latest_dir is None and dirs:
-        latest_dir = dirs[0]
-    latest_run_id = latest_dir.name if latest_dir is not None else None
-
-    queries = forced_queries if forced_queries is not None else list(req.get("queries") or [])
-    if not dirs:
-        if queries:
-            _emit_manifest({"ok": False, "error": f"No runs found in {runs_root}"})
-        else:
-            _emit_manifest({
-                "ok": True,
-                "remote_host": socket.gethostname(),
-                "remote_runs_root": str(runs_root),
-                "auto_discovered": bool(auto_discovered),
-                "latest_run_id": None,
-                "selected_runs": [],
-                "up_to_date_count": 0,
-                "total_matched": 0,
-                "total_files": 0,
-                "total_bytes": 0,
-                "skipped_weights_files": 0,
-                "skipped_weights_bytes": 0,
-                "skipped_code_files": 0,
-                "any_active": False,
-            })
-        return
-
-    live_clusters_box = [False, None]
-    loaded_cache = {}
-
-    def _get_data(d):
-        if d.name not in loaded_cache:
-            loaded_cache[d.name] = _load_and_reconcile(d, _ht_condor, live_clusters_box)
-        return loaded_cache[d.name]
-
-    candidate_dirs = []
-    seen_names = set()
-
-    if queries:
-        for raw_q in queries:
-            q = str(raw_q).strip()
-            if not q:
-                continue
-            q_matches = []
-            if q == "latest":
-                q_matches = [latest_dir if latest_dir is not None else dirs[0]]
-            elif q.isdigit() and 1 <= int(q) <= len(dirs):
-                q_matches = [dirs[int(q) - 1]]
-            else:
-                exact = [d for d in dirs if d.name == q]
-                if exact:
-                    q_matches = exact
-                else:
-                    ql = q.lower()
-                    for d in dirs:
-                        if ql in d.name.lower():
-                            q_matches.append(d)
-                        else:
-                            rj = _get_data(d)
-                            lbl = _extract_label(d, rj).lower()
-                            cids = [str(c) for c in _get_all_cids(rj)]
-                            if ql in lbl or q in cids:
-                                q_matches.append(d)
-            if not q_matches:
-                _emit_manifest({
-                    "ok": False,
-                    "error": f"No remote run matching '{q}' in {runs_root}",
-                })
-                return
-            for m in q_matches:
-                if m.name not in seen_names:
-                    seen_names.add(m.name)
-                    candidate_dirs.append(m)
-    else:
-        candidate_dirs = list(dirs)
-
-    status_filter = (req.get("status") or "").strip().upper()
-    tag_filter = (req.get("tag") or "").strip().lower()
-    pinned_only = bool(req.get("pinned", False))
-    limit = int(req.get("limit") or 0)
-
-    matched_runs = []
-    for d in candidate_dirs:
-        data = _get_data(d)
-        if pinned_only and not bool(data.get("pinned", False)):
-            continue
-        disp_st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
-        if status_filter and status_filter not in disp_st.upper():
-            continue
-        lbl = _extract_label(d, data)
-        if tag_filter and tag_filter not in d.name.lower() and tag_filter not in lbl.lower():
-            continue
-        matched_runs.append((d, data, disp_st))
-        if not queries and limit > 0 and len(matched_runs) >= limit:
-            break
-
-    include_weights = bool(req.get("include_weights", False))
-    include_code = bool(req.get("include_code", False))
-    force = bool(req.get("force", False))
-    include_globs = [str(x).strip() for x in (req.get("include_globs") or []) if str(x).strip()]
-    exclude_globs = [str(x).strip() for x in (req.get("exclude_globs") or []) if str(x).strip()]
-    local_state = req.get("local_state") or {}
-
-    files_to_send = []
-    selected_runs_meta = []
-    up_to_date_count = 0
-    total_bytes = 0
-    skipped_weights_files = 0
-    skipped_weights_bytes = 0
-    skipped_code_files = 0
-    any_active = False
-
-    for d, data, disp_st in matched_runs:
-        is_active = disp_st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING"))
-        if is_active:
-            any_active = True
-
-        loc_run = local_state.get(d.name) or {}
-        loc_files = loc_run.get("files") or {}
-        loc_status = str(loc_run.get("status") or "")
-        loc_has_code = bool(loc_run.get("has_code", False))
-
-        run_items = []
-        run_bytes = 0
-
-        for cur_root, subdirs, files in os.walk(d, followlinks=False):
-            cur_path = Path(cur_root)
-            rel_dir = cur_path.relative_to(d).as_posix()
-
-            kept_subdirs = []
-            for sd in sorted(subdirs):
-                sdp = cur_path / sd
-                if sdp.is_symlink():
-                    continue
-                sd_rel = sdp.relative_to(d).as_posix()
-                if sd_rel == "repro/code" and not include_code and not include_globs:
-                    try:
-                        for _, _, cfiles in os.walk(sdp, followlinks=False):
-                            skipped_code_files += len(cfiles)
-                    except OSError:
-                        pass
-                    continue
-                if sd_rel == "repro/code" and include_code and not force and not is_active and loc_has_code:
-                    continue
-                kept_subdirs.append(sd)
-            subdirs[:] = kept_subdirs
-
-            for fname in sorted(files):
-                if fname == ".run_json.lock" or ".tmp." in fname or ".pull_tmp." in fname:
-                    continue
-                fp = cur_path / fname
-                try:
-                    st = fp.lstat()
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-
-                rel_posix = fp.relative_to(d).as_posix()
-                if any(fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(fname, pat) for pat in exclude_globs):
-                    continue
-
-                explicit_inc = any(
-                    fnmatch.fnmatch(rel_posix, pat) or fnmatch.fnmatch(fname, pat)
-                    for pat in include_globs
-                )
-                if not explicit_inc:
-                    if rel_posix == "repro/code" or rel_posix.startswith("repro/code/"):
-                        if not include_code:
-                            skipped_code_files += 1
-                            continue
-                    if fp.suffix.lower() in WEIGHT_EXTS and not include_weights:
-                        skipped_weights_files += 1
-                        skipped_weights_bytes += st.st_size
-                        continue
-
-                mtime_int = int(st.st_mtime)
-                if rel_posix == "run.json":
-                    rj_bytes = (json.dumps(data, indent=2) + "\n").encode("utf-8")
-                    if (
-                        not force
-                        and not is_active
-                        and rel_posix in loc_files
-                        and loc_files[rel_posix] == [len(rj_bytes), mtime_int]
-                        and loc_status == disp_st
-                    ):
-                        continue
-                    run_items.append(("bytes", d.name, rel_posix, rj_bytes, mtime_int))
-                    run_bytes += len(rj_bytes)
-                else:
-                    if (
-                        not force
-                        and rel_posix in loc_files
-                        and loc_files[rel_posix] == [st.st_size, mtime_int]
-                    ):
-                        continue
-                    run_items.append(("file", d.name, rel_posix, str(fp), st.st_size, mtime_int))
-                    run_bytes += st.st_size
-
-        if not run_items:
-            up_to_date_count += 1
-            continue
-
-        files_to_send.extend(run_items)
-        total_bytes += run_bytes
-        sub = data.get("submission") or {}
-        req_res = data.get("resources_requested") or {}
-        cids = _get_all_cids(data)
-        selected_runs_meta.append({
-            "run_id": d.name,
-            "status": disp_st,
-            "arch": str(req_res.get("architecture") or "—"),
-            "target": str(sub.get("target") or ""),
-            "tag": str(sub.get("tag") or ""),
-            "submitted_at": str(sub.get("submitted_at") or ""),
-            "cluster_id": cids[-1] if cids else None,
-            "files_count": len(run_items),
-            "bytes_count": run_bytes,
-            "is_update": bool(d.name in local_state),
-            "is_active": is_active,
-        })
-
-    manifest = {
-        "ok": True,
-        "remote_host": socket.gethostname(),
-        "remote_runs_root": str(runs_root),
-        "auto_discovered": bool(auto_discovered),
-        "latest_run_id": latest_run_id,
-        "selected_runs": selected_runs_meta,
-        "up_to_date_count": up_to_date_count,
-        "total_matched": len(matched_runs),
-        "total_files": len(files_to_send),
-        "total_bytes": total_bytes,
-        "skipped_weights_files": skipped_weights_files,
-        "skipped_weights_bytes": skipped_weights_bytes,
-        "skipped_code_files": skipped_code_files,
-        "any_active": any_active,
-    }
-    _emit_manifest(manifest)
-
-    if not req.get("dry_run") and files_to_send:
-        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", compresslevel=4) as tf:
-            for item in files_to_send:
-                kind = item[0]
-                if kind == "bytes":
-                    _, run_name, rel_posix, raw_bytes, mtime_int = item
-                    ti = tarfile.TarInfo(name=f"{run_name}/{rel_posix}")
-                    ti.size = len(raw_bytes)
-                    ti.mtime = mtime_int
-                    ti.mode = 0o644
-                    tf.addfile(ti, io.BytesIO(raw_bytes))
-                else:
-                    _, run_name, rel_posix, fpath_str, fsize, mtime_int = item
-                    try:
-                        if fsize <= 8 * 1024 * 1024:
-                            with open(fpath_str, "rb") as fh:
-                                data_bytes = fh.read()
-                            ti = tarfile.TarInfo(name=f"{run_name}/{rel_posix}")
-                            ti.size = len(data_bytes)
-                            ti.mtime = mtime_int
-                            ti.mode = 0o644
-                            tf.addfile(ti, io.BytesIO(data_bytes))
-                        else:
-                            with open(fpath_str, "rb") as fh:
-                                ti = tarfile.TarInfo(name=f"{run_name}/{rel_posix}")
-                                ti.size = fsize
-                                ti.mtime = mtime_int
-                                ti.mode = 0o644
-                                tf.addfile(ti, _SafeReader(fh, fsize))
-                    except OSError:
-                        pass
-        sys.stdout.buffer.flush()
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-
-def _format_bytes(num_bytes: int | float) -> str:
-    val = float(max(0, num_bytes))
-    if val >= 1024 * 1024 * 1024:
-        return f"{val / (1024 * 1024 * 1024):.2f} GB"
-    if val >= 1024 * 1024:
-        return f"{val / (1024 * 1024):.2f} MB"
-    if val >= 1024:
-        return f"{val / 1024:.1f} KB"
-    return f"{int(val)} B"
-
-
-def _parse_remote_spec(spec: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parses a `--remote` / `remote` specification into `(host, remote_dir)`.
-    Supports `[user@]host:/path/to/project`, `/remote/path`, `~/remote/path`, or `host`.
-    """
-    s = (spec or "").strip()
-    if not s:
-        return None, None
-    if s.startswith(("/", "~", ".")):
-        return None, s
-    if ":" in s and not re.match(r"^[A-Za-z]:[\\/]", s):
-        host_part, path_part = s.split(":", 1)
-        return (host_part.strip() or None), (path_part.strip() or None)
-    return s, None
-
-
-def _read_local_git_origin(cwd: Path) -> Tuple[str, str]:
-    curr = cwd.resolve()
-    git_root: Optional[Path] = None
-    for _ in range(5):
-        if (curr / ".git").exists():
-            git_root = curr
-            break
-        if curr.parent == curr:
-            break
-        curr = curr.parent
-
-    proj_dir = git_root if git_root is not None else cwd.resolve()
-    proj_name = proj_dir.name
-    git_origin = ""
-    if git_root is not None:
-        cfg_file = git_root / ".git" / "config"
-        if cfg_file.is_file():
-            try:
-                for line in cfg_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                    s = line.strip()
-                    if s.startswith("url =") or s.startswith("url="):
-                        git_origin = s.split("=", 1)[1].strip()
-                        break
-            except OSError:
-                pass
-    return proj_name, git_origin
-
-
-def _resolve_pull_target(
-    args: argparse.Namespace, cwd: Path, runs_root: Path
-) -> Tuple[str, Optional[str], List[str], str, str]:
-    """Resolves `(host, remote_dir, hint_dirs, project_name, git_remote_url)`."""
-    proj_cfg = load_project_config(cwd)
-
-    cli_remote_host, cli_remote_dir = _parse_remote_spec(str(getattr(args, "remote", "") or ""))
-    cfg_remote_host, cfg_remote_dir = _parse_remote_spec(str(proj_cfg.get("remote", "") or ""))
-
-    explicit_host = (
-        getattr(args, "host", None)
-        or cli_remote_host
-        or proj_cfg.get("remote_host")
-        or proj_cfg.get("host")
-        or cfg_remote_host
-    )
-    host = str(explicit_host).strip() if explicit_host else "hermes"
-
-    explicit_dir = (
-        getattr(args, "remote_dir", None)
-        or cli_remote_dir
-        or proj_cfg.get("remote_dir")
-        or proj_cfg.get("remote_path")
-        or cfg_remote_dir
-    )
-    remote_dir = str(explicit_dir).strip() if explicit_dir else None
-
-    hint_dirs: List[str] = []
-    for d in list_run_dirs(runs_root)[:10]:
-        rj = load_run_json(d)
-        wd = str((rj.get("submission") or {}).get("working_directory") or "").strip()
-        if wd and wd not in hint_dirs:
-            hint_dirs.append(f"{wd.rstrip('/')}/runs")
-            hint_dirs.append(wd)
-
-    proj_name, git_origin = _read_local_git_origin(cwd)
-    return host, remote_dir, hint_dirs, proj_name, git_origin
-
-
-def _collect_local_pull_state(runs_root: Path, force: bool = False) -> Dict[str, Any]:
-    if force or not runs_root.is_dir():
-        return {}
-    state: Dict[str, Any] = {}
-    for d in list_run_dirs(runs_root):
-        rj = load_run_json(d)
-        status = str(rj.get("_live_badge") or rj.get("status", "UNKNOWN"))
-        is_active = status.startswith(("QUEUED", "RUNNING", "HELD", "WAITING"))
-        files_map: Dict[str, List[int]] = {}
-        code_dir = d / "repro" / "code"
-        has_code = False
-        try:
-            if code_dir.is_dir():
-                with os.scandir(code_dir) as it:
-                    has_code = any(True for _ in it)
-        except OSError:
-            pass
-
-        for cur_root, subdirs, files in os.walk(d, followlinks=False):
-            cur_path = Path(cur_root)
-            rel_dir = cur_path.relative_to(d).as_posix()
-            if rel_dir == "repro" and has_code and not is_active:
-                subdirs[:] = [sd for sd in subdirs if sd != "code"]
-            for fname in files:
-                if fname == ".run_json.lock" or ".tmp." in fname or ".pull_tmp." in fname:
-                    continue
-                fp = cur_path / fname
-                try:
-                    st = fp.lstat()
-                    rel_posix = fp.relative_to(d).as_posix()
-                    files_map[rel_posix] = [st.st_size, int(st.st_mtime)]
-                except OSError:
-                    pass
-        state[d.name] = {
-            "status": status,
-            "has_code": has_code,
-            "files": files_map,
-        }
-    return state
-
-
-def _spawn_pull_process(host: str, req: Dict[str, Any]) -> subprocess.Popen[bytes]:
-    script_b64 = base64.b64encode(_REMOTE_PULL_SCRIPT.encode("utf-8")).decode("ascii")
-    py_one_liner = f"import base64;exec(base64.b64decode('{script_b64}'))"
-
-    if host.lower() in ("local", "localhost-local"):
-        cmd = [sys.executable, "-u", "-c", py_one_liner]
-    else:
-        ssh_bin = shutil.which("ssh")
-        if not ssh_bin:
-            console.print("[bold red]✘ Error:[/bold red] 'ssh' client not found in PATH.")
-            sys.exit(1)
-        remote_sh = (
-            'export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"; '
-            'PY_BIN="$HOME/.local/share/uv/tools/hermes-tools/bin/python"; '
-            'if [ ! -x "$PY_BIN" ]; then PY_BIN="python3"; fi; '
-            f'"$PY_BIN" -u -c "{py_one_liner}"'
-        )
-        cmd = [ssh_bin, host, remote_sh]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert proc.stdin is not None
-    try:
-        proc.stdin.write(json.dumps(req).encode("utf-8"))
-        proc.stdin.close()
-    except OSError:
-        pass
-    return proc
-
-
-def _extract_pull_tar_stream(
-    stream: Any,
-    runs_root: Path,
-    total_bytes: int,
-    show_progress: bool = True,
-) -> Tuple[int, int]:
-    runs_root.mkdir(parents=True, exist_ok=True)
-    runs_root_resolved = runs_root.resolve()
-    extracted_files = 0
-    extracted_bytes = 0
-
-    def _do_extract(progress: Optional[Any], task_id: Optional[Any]) -> None:
-        nonlocal extracted_files, extracted_bytes
-        with tarfile.open(fileobj=stream, mode="r|gz") as tf:
-            for member in tf:
-                if not member.isfile():
-                    continue
-                rel_parts = [
-                    p
-                    for p in member.name.replace("\\", "/").split("/")
-                    if p and p != "."
-                ]
-                if not rel_parts or ".." in rel_parts:
-                    continue
-                dest_path = runs_root.joinpath(*rel_parts)
-                try:
-                    if not dest_path.resolve().is_relative_to(runs_root_resolved):
-                        continue
-                except OSError:
-                    continue
-
-                src_f = tf.extractfile(member)
-                if src_f is None:
-                    continue
-
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_dest = dest_path.parent / f".{dest_path.name}.pull_tmp.{os.getpid()}"
-                try:
-                    with open(tmp_dest, "wb") as out_f:
-                        while True:
-                            chunk = src_f.read(65536)
-                            if not chunk:
-                                break
-                            out_f.write(chunk)
-                            extracted_bytes += len(chunk)
-                            if progress is not None and task_id is not None:
-                                progress.update(task_id, advance=len(chunk))
-                    os.replace(tmp_dest, dest_path)
-                    if member.mtime:
-                        mtime_int = int(member.mtime)
-                        try:
-                            os.utime(dest_path, (mtime_int, mtime_int))
-                        except OSError:
-                            pass
-                    extracted_files += 1
-                finally:
-                    if tmp_dest.exists():
-                        try:
-                            tmp_dest.unlink()
-                        except OSError:
-                            pass
-
-    if show_progress and console.is_terminal and total_bytes > 0:
-        from rich.progress import (
-            BarColumn,
-            DownloadColumn,
-            Progress,
-            SpinnerColumn,
-            TextColumn,
-            TransferSpeedColumn,
-        )
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            tid = progress.add_task("Downloading run artifacts...", total=total_bytes)
-            _do_extract(progress, tid)
-    else:
-        _do_extract(None, None)
-
-    return extracted_files, extracted_bytes
-
-
-def _execute_single_pull(
-    args: argparse.Namespace, runs_root: Path, quiet_if_up_to_date: bool = False
-) -> Tuple[int, bool]:
-    cwd = Path.cwd()
-    host, remote_dir, hint_dirs, proj_name, git_origin = _resolve_pull_target(
-        args, cwd, runs_root
-    )
-    full_flag = bool(getattr(args, "full", False))
-    include_weights = bool(getattr(args, "weights", False) or full_flag)
-    include_code = bool(getattr(args, "code", False) or full_flag)
-    force = bool(getattr(args, "force", False))
-    dry_run = bool(getattr(args, "dry_run", False))
-    all_runs = bool(getattr(args, "all", False))
-    raw_limit = int(getattr(args, "limit", 25) or 0)
-    limit = 0 if all_runs else raw_limit
-
-    raw_queries = getattr(args, "run", None)
-    if isinstance(raw_queries, str):
-        queries = [raw_queries] if raw_queries.strip() else []
-    elif isinstance(raw_queries, list):
-        queries = [str(q).strip() for q in raw_queries if str(q).strip()]
-    else:
-        queries = []
-
-    local_state = _collect_local_pull_state(runs_root, force=force)
-    req: Dict[str, Any] = {
-        "host": host,
-        "remote_dir": remote_dir,
-        "hint_dirs": hint_dirs,
-        "project_name": proj_name,
-        "git_remote_url": git_origin,
-        "queries": queries,
-        "limit": limit,
-        "status": getattr(args, "status", None),
-        "tag": getattr(args, "tag", None),
-        "pinned": bool(getattr(args, "pinned", False)),
-        "include_weights": include_weights,
-        "include_code": include_code,
-        "include_globs": list(getattr(args, "include", None) or []),
-        "exclude_globs": list(getattr(args, "exclude", None) or []),
-        "force": force,
-        "dry_run": dry_run,
-        "local_state": local_state,
-    }
-
-    proc = _spawn_pull_process(host, req)
-    assert proc.stdout is not None and proc.stderr is not None
-
-    manifest: Optional[Dict[str, Any]] = None
-    pre_lines: List[str] = []
-    try:
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if line.startswith(_PULL_MANIFEST_PREFIX):
-                raw_json = line[len(_PULL_MANIFEST_PREFIX) :].decode("utf-8", errors="replace")
-                manifest = json.loads(raw_json)
-                break
-            pre_lines.append(line.decode("utf-8", errors="replace").rstrip())
-
-        if manifest is None:
-            stderr_txt = proc.stderr.read().decode("utf-8", errors="replace").strip()
-            proc.wait()
-            err_detail = stderr_txt or "\n".join(pre_lines).strip() or "Connection closed unexpectedly."
-            console.print(f"[bold red]✘ Failed to pull from '{host}':[/bold red]\n{err_detail}")
-            sys.exit(1)
-
-        if not manifest.get("ok"):
-            proc.wait()
-            console.print(f"[bold red]✘ {manifest.get('error', 'Remote pull error.')}[/bold red]")
-            sys.exit(1)
-
-        remote_runs_root = str(manifest.get("remote_runs_root") or "")
-        auto_discovered = bool(manifest.get("auto_discovered", False))
-        selected_runs: List[Dict[str, Any]] = list(manifest.get("selected_runs") or [])
-        up_to_date_count = int(manifest.get("up_to_date_count") or 0)
-        total_matched = int(manifest.get("total_matched") or 0)
-        total_files = int(manifest.get("total_files") or 0)
-        total_bytes = int(manifest.get("total_bytes") or 0)
-        skipped_weights_files = int(manifest.get("skipped_weights_files") or 0)
-        skipped_weights_bytes = int(manifest.get("skipped_weights_bytes") or 0)
-        any_active = bool(manifest.get("any_active", False))
-        latest_run_id = manifest.get("latest_run_id")
-
-        if auto_discovered and not quiet_if_up_to_date:
-            console.print(
-                f"[dim cyan]ℹ Auto-discovered remote runs:[/dim cyan] [bold]{host}:{remote_runs_root}[/bold]"
-            )
-
-        if total_matched == 0:
-            proc.wait()
-            if not quiet_if_up_to_date:
-                console.print(f"[yellow]No matching runs found on {host}:{remote_runs_root}.[/yellow]")
-            return 0, False
-
-        if not selected_runs:
-            proc.wait()
-            if not quiet_if_up_to_date:
-                console.print(
-                    f"[bold green]✔ All {up_to_date_count} matching run(s) are already up-to-date locally in {runs_root}.[/bold green]"
-                )
-                if skipped_weights_files > 0:
-                    console.print(
-                        f"[dim]  ℹ Skipped {skipped_weights_files} checkpoint/weight file(s) "
-                        f"({_format_bytes(skipped_weights_bytes)}) — pass [bold]--weights[/bold] to include them.[/dim]"
-                    )
-            return 0, any_active
-
-        tbl_title = (
-            f"🔍 Dry Run — Runs to Pull from {host}"
-            if dry_run
-            else f"📥 Pulling Runs from {host}"
-        )
-        tbl = Table(
-            title=tbl_title,
-            title_style="bold cyan",
-            box=box.ROUNDED,
-            header_style="bold cyan",
-            padding=(0, 1),
-        )
-        tbl.add_column("Run", no_wrap=True)
-        tbl.add_column("Submitted", style="dim", no_wrap=True)
-        tbl.add_column("Cluster", style="cyan", justify="right", no_wrap=True)
-        tbl.add_column("Arch", style="magenta", no_wrap=True)
-        tbl.add_column("Status", no_wrap=True)
-        tbl.add_column("Sync", justify="center", no_wrap=True)
-        tbl.add_column("Files", justify="right", no_wrap=True)
-        tbl.add_column("Size", justify="right", style="cyan", no_wrap=True)
-
-        for r in selected_runs[:30]:
-            fake_data = {
-                "submission": {
-                    "target": r.get("target"),
-                    "tag": r.get("tag"),
-                    "submitted_at": r.get("submitted_at"),
-                },
-                "resources_requested": {"architecture": r.get("arch")},
-            }
-            _, rich_label, short_date = _extract_run_display_parts(
-                Path(str(r["run_id"])), fake_data
-            )
-            star = (
-                "[bold yellow]★[/bold yellow] "
-                if latest_run_id and r.get("run_id") == latest_run_id
-                else ""
-            )
-            sync_badge = (
-                "[cyan]update[/cyan]" if r.get("is_update") else "[bold green]new[/bold green]"
-            )
-            cid_val = r.get("cluster_id")
-            tbl.add_row(
-                f"{star}{rich_label}",
-                short_date,
-                str(cid_val) if cid_val else "—",
-                str(r.get("arch") or "—"),
-                style_status(str(r.get("status") or "UNKNOWN")),
-                sync_badge,
-                str(r.get("files_count", 0)),
-                _format_bytes(int(r.get("bytes_count", 0))),
-            )
-
-        if len(selected_runs) > 30:
-            tbl.add_row(
-                f"[dim]... (+{len(selected_runs) - 30} more runs)[/dim]",
-                "—",
-                "—",
-                "—",
-                "—",
-                "—",
-                "—",
-                "—",
-            )
-
-        console.print(tbl)
-
-        if dry_run:
-            proc.wait()
-            console.print(
-                f"[bold cyan]Dry run:[/bold cyan] Would pull [bold]{len(selected_runs)}[/bold] run(s) "
-                f"({total_files} files, {_format_bytes(total_bytes)}) into [bold]{runs_root}[/bold]"
-            )
-            if skipped_weights_files > 0:
-                console.print(
-                    f"[dim]  ℹ {skipped_weights_files} checkpoint/weight file(s) "
-                    f"({_format_bytes(skipped_weights_bytes)}) excluded by default (use [bold]--weights[/bold] to include).[/dim]"
-                )
-            return len(selected_runs), any_active
-
-        extracted_files, extracted_bytes = _extract_pull_tar_stream(
-            proc.stdout, runs_root, total_bytes
-        )
-        proc.wait()
-
-        if latest_run_id and (runs_root / str(latest_run_id)).is_dir():
-            update_latest_symlink(runs_root, runs_root / str(latest_run_id))
-        else:
-            update_latest_symlink(runs_root)
-
-        up_note = (
-            f" [dim]({up_to_date_count} already up-to-date)[/dim]"
-            if up_to_date_count > 0
-            else ""
-        )
-        console.print(
-            f"[bold green]✔ Pulled {len(selected_runs)} run(s)[/bold green] "
-            f"({extracted_files} files, {_format_bytes(extracted_bytes)}) into [bold]{runs_root}[/bold]{up_note}"
-        )
-        if skipped_weights_files > 0:
-            console.print(
-                f"[dim]  ℹ Skipped {skipped_weights_files} checkpoint/weight file(s) "
-                f"({_format_bytes(skipped_weights_bytes)}) — pass [bold]--weights[/bold] to include them.[/dim]"
-            )
-        return len(selected_runs), any_active
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-
-
-def cmd_pull(args: argparse.Namespace, runs_root: Path) -> None:
-    watch_mode = bool(getattr(args, "watch", False))
-    interval = max(2, int(getattr(args, "interval", 15) or 15))
-
-    _, any_active = _execute_single_pull(args, runs_root, quiet_if_up_to_date=False)
-    if not watch_mode or getattr(args, "dry_run", False):
-        return
-
-    if not any_active:
-        console.print("[dim]All matched remote runs have reached a terminal status.[/dim]")
-        return
-
-    console.print(
-        f"[dim cyan]Watching remote runs every {interval}s for new outputs/telemetry (Ctrl+C to stop)...[/dim cyan]"
-    )
-    try:
-        while any_active:
-            time.sleep(interval)
-            _, any_active = _execute_single_pull(args, runs_root, quiet_if_up_to_date=True)
-            if not any_active:
-                console.print(
-                    "[bold green]✔ All watched remote runs have finished and synced locally![/bold green]"
-                )
-                break
-    except KeyboardInterrupt:
-        console.print("\n[dim]Stopped watching remote runs.[/dim]")
-
-
-# ---------------------------------------------------------------------------
 # Subcommand: `runs retry`
 # ---------------------------------------------------------------------------
 def _find_downstream_retry_chain(
@@ -2262,60 +1098,98 @@ def _find_downstream_retry_chain(
     Finds transitive downstream runs (in chronological pipeline order) that depended on
     `root_run_dir` or `root_cids` and are inactive (e.g. CANCELLED, ABORTED, FAILED).
     """
-    dirs = list(reversed(list_run_dirs(runs_root)))
-    if not dirs:
-        return []
-
-    loaded: List[Tuple[Path, Dict[str, Any], List[int], str, bool]] = []
-    for d in dirs:
-        if d == root_run_dir:
-            continue
-        raw_data = load_run_json(d)
-        if not raw_data:
-            continue
-        dep = raw_data.get("dependency")
-        if not isinstance(dep, dict):
-            continue
-        data = (
-            reconcile_run(d, raw_data, live_clusters)
-            if run_needs_live_reconcile(raw_data)
-            else raw_data
+    return [
+        (d, data)
+        for d, _, data in _find_downstream_runs(
+            runs_root,
+            root_run_dir,
+            root_cids,
+            live_clusters,
+            active_only=False,
+            include_completed=include_completed,
         )
-        st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
-        cids = get_all_cluster_ids(data)
-        act_cids = [c for c in cids if live_clusters is not None and c in live_clusters]
-        is_active = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or bool(act_cids)
-        loaded.append((d, data, cids, st, is_active))
+    ]
 
-    downstream: List[Tuple[Path, Dict[str, Any]]] = []
-    frontier_names = {root_run_dir.name}
-    frontier_cids = set(root_cids)
-    visited: set[Path] = {root_run_dir}
 
-    changed = True
-    while changed:
-        changed = False
-        for d, data, cids, st, is_active in loaded:
-            if d in visited:
-                continue
-            dep = data.get("dependency") or {}
-            p_run_id = dep.get("parent_run_id")
-            p_cid = dep.get("parent_cluster_id")
-            matches_parent = (p_run_id and str(p_run_id) in frontier_names) or (
-                p_cid is not None and int(p_cid) in frontier_cids
+def resolve_after_parent(
+    runs_root: Path,
+    after_arg: str,
+    after_ok: bool,
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
+    *,
+    self_run_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Tuple[Optional[Path], Optional[int], bool, str]:
+    """
+    Resolves `--after <after_arg>` to `(parent_run_dir, parent_cid, submit_via_dag, resolved_after_id)`.
+    Shared by `send` and `runs retry`.
+    """
+    parent_run_dir = resolve_run_dir(runs_root, after_arg, exit_on_fail=False)
+    if self_run_dir is not None and parent_run_dir == self_run_dir:
+        console.print(
+            "[bold red]✘ Error:[/bold red] A run cannot be chained after itself (--after)."
+        )
+        sys.exit(1)
+
+    if parent_run_dir and parent_run_dir.is_dir():
+        parent_data = load_run_json(parent_run_dir)
+        if not parent_data:
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
             )
-            if matches_parent:
-                visited.add(d)
-                frontier_names.add(d.name)
-                frontier_cids.update(cids)
-                changed = True
-                if is_active:
-                    continue
-                if st == "COMPLETED" and not include_completed:
-                    continue
-                downstream.append((d, data))
+            sys.exit(1)
+        if run_needs_live_reconcile(parent_data):
+            parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
+        p_cids = get_all_cluster_ids(parent_data)
+        parent_cid = p_cids[-1] if p_cids else None
+        parent_status = str(
+            parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN")
+        )
+        is_parent_active = parent_status.startswith(
+            ("QUEUED", "RUNNING", "HELD", "WAITING")
+        ) or (
+            live_clusters is not None
+            and parent_cid is not None
+            and parent_cid in live_clusters
+        )
+        if not is_parent_active:
+            if parent_status == "COMPLETED":
+                console.print(
+                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
+                    f"Submitting directly without DAGMan delay...[/dim]"
+                )
+                return parent_run_dir, parent_cid, False, parent_run_dir.name
+            if after_ok:
+                console.print(
+                    f"[bold red]✘ Cannot submit:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
+                    f"with status '{parent_status}'. Aborting because --after-ok was specified."
+                )
+                sys.exit(1)
+            console.print(
+                f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
+                f"Proceeding with direct submission...[/dim]"
+            )
+            return parent_run_dir, parent_cid, False, parent_run_dir.name
+        return parent_run_dir, parent_cid, True, parent_run_dir.name
 
-    return downstream
+    if str(after_arg).strip().isdigit():
+        raw_cid = int(str(after_arg).strip())
+        if dry_run or (live_clusters is not None and raw_cid in live_clusters):
+            if not dry_run:
+                console.print(
+                    f"[dim]Parent job [bold]#{raw_cid}[/bold] detected as active raw HTCondor cluster in condor_q.[/dim]"
+                )
+            return None, raw_cid, True, str(raw_cid)
+        console.print(
+            f"[bold red]✘ Error:[/bold red] Cluster ID #{raw_cid} is not active in HTCondor (condor_q) "
+            f"and does not match any local run in {runs_root}."
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[bold red]✘ Error:[/bold red] Parent run '{after_arg}' could not be resolved."
+    )
+    sys.exit(1)
 
 
 def _resolve_retry_dependency(
@@ -2331,71 +1205,14 @@ def _resolve_retry_dependency(
     for `runs retry` when `--after` is passed or when the target run's original parent is currently active.
     """
     if after_arg:
-        parent_run_dir = resolve_run_dir(runs_root, after_arg, exit_on_fail=False)
-        if parent_run_dir == run_dir:
-            console.print(
-                "[bold red]✘ Error:[/bold red] A run cannot be chained after itself (--after)."
-            )
-            sys.exit(1)
-
-        if parent_run_dir and parent_run_dir.is_dir():
-            parent_data = load_run_json(parent_run_dir)
-            if not parent_data:
-                console.print(
-                    f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
-                )
-                sys.exit(1)
-            if run_needs_live_reconcile(parent_data):
-                parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
-            p_cids = get_all_cluster_ids(parent_data)
-            parent_cid = p_cids[-1] if p_cids else None
-            parent_status = str(
-                parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN")
-            )
-            is_parent_active = parent_status.startswith(
-                ("QUEUED", "RUNNING", "HELD", "WAITING")
-            ) or (
-                live_clusters is not None
-                and parent_cid is not None
-                and parent_cid in live_clusters
-            )
-            if not is_parent_active:
-                if parent_status == "COMPLETED":
-                    console.print(
-                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
-                        f"Submitting retry directly without DAGMan delay...[/dim]"
-                    )
-                    return parent_run_dir, parent_cid, False, after_ok, parent_run_dir.name
-                if after_ok:
-                    console.print(
-                        f"[bold red]✘ Cannot submit retry:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
-                        f"with status '{parent_status}'. Aborting because --after-ok was specified."
-                    )
-                    sys.exit(1)
-                console.print(
-                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
-                    f"Proceeding with direct retry submission...[/dim]"
-                )
-                return parent_run_dir, parent_cid, False, after_ok, parent_run_dir.name
-            return parent_run_dir, parent_cid, True, after_ok, parent_run_dir.name
-
-        if str(after_arg).strip().isdigit():
-            raw_cid = int(str(after_arg).strip())
-            if live_clusters is not None and raw_cid in live_clusters:
-                console.print(
-                    f"[dim]Parent job [bold]#{raw_cid}[/bold] detected as active raw HTCondor cluster in condor_q.[/dim]"
-                )
-                return None, raw_cid, True, after_ok, str(raw_cid)
-            console.print(
-                f"[bold red]✘ Error:[/bold red] Cluster ID #{raw_cid} is not active in HTCondor (condor_q) "
-                f"and does not match any local run in {runs_root}."
-            )
-            sys.exit(1)
-
-        console.print(
-            f"[bold red]✘ Error:[/bold red] Parent run '{after_arg}' could not be resolved."
+        p_dir, p_cid, via_dag, res_id = resolve_after_parent(
+            runs_root,
+            after_arg,
+            after_ok,
+            live_clusters,
+            self_run_dir=run_dir,
         )
-        sys.exit(1)
+        return p_dir, p_cid, via_dag, after_ok, res_id
 
     dep = data.get("dependency")
     if isinstance(dep, dict):
@@ -2507,32 +1324,15 @@ def _retry_single_run_in_place(
     write_text_lf(retry_sub_path, retry_sub_content)
 
     if submit_via_dag:
-        wait_script_path = repro_dir / "wait_parent.py"
-        write_text_lf(wait_script_path, generate_wait_parent_script())
-        try:
-            wait_script_path.chmod(0o755)
-        except OSError:
-            pass
-
-        dag_path = repro_dir / "job.dag"
-        submit_py = str(resolve_submit_python())
-        dagman_cfg_path: Optional[Path] = None
-        dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
-        if dagman_cfg:
-            dagman_cfg_path = repro_dir / "dagman.config"
-            write_text_lf(dagman_cfg_path, dagman_cfg)
-
-        dag_content = generate_dag_file(
+        dag_path, _ = materialize_dag_files(
+            run_dir=run_dir,
+            repro_dir=repro_dir,
             sub_path=retry_sub_path,
-            wait_script_path=wait_script_path,
-            python_bin=submit_py,
-            child_dir=run_dir,
             parent_dir=parent_run_dir,
             parent_cluster_id=parent_cid,
             require_ok=require_ok,
-            config_path=dagman_cfg_path,
+            condor_submit_exe=shutil.which("condor_submit"),
         )
-        write_text_lf(dag_path, dag_content)
 
         dag_res = subprocess.run(
             ["condor_submit_dag", "-f", "-no_submit", str(dag_path)],
@@ -3851,137 +2651,6 @@ def _resolve_running_job_context(
     return f"{cids[-1]}.{proc_idx}", plain_label, arch
 
 
-def _build_live_telemetry_panel(
-    job_target: str,
-    frame: Dict[str, Any],
-    run_name: Optional[str] = None,
-    arch: Optional[str] = None,
-) -> Panel:
-    from rich.console import Group
-
-    host_short = str(frame.get("host") or "unknown")
-    host_fqdn = str(frame.get("hostname") or host_short)
-    load_avg = frame.get("load_avg")
-
-    info_tbl = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
-    info_tbl.add_column("K", style="bold cyan", width=20, no_wrap=True)
-    info_tbl.add_column("V", style="white")
-    if run_name:
-        info_tbl.add_row("Run", f"[bold white]{run_name}[/bold white] ({style_status('RUNNING')})")
-    clean_arch = str(arch or "").strip()
-    if clean_arch.upper() in ("", "—", "UNDEFINED", "NONE", "ANY"):
-        pool_str = ""
-    else:
-        pool_str = f" · Pool: [bold magenta]{clean_arch}[/bold magenta]"
-    load_str = f" · Load: [cyan]{load_avg:.2f}[/cyan]" if isinstance(load_avg, (int, float)) else ""
-    info_tbl.add_row("Worker Node", f"[bold white]{host_fqdn}[/bold white]{pool_str}{load_str}")
-
-    renderables: List[Any] = [info_tbl]
-
-    gpus = frame.get("gpus") or []
-    if gpus:
-        gpu_tbl = Table(
-            title="Allocated GPUs",
-            title_style="bold cyan",
-            box=box.SIMPLE_HEAVY,
-            header_style="bold cyan",
-        )
-        gpu_tbl.add_column("GPU", style="dim", no_wrap=True)
-        gpu_tbl.add_column("Model", style="bold white", no_wrap=True)
-        gpu_tbl.add_column("Util", justify="right", no_wrap=True)
-        gpu_tbl.add_column("VRAM Used / Total", justify="right", no_wrap=True)
-        gpu_tbl.add_column("Temp", justify="right", no_wrap=True)
-        gpu_tbl.add_column("Power", justify="right", no_wrap=True)
-
-        for g in gpus:
-            util = float(g.get("util_pct", 0.0))
-            util_col = "bold green" if util >= 50 else ("yellow" if util >= 10 else "dim")
-            used_gb = float(g.get("mem_used_mb", 0.0)) / 1024.0
-            tot_gb = max(0.1, float(g.get("mem_total_mb", 0.0)) / 1024.0)
-            vram_pct = min(100, round((used_gb / tot_gb) * 100))
-            temp = g.get("temp_c")
-            temp_str = f"{temp:.0f}°C" if isinstance(temp, (int, float)) and temp > 0 else "—"
-            pw = g.get("power_w")
-            plim = g.get("power_limit_w")
-            if isinstance(pw, (int, float)) and pw > 0:
-                pw_str = (
-                    f"{pw:.0f} / {plim:.0f} W"
-                    if isinstance(plim, (int, float)) and plim > 0
-                    else f"{pw:.0f} W"
-                )
-            else:
-                pw_str = "—"
-
-            gpu_tbl.add_row(
-                str(g.get("index", "0")),
-                str(g.get("model", "GPU")),
-                f"[{util_col}]{util:.0f} %[/{util_col}]",
-                f"[cyan]{used_gb:.1f}[/cyan] / {tot_gb:.1f} GB ({vram_pct}%)",
-                temp_str,
-                pw_str,
-            )
-        renderables.append(gpu_tbl)
-
-    procs = frame.get("processes") or []
-    if procs:
-        proc_tbl = Table(
-            title="Active Job Processes",
-            title_style="bold cyan",
-            box=box.SIMPLE_HEAVY,
-            header_style="bold cyan",
-        )
-        proc_tbl.add_column("PID", style="dim", justify="right", no_wrap=True)
-        proc_tbl.add_column("State", no_wrap=True)
-        proc_tbl.add_column("CPU %", justify="right", style="green", no_wrap=True)
-        proc_tbl.add_column("Host RAM", justify="right", no_wrap=True)
-        proc_tbl.add_column("GPU VRAM", justify="right", style="cyan", no_wrap=True)
-        proc_tbl.add_column("Elapsed", justify="right", no_wrap=True)
-        proc_tbl.add_column("Command", style="white")
-
-        for p in procs[:12]:
-            st_raw = str(p.get("state") or "RUN")
-            if "I/O" in st_raw:
-                st_cell = f"[bold yellow]{st_raw}[/bold yellow]"
-            elif st_raw.startswith("RUN"):
-                st_cell = f"[bold green]{st_raw}[/bold green]"
-            else:
-                st_cell = f"[dim]{st_raw}[/dim]"
-
-            rss_mb = float(p.get("rss_mb", 0.0))
-            ram_str = f"{rss_mb / 1024.0:.1f} GB" if rss_mb >= 1024.0 else f"{rss_mb:.0f} MB"
-            vram_mb = float(p.get("vram_mb", 0.0))
-            if vram_mb >= 1024.0:
-                vram_str = f"{vram_mb / 1024.0:.1f} GB"
-            elif vram_mb > 0:
-                vram_str = f"{vram_mb:.0f} MB"
-            else:
-                vram_str = "[dim]—[/dim]"
-            cmd_text = str(p.get("command") or p.get("comm") or "—")
-            if len(cmd_text) > 52:
-                cmd_text = cmd_text[:49] + "..."
-            workers = int(p.get("workers") or 0)
-            if workers > 0:
-                cmd_text = f"[bold cyan][+{workers} workers][/bold cyan] {cmd_text}"
-
-            proc_tbl.add_row(
-                str(p.get("pid", "—")),
-                st_cell,
-                f"{float(p.get('cpu_pct', 0.0)):.1f}%",
-                ram_str,
-                vram_str,
-                str(p.get("elapsed", "—")),
-                cmd_text,
-            )
-        renderables.append(proc_tbl)
-
-    return Panel(
-        Group(*renderables),
-        title=f"[bold cyan]⚡ Live Worker Telemetry — {host_short} (Job {job_target})[/bold cyan]",
-        border_style="cyan",
-        expand=False,
-    )
-
-
 def cmd_top(args: argparse.Namespace, runs_root: Path) -> None:
     job_target, run_name, arch = _resolve_running_job_context(args, runs_root)
     watch_mode = bool(getattr(args, "watch", False))
@@ -4037,381 +2706,6 @@ def cmd_ssh(args: argparse.Namespace, runs_root: Path) -> None:
     console.print(f"[cyan]Connecting interactive shell to {label} via condor_ssh_to_job...[/cyan]")
     res = subprocess.run(["condor_ssh_to_job", "-auto-retry", job_target])
     sys.exit(res.returncode)
-
-
-_SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
-
-
-def _bin_series(values: List[float], width: int, agg: str = "mean") -> List[float]:
-    if not values:
-        return []
-    n = len(values)
-    w = max(1, min(width, n))
-    if w == n:
-        return list(values)
-    out: List[float] = []
-    for i in range(w):
-        lo = int(i * n / w)
-        hi = max(lo + 1, int((i + 1) * n / w))
-        chunk = values[lo:hi]
-        out.append(max(chunk) if agg == "max" else sum(chunk) / len(chunk))
-    return out
-
-
-def _render_sparkline_rows(
-    values: List[float],
-    width: int,
-    *,
-    height: int = 2,
-    max_val: Optional[float] = None,
-    color: str = "green",
-) -> List[str]:
-    binned = _bin_series(values, width)
-    if not binned:
-        return [""] * height
-    hi = max_val if (max_val is not None and max_val > 0) else max(binned)
-    if hi <= 0:
-        hi = 1.0
-    total_levels = height * 8
-    rows_out: List[str] = []
-    for row_idx in range(height - 1, -1, -1):
-        row_chars: List[str] = []
-        base_lvl = row_idx * 8
-        for v in binned:
-            norm = max(0.0, min(1.0, v / hi))
-            lvl = int(round(norm * total_levels))
-            if v > 0 and lvl == 0:
-                lvl = 1
-            cell_lvl = max(0, min(8, lvl - base_lvl))
-            row_chars.append(_SPARK_BLOCKS[cell_lvl])
-        rows_out.append(f"[{color}]{''.join(row_chars)}[/{color}]")
-    return rows_out
-
-
-def _series_stats(values: List[float]) -> Tuple[float, float, float, float]:
-    if not values:
-        return 0.0, 0.0, 0.0, 0.0
-    s = sorted(values)
-    p95 = s[min(len(s) - 1, int(0.95 * (len(s) - 1)))]
-    return s[0], sum(values) / len(values), p95, s[-1]
-
-
-def _diagnose_telemetry(summary: Dict[str, Any], is_gpu: bool) -> List[str]:
-    diags: List[str] = []
-    gpu_avg = float(summary.get("gpu_util_avg", 0.0) or 0.0)
-    gpu_bw = float(summary.get("gpu_mem_bw_avg", 0.0) or 0.0)
-    vram_max = float(summary.get("vram_mb_max", 0.0) or 0.0)
-    vram_tot = float(summary.get("vram_total_mb", 0.0) or 0.0)
-    g_temp = float(summary.get("gpu_temp_max_c", 0.0) or 0.0)
-    cpu_avg = float(summary.get("cpu_pct_avg", 0.0) or 0.0)
-    cpu_sys = float(summary.get("cpu_sys_pct_avg", 0.0) or 0.0)
-    iow_pct = float(summary.get("io_wait_pct", 0.0) or 0.0)
-
-    if is_gpu and gpu_avg < 50.0 and (iow_pct > 15.0 or cpu_avg > 90.0):
-        diags.append(
-            f"[bold yellow]⚠ GPU Starvation Detected:[/bold yellow] GPU averaged {gpu_avg:.1f}% utilization "
-            f"while workers spent {iow_pct:.1f}% of samples in Disk/CephFS I/O wait (CPU avg {cpu_avg:.1f}%). "
-            f"Consider increasing DataLoader num_workers, caching dataset in RAM/scratch, or pre-packing files."
-        )
-    if is_gpu and gpu_avg < 60.0 and gpu_bw > 70.0:
-        diags.append(
-            f"[bold cyan]ℹ Memory-Bandwidth Bound:[/bold cyan] High GPU memory controller load ({gpu_bw:.1f}%) "
-            f"with {gpu_avg:.1f}% compute utilization. Consider mixed precision (bf16/fp16) or torch.compile operator fusion."
-        )
-    if is_gpu and vram_tot > 0:
-        vram_pct = vram_max / vram_tot
-        if vram_pct > 0.92:
-            diags.append(
-                f"[bold red]⚠ VRAM OOM Proximity:[/bold red] Peak VRAM reached {vram_max / 1024:.2f}/{vram_tot / 1024:.1f} GB "
-                f"({vram_pct * 100:.0f}%). Reduce batch size or enable gradient checkpointing to avoid OOM."
-            )
-        elif vram_pct < 0.35 and gpu_avg > 20.0:
-            diags.append(
-                f"[cyan]ℹ VRAM Headroom Available:[/cyan] Peak VRAM only used {vram_pct * 100:.0f}% "
-                f"({vram_max / 1024:.2f}/{vram_tot / 1024:.1f} GB). Batch size could potentially be increased."
-            )
-    if is_gpu and g_temp >= 83.0:
-        diags.append(
-            f"[bold red]⚠ Thermal / Clock Throttling Risk:[/bold red] GPU reached {g_temp:.0f}°C."
-        )
-    if cpu_avg > 50.0 and cpu_sys > 0.35 * cpu_avg:
-        diags.append(
-            f"[bold yellow]⚠ Kernel / Syscall Contention:[/bold yellow] System CPU averaged {cpu_sys:.1f}% "
-            f"(>35% of {cpu_avg:.1f}% total CPU), often caused by thread oversubscription or small-file CephFS metadata storms."
-        )
-    if not diags:
-        diags.append("[bold green]✔ Healthy resource utilization profile.[/bold green]")
-    return diags
-
-
-def _build_telemetry_plot_panel(
-    run_dir: Path,
-    data: Dict[str, Any],
-    proc_id: int,
-    rows: List[Dict[str, Any]],
-    width: int = 60,
-) -> Panel:
-    from rich.console import Group
-
-    summary = compute_telemetry_summary(run_dir / "repro" / f"telemetry_{proc_id}.csv", rows=rows) or {}
-    arch = str((data.get("resources_requested") or {}).get("architecture") or "")
-    vtot = float(summary.get("vram_total_mb", 0.0) or 0.0)
-    gmax = float(summary.get("gpu_util_max", 0.0) or 0.0)
-    is_gpu = vtot > 0 or gmax > 0 or arch in ("GPU3090", "A100")
-
-    t_start = str(rows[0].get("timestamp_iso", "") or "")[:19].replace("T", " ")
-    t_end = str(rows[-1].get("timestamp_iso", "") or "")[:19].replace("T", " ")
-    dur_s = max(0.0, float(rows[-1].get("elapsed_s", 0.0) or 0.0) - float(rows[0].get("elapsed_s", 0.0) or 0.0))
-    n_samples = len(rows)
-    cadence = round(dur_s / max(1, n_samples - 1), 1) if n_samples > 1 else 5.0
-    header_line = (
-        f"[bold white]{t_start}[/bold white] [dim]→[/dim] [bold white]{t_end}[/bold white]  "
-        f"[dim]│[/dim]  Duration: [cyan]{format_duration(int(dur_s))}[/cyan]  "
-        f"[dim]│[/dim]  [bold]{n_samples}[/bold] samples @ ~{cadence:g}s"
-    )
-
-    chart_tbl = Table(box=None, show_header=True, header_style="bold dim", pad_edge=False)
-    chart_tbl.add_column("Metric", style="bold cyan", width=18, no_wrap=True)
-    chart_tbl.add_column("Time Series", no_wrap=True)
-    chart_tbl.add_column("Min │ Avg │ P95 │ Max", justify="right", style="white", no_wrap=True)
-
-    def _add_chart(
-        label: str,
-        vals: List[float],
-        color: str,
-        *,
-        max_val: Optional[float] = None,
-        unit: str = "",
-        extra_note: str = "",
-    ) -> None:
-        mn, av, p95, mx = _series_stats(vals)
-        sp_rows = _render_sparkline_rows(vals, width, height=2, max_val=max_val, color=color)
-        stats_str = f"{mn:.1f} │ [bold]{av:.1f}[/bold] │ {p95:.1f} │ {mx:.1f}{unit}"
-        if extra_note:
-            stats_str += f"\n[dim]{extra_note}[/dim]"
-        chart_tbl.add_row(label, "\n".join(sp_rows), stats_str)
-
-    if is_gpu:
-        _add_chart("GPU Compute (%)", [r.get("gpu_util_pct", 0.0) for r in rows], "green", max_val=100.0, unit="%")
-        _add_chart("GPU Mem BW (%)", [r.get("gpu_mem_bw_pct", 0.0) for r in rows], "cyan", max_val=100.0, unit="%")
-        vram_gb = [r.get("vram_used_mb", 0.0) / 1024.0 for r in rows]
-        vtot_gb = vtot / 1024.0 if vtot > 0 else None
-        peak_pct_note = f"Peak {max(vram_gb) / vtot_gb * 100:.0f}% of {vtot_gb:.1f} GB" if vtot_gb else ""
-        _add_chart("GPU VRAM (GB)", vram_gb, "magenta", max_val=vtot_gb, unit="G", extra_note=peak_pct_note)
-        temps = [r.get("gpu_temp_c", 0.0) for r in rows]
-        pwrs = [r.get("gpu_power_w", 0.0) for r in rows]
-        clks = [r.get("gpu_sm_clock_mhz", 0.0) for r in rows]
-        _add_chart(
-            "GPU Power (W)",
-            pwrs,
-            "yellow",
-            unit="W",
-            extra_note=f"Temp max {max(temps):.0f}°C · SM {min(clks):.0f}-{max(clks):.0f} MHz",
-        )
-
-    cpu_tot = [r.get("cpu_total_pct", 0.0) for r in rows]
-    cpu_usr_avg = sum(r.get("cpu_user_pct", 0.0) for r in rows) / n_samples
-    cpu_sys_avg = sum(r.get("cpu_sys_pct", 0.0) for r in rows) / n_samples
-    _add_chart(
-        "CPU Usage (%)",
-        cpu_tot,
-        "blue",
-        unit="%",
-        extra_note=f"usr {cpu_usr_avg:.1f}% / sys {cpu_sys_avg:.1f}%",
-    )
-
-    pss_gb = [r.get("pss_mb", 0.0) / 1024.0 for r in rows]
-    rss_max_gb = max(r.get("rss_mb", 0.0) for r in rows) / 1024.0
-    avail_gb = rows[-1].get("node_ram_avail_mb", 0.0) / 1024.0
-    _add_chart(
-        "Host RAM PSS (GB)",
-        pss_gb,
-        "bright_cyan",
-        unit="G",
-        extra_note=f"RSS max {rss_max_gb:.2f}G · Node free {avail_gb:.1f}G",
-    )
-
-    disk_tot = [r.get("disk_read_mb_s", 0.0) + r.get("disk_write_mb_s", 0.0) for r in rows]
-    iow_pct = float(summary.get("io_wait_pct", 0.0) or 0.0)
-    _add_chart(
-        "Disk I/O (MB/s)",
-        disk_tot,
-        "yellow",
-        unit="M/s",
-        extra_note=f"D-state wait {iow_pct:.1f}% · R {summary.get('disk_read_mb_total', 0.0):.0f}M / W {summary.get('disk_write_mb_total', 0.0):.0f}M",
-    )
-
-    diags = _diagnose_telemetry(summary, is_gpu)
-    diag_panel = Panel(
-        "\n".join(diags),
-        title="[bold cyan]🩺 Automated Bottleneck Diagnosis[/bold cyan]",
-        border_style="dim",
-        expand=True,
-    )
-
-    status_str = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
-    return Panel(
-        Group(header_line, "", chart_tbl, "", diag_panel),
-        title=f"[bold cyan]📈 Telemetry — {_format_run_short(run_dir, data)} [proc {proc_id}] ({style_status(status_str)})[/bold cyan]",
-        border_style="cyan",
-        expand=False,
-    )
-
-
-def _find_matplotlib_python(data: Dict[str, Any], runs_root: Path) -> Optional[str]:
-    from hermes_tools.core import discover_project_venv, resolve_submit_python
-
-    candidates: List[str] = [sys.executable]
-    sub_venv = (data.get("submission") or {}).get("venv")
-    if sub_venv:
-        vp = Path(str(sub_venv))
-        for py in (vp / "bin" / "python", vp / "Scripts" / "python.exe"):
-            if py.is_file():
-                candidates.append(str(py))
-    env_venv = os.environ.get("VIRTUAL_ENV")
-    if env_venv:
-        vp = Path(env_venv)
-        for py in (vp / "bin" / "python", vp / "Scripts" / "python.exe"):
-            if py.is_file():
-                candidates.append(str(py))
-    proj_venv = discover_project_venv(runs_root.parent)
-    if proj_venv:
-        for py in (proj_venv / "bin" / "python", proj_venv / "Scripts" / "python.exe"):
-            if py.is_file():
-                candidates.append(str(py))
-    sub_py = resolve_submit_python()
-    if sub_py:
-        candidates.append(str(sub_py))
-
-    seen = set()
-    for py in candidates:
-        if not py or py in seen:
-            continue
-        seen.add(py)
-        try:
-            chk = subprocess.run(
-                [py, "-c", "import matplotlib"],
-                capture_output=True,
-                timeout=5,
-            )
-            if chk.returncode == 0:
-                return py
-        except Exception:
-            continue
-    return None
-
-
-def _save_telemetry_matplotlib(
-    csv_path: Path,
-    out_path: Path,
-    title: str,
-    is_gpu: bool,
-    data: Dict[str, Any],
-    runs_root: Path,
-) -> bool:
-    py_exe = _find_matplotlib_python(data, runs_root)
-    if not py_exe:
-        console.print(
-            "[bold red]✘ Could not find `matplotlib` in the current or project Python environment.[/bold red]\n"
-            "  Install it (`uv pip install matplotlib`) to enable `--save`."
-        )
-        return False
-
-    plot_script = """
-import csv, sys
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-csv_path, out_path, title, is_gpu_str = sys.argv[1:5]
-is_gpu = is_gpu_str == "1"
-with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
-    rows = list(csv.DictReader(fh))
-if not rows:
-    sys.exit(2)
-
-def col(k):
-    return [float(r.get(k, 0.0) or 0.0) for r in rows]
-
-t_min = [x / 60.0 for x in col("elapsed_s")]
-n_panels = 5 if is_gpu else 3
-fig, axes = plt.subplots(n_panels, 1, figsize=(12, 10), dpi=200, sharex=True)
-fig.suptitle(title, fontsize=13, fontweight="bold")
-ax_i = 0
-
-if is_gpu:
-    ax = axes[ax_i]; ax_i += 1
-    ax.plot(t_min, col("gpu_util_pct"), label="GPU Compute %", color="#2ca02c", lw=1.6)
-    ax.plot(t_min, col("gpu_mem_bw_pct"), label="GPU Mem BW %", color="#17becf", lw=1.2, alpha=0.85)
-    ax.set_ylim(0, 105)
-    ax.set_ylabel("GPU %")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="upper right", fontsize=8)
-
-ax = axes[ax_i]; ax_i += 1
-if is_gpu:
-    vram_gb = [x / 1024.0 for x in col("vram_used_mb")]
-    vtot_gb = max(col("vram_total_mb")) / 1024.0
-    ax.plot(t_min, vram_gb, label="VRAM Used (GB)", color="#9467bd", lw=1.6)
-    if vtot_gb > 0:
-        ax.axhline(vtot_gb, color="#9467bd", ls="--", lw=1.0, alpha=0.6, label=f"VRAM Limit ({vtot_gb:.1f} GB)")
-ax.plot(t_min, [x / 1024.0 for x in col("pss_mb")], label="Host PSS (GB)", color="#1f77b4", lw=1.4)
-ax.plot(t_min, [x / 1024.0 for x in col("rss_mb")], label="Host RSS (GB)", color="#aec7e8", lw=1.0, ls=":")
-ax.set_ylabel("Memory (GB)")
-ax.grid(True, alpha=0.25)
-ax.legend(loc="upper right", fontsize=8)
-
-ax = axes[ax_i]; ax_i += 1
-ax.plot(t_min, col("cpu_total_pct"), label="CPU Total %", color="#1f77b4", lw=1.5)
-ax.plot(t_min, col("cpu_sys_pct"), label="CPU Sys %", color="#ff7f0e", lw=1.2, alpha=0.85)
-ax2 = ax.twinx()
-ax2.plot(t_min, col("node_load_1m"), label="Load 1m", color="#7f7f7f", lw=1.0, ls="--", alpha=0.7)
-ax.set_ylabel("CPU %")
-ax2.set_ylabel("Load 1m")
-ax.grid(True, alpha=0.25)
-ax.legend(loc="upper left", fontsize=8)
-ax2.legend(loc="upper right", fontsize=8)
-
-ax = axes[ax_i]; ax_i += 1
-ax.plot(t_min, col("disk_read_mb_s"), label="Disk Read (MB/s)", color="#2ca02c", lw=1.4)
-ax.plot(t_min, col("disk_write_mb_s"), label="Disk Write (MB/s)", color="#d62728", lw=1.2)
-iow = col("io_wait_procs")
-for idx_i, w in enumerate(iow):
-    if w > 0 and idx_i + 1 < len(t_min):
-        ax.axvspan(t_min[idx_i], t_min[idx_i + 1], color="#ff9896", alpha=0.25)
-ax.set_ylabel("Disk I/O (MB/s)")
-ax.grid(True, alpha=0.25)
-ax.legend(loc="upper right", fontsize=8)
-
-if is_gpu:
-    ax = axes[ax_i]; ax_i += 1
-    ax.plot(t_min, col("gpu_power_w"), label="Power (W)", color="#ff7f0e", lw=1.4)
-    ax.plot(t_min, col("gpu_temp_c"), label="Temp (°C)", color="#d62728", lw=1.2)
-    ax2 = ax.twinx()
-    ax2.plot(t_min, col("gpu_sm_clock_mhz"), label="SM Clock (MHz)", color="#8c564b", lw=1.0, alpha=0.8)
-    ax.set_ylabel("Power / Temp")
-    ax2.set_ylabel("Clock (MHz)")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="upper left", fontsize=8)
-    ax2.legend(loc="upper right", fontsize=8)
-
-axes[-1].set_xlabel("Elapsed Time (minutes)")
-fig.tight_layout(rect=[0, 0, 1, 0.96])
-fig.savefig(out_path, dpi=200)
-"""
-    res = subprocess.run(
-        [py_exe, "-c", plot_script, str(csv_path), str(out_path), title, "1" if is_gpu else "0"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-    )
-    if res.returncode != 0:
-        console.print(f"[bold red]✘ Matplotlib export failed:[/bold red] {(res.stderr or res.stdout).strip()}")
-        return False
-    console.print(f"[bold green]✔ Saved telemetry figure:[/bold green] {out_path.resolve()}")
-    return True
 
 
 def cmd_plot(args: argparse.Namespace, runs_root: Path) -> None:
