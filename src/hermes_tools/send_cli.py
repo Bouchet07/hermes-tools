@@ -48,6 +48,7 @@ from hermes_tools.core import (
     get_runs_root,
     get_username,
     is_valid_memory_input,
+    list_run_dirs,
     load_project_config,
     load_run_json,
     locked_mutate_run_json,
@@ -1213,7 +1214,17 @@ def main() -> None:
 
     equivalent_cli = " ".join(cli_parts)
 
-    now = datetime.datetime.now()
+    now = datetime.datetime.now().replace(microsecond=0)
+    existing_dirs = list_run_dirs(runs_root)
+    if existing_dirs:
+        try:
+            latest_dt = datetime.datetime.strptime(
+                existing_dirs[0].name[:19], "%Y-%m-%d_%H-%M-%S"
+            )
+            if now <= latest_dt:
+                now = latest_dt + datetime.timedelta(seconds=1)
+        except ValueError:
+            pass
     submit_epoch = int(now.timestamp())
     ts_str = now.strftime("%Y-%m-%d_%H-%M-%S")
     safe_tag = f"_{tag}" if tag else ""
@@ -1250,6 +1261,7 @@ def main() -> None:
             sys.exit(1)
 
         used_ids = set()
+        offset_sec = 0
         for idx in range(len(sweep_list)):
             raw_item = raw_sweep_items[idx] if idx < len(raw_sweep_items) else sweep_list[idx]
             if no_tag_flag:
@@ -1259,20 +1271,16 @@ def main() -> None:
             else:
                 st_tag = _derive_sweep_item_tag(tag, raw_item, idx)
 
-            if st_tag:
-                cand_id = f"{ts_str}_{target_path.stem}_{arch}_{st_tag}"
-                if cand_id in used_ids or (runs_root / cand_id).exists():
-                    cand_id = f"{cand_id}_{idx}"
-            else:
-                offset_sec = idx
-                while True:
-                    step_ts = (now + datetime.timedelta(seconds=offset_sec)).strftime(
-                        "%Y-%m-%d_%H-%M-%S"
-                    )
-                    cand_id = f"{step_ts}_{target_path.stem}_{arch}"
-                    if cand_id not in used_ids and not (runs_root / cand_id).exists():
-                        break
-                    offset_sec += 1
+            tag_suffix = f"_{st_tag}" if st_tag else ""
+            while True:
+                step_ts = (now + datetime.timedelta(seconds=offset_sec)).strftime(
+                    "%Y-%m-%d_%H-%M-%S"
+                )
+                cand_id = f"{step_ts}_{target_path.stem}_{arch}{tag_suffix}"
+                if cand_id not in used_ids and not (runs_root / cand_id).exists():
+                    break
+                offset_sec += 1
+            offset_sec += 1
             used_ids.add(cand_id)
             step_tags.append(st_tag)
             step_run_ids.append(cand_id)

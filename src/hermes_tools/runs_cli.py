@@ -80,6 +80,24 @@ from hermes_tools.telemetry import (
 )
 
 
+def _format_waiting_status_with_run_index(
+    display_status: str,
+    data: Dict[str, Any],
+    run_index_by_name: Dict[str, int],
+) -> str:
+    """Replaces cluster IDs in `WAITING (...)` with the parent run's `#N` table index when known."""
+    if not display_status.startswith("WAITING"):
+        return display_status
+    dep = data.get("dependency")
+    if isinstance(dep, dict):
+        parent_name = dep.get("parent_run_id") or (
+            Path(str(dep["parent_run_dir"])).name if dep.get("parent_run_dir") else None
+        )
+        if parent_name and str(parent_name) in run_index_by_name:
+            return f"WAITING (#{run_index_by_name[str(parent_name)]})"
+    return display_status
+
+
 def resolve_run_dir(
     runs_root: Path,
     query: Optional[str],
@@ -137,6 +155,7 @@ def resolve_run_dir(
     import questionary
 
     latest_target = resolve_latest_symlink(runs_root)
+    run_index_by_name = {d.name: idx for idx, d in enumerate(dirs, start=1)}
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, Any]]] = None
     rows: List[Tuple[int, Path, str, str, str, str, str, str]] = []
@@ -150,7 +169,11 @@ def resolve_run_dir(
         else:
             rj = raw_rj
         plain_label, _, short_date = _extract_run_display_parts(d, rj)
-        st = str(rj.get("_live_badge") or rj.get("status", "UNKNOWN"))
+        st = _format_waiting_status_with_run_index(
+            str(rj.get("_live_badge") or rj.get("status", "UNKNOWN")),
+            rj,
+            run_index_by_name,
+        )
         arch = str(rj.get("resources_requested", {}).get("architecture", "—"))
         _, dur_str, _ = summarize_metrics(rj)
         raw_cid = rj.get("submission", {}).get("cluster_id")
@@ -226,6 +249,7 @@ def _build_ls_table_with_state(
     live_clusters_queried = False
     live_clusters: Optional[Dict[int, Dict[str, int]]] = None
     row_signatures: List[Tuple[str, ...]] = []
+    run_index_by_name = {d.name: idx for idx, d in enumerate(dirs, start=1)}
 
     for idx, d in enumerate(dirs, start=1):
         rj_stat_key: Optional[Tuple[int, int, int]] = None
@@ -267,7 +291,11 @@ def _build_ls_table_with_state(
         if pinned_only and not bool(data.get("pinned", False)):
             continue
 
-        display_status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+        display_status = _format_waiting_status_with_run_index(
+            str(data.get("_live_badge") or data.get("status", "UNKNOWN")),
+            data,
+            run_index_by_name,
+        )
         if status_upper and status_upper not in display_status.upper():
             continue
 

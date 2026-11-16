@@ -2636,6 +2636,21 @@ def test_send_sweep_chain_creates_separate_linked_runs(
     assert rj3["dependency"]["require_ok"] is True
     assert rj3["dependency"]["dagman_cluster_id"] == 1003
 
+    # Verify list_run_dirs orders chained runs strictly newest-step-first (#1=run3, #2=run2, #3=run1)
+    # and runs ls displays WAITING (#2) and WAITING (#3) instead of raw cluster IDs
+    import argparse
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.core import list_run_dirs
+
+    ordered = list_run_dirs(runs_root)
+    assert ordered == [run3, run2, run1]
+    _, row_sigs = runs_cli._build_ls_table_with_state(
+        argparse.Namespace(limit=25, status=None, tag=None, pinned=False, watch=False),
+        runs_root,
+    )
+    assert "WAITING (#2)" in row_sigs[0][5]
+    assert "WAITING (#3)" in row_sigs[1][5]
+
 
 def test_stop_cascades_to_downstream_chained_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2804,7 +2819,7 @@ def test_send_chain_explicit_tags_and_no_tag(tmp_path: Path) -> None:
             "--task {age,lab,survival}",
             "--chain",
             "-t",
-            "t_age,t_lab,t_surv",
+            "z_age,m_lab,a_surv",
             "--dry-run",
             "--no-venv",
         ],
@@ -2815,10 +2830,12 @@ def test_send_chain_explicit_tags_and_no_tag(tmp_path: Path) -> None:
         errors="replace",
     )
     assert res1.returncode == 0, res1.stderr
-    dirs1 = sorted(d for d in (proj1 / "runs").iterdir() if d.is_dir())
+    from hermes_tools.core import list_run_dirs
+
+    dirs1 = list_run_dirs(proj1 / "runs")
     assert len(dirs1) == 3
-    tags1 = {load_run_json(d)["submission"]["tag"] for d in dirs1}
-    assert tags1 == {"t_age", "t_lab", "t_surv"}
+    tags1 = [load_run_json(d)["submission"]["tag"] for d in dirs1]
+    assert tags1 == ["a_surv", "m_lab", "z_age"]
 
     # 2. --no-tag produces untagged folder names ending in _GPU3090 with no (tag) suffix in runs ls
     proj2 = tmp_path / "proj_notag"
