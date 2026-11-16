@@ -1798,7 +1798,7 @@ def _resolve_pull_target(
         or proj_cfg.get("host")
         or cfg_remote_host
     )
-    host = str(explicit_host).strip() if explicit_host else "hermes2"
+    host = str(explicit_host).strip() if explicit_host else "hermes"
 
     explicit_dir = (
         getattr(args, "remote_dir", None)
@@ -4222,7 +4222,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-H",
         "--host",
         type=str,
-        help="Remote SSH host (default: 'hermes2' or remote_host in .hermes.toml)",
+        help="Remote SSH host (default: 'hermes' or remote_host in .hermes.toml)",
     )
     p_pull.add_argument(
         "-d",

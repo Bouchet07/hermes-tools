@@ -225,7 +225,7 @@ no_venv = false
 node = []
 exclude = ["her07-100"]
 scratch = []
-remote_host = "hermes2"
+remote_host = "hermes"
 remote_dir = "~/projects/my-repo"
 
 [tool.hermes.env]
@@ -401,7 +401,7 @@ runs logs latest -f -n 100     # Wait if QUEUED, stream live output, and auto-ex
 runs sync latest
 ```
 
-**`runs pull`** (aliases: `runs fetch`, `runs download`, run on your **local laptop/desktop**) streams run capsules and outputs from `hermes2` to your local `runs/` folder over a single compressed SSH connection for local Jupyter notebook analysis and offline inspection (`runs ls`, `runs inspect`, `runs logs`, `runs plot`):
+**`runs pull`** (aliases: `runs fetch`, `runs download`, run on your **local laptop/desktop**) streams run capsules and outputs from `hermes` to your local `runs/` folder over a single compressed SSH connection for local Jupyter notebook analysis and offline inspection (`runs ls`, `runs inspect`, `runs logs`, `runs plot`):
 
 ```bash
 runs pull                            # Incremental pull of recent runs (skips repro/code/ and heavy .pt/.ckpt weights)
@@ -414,13 +414,13 @@ runs pull latest --code              # Include repro/code/ source snapshot
 runs pull latest --full              # Include both weights and repro/code/ snapshot
 runs pull --include '*.pt'           # Include specific glob pattern(s)
 runs pull --exclude '*.npz'          # Exclude specific glob pattern(s)
-runs pull -r hermes2:~/my-proj       # Specify remote host and path explicitly
+runs pull -r hermes:~/my-proj        # Specify remote host and path explicitly
 runs pull --watch -i 15              # Continuously sync active runs every 15s until they finish
 runs pull --dry-run                  # Preview runs, file counts, and transfer sizes without downloading
 ```
 
 > **Smart Auto-Discovery & Incremental Sync**:
-> - If `remote_dir` is not set in `.hermes.toml` / `pyproject.toml`, `runs pull` automatically searches your home directory on `hermes2` for a project matching your local repository name or Git remote URL (and remembers the remote working directory from pulled `run.json` provenance).
+> - If `remote_dir` is not set in `.hermes.toml` / `pyproject.toml`, `runs pull` automatically searches your home directory on `hermes` for a project matching your local repository name or Git remote URL (and remembers the remote working directory from pulled `run.json` provenance).
 > - Only new or modified files are transferred; unchanged runs and files are skipped automatically (use `-f` / `--force` to re-download everything).
 
 ### 6.5 `runs retry` (`resume`, `continue`)

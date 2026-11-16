@@ -3039,10 +3039,13 @@ def test_runs_pull_ssh_motd_resilience_and_remote_spec_parsing(
     import subprocess as _sp
     import hermes_tools.runs_cli as runs_cli
 
-    assert runs_cli._parse_remote_spec("hermes2:/mnt/cephfs/proj") == ("hermes2", "/mnt/cephfs/proj")
-    assert runs_cli._parse_remote_spec("user@hermes2:~/proj") == ("user@hermes2", "~/proj")
+    assert runs_cli._parse_remote_spec("hermes:/mnt/cephfs/proj") == ("hermes", "/mnt/cephfs/proj")
+    assert runs_cli._parse_remote_spec("user@hermes:~/proj") == ("user@hermes", "~/proj")
     assert runs_cli._parse_remote_spec("~/proj/runs") == (None, "~/proj/runs")
-    assert runs_cli._parse_remote_spec("hermes2") == ("hermes2", None)
+    assert runs_cli._parse_remote_spec("hermes") == ("hermes", None)
+    assert runs_cli._resolve_pull_target(
+        runs_cli.build_parser().parse_args(["pull"]), tmp_path, tmp_path / "runs"
+    )[0] == "hermes"
 
     remote_runs = tmp_path / "remote" / "runs"
     r1 = remote_runs / "2026-11-16_12-00-00_eval_AMD"
