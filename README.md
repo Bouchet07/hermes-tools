@@ -48,7 +48,7 @@ On `hermes2` (or locally):
 uv tool install git+https://github.com/Bouchet07/hermes-tools.git
 
 # Upgrade to the latest commit on main
-uv tool upgrade hermes-tools
+uv tool upgrade --reinstall hermes-tools
 ```
 
 To run the test suite during development:
@@ -433,10 +433,17 @@ runs retry latest --in-place -u -y  # Update code snapshot & retry failed proces
 runs retry latest --in-place -y     # Retry failed processes with frozen code snapshot
 runs retry latest --new-run -y      # Relaunch as a brand-new run using the frozen historical snapshot (works on COMPLETED runs too!)
 runs retry latest --new-run -u -y   # Relaunch as a brand-new run using the current working tree
+runs retry 3 --after 1 --after-ok -y  # Queue retry of run #3 after run #1 finishes with exit 0
+runs retry 3 -u --chain -y          # Retry run #3 and automatically re-queue downstream chained runs
+runs retry 3 --single -y            # Retry only run #3 without cascading to downstream chained runs
 send --from-run 1 -t cloned         # Clone an existing run's frozen snapshot & provenance into a new run
 runs retry latest --all             # Force re-run of all processes (even exit_code 0)
 runs retry latest --force           # Allow retry even if cluster still appears in condor_q
 ```
+
+**Chain-Aware Recovery & `--after` Chaining**:
+- **Dependency Chaining (`--after` / `--after-ok`)**: Works in both `--in-place` and `--new-run` modes. In `--in-place` mode, if the target parent run is still active, `runs retry` generates `repro/job.dag` pointing to `repro/job_retry.sub` and queues the retry in `WAITING` status via HTCondor DAGMan.
+- **Automatic Downstream Chain Recovery**: When a run in a `--chain` / `--after` pipeline fails and causes downstream runs to become `CANCELLED (parent failed)` (or `ABORTED` / `FAILED`), running `runs retry <failed_run>` automatically detects the downstream chain (`Run 2 -> Run 3 -> ...`), refreshes code snapshots across all runs in the chain if `-u` is passed, and re-queues the entire chain in pipeline order (pass `--single` / `--no-cascade` to retry only the target run).
 
 **How In-Place Retry Works (`--in-place`)**:
 1. Guards against colliding with still-running jobs in `condor_q` (unless `--force` is passed).

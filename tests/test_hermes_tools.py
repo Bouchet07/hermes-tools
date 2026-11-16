@@ -3086,6 +3086,164 @@ def test_runs_pull_ssh_motd_resilience_and_remote_spec_parsing(
     assert (local_dir / "runs" / r1.name / "summary.json").read_text(encoding="utf-8") == '{"acc": 0.99}\n'
 
 
+def test_runs_retry_with_after_and_downstream_chain_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Verifies runs retry --after/--after-ok and automatic downstream chain recovery (in-place + -u)."""
+    import hermes_tools.runs_cli as runs_cli
+
+    monkeypatch.chdir(tmp_path)
+    script = tmp_path / "pipeline.py"
+    script.write_text("print('v1')\n", encoding="utf-8")
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+
+    r0 = runs_root / "2026-11-16_09-00-00_prep_GPU3090"
+    r1 = runs_root / "2026-11-16_10-00-00_pipeline_GPU3090_age"
+    r2 = runs_root / "2026-11-16_10-00-01_pipeline_GPU3090_lab"
+    r3 = runs_root / "2026-11-16_10-00-02_pipeline_GPU3090_survival"
+    for r in (r0, r1, r2, r3):
+        (r / "repro" / "code").mkdir(parents=True)
+        (r / "repro" / "code" / "pipeline.py").write_text("print('v1')\n", encoding="utf-8")
+        (r / "repro" / "job.sub").write_text("executable = /bin/true\nqueue\n", encoding="utf-8")
+
+    # r0 is currently RUNNING (#900)
+    atomic_write_json(
+        r0 / "run.json",
+        {
+            "run_id": r0.name,
+            "status": "RUNNING",
+            "submission": {"cluster_id": 900, "target": "pipeline.py", "working_directory": str(tmp_path)},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1, "sweep_arguments": ["--prep"]},
+            "executions": [],
+        },
+        r0 / "repro",
+    )
+    # r1 FAILED (#1001), causing r2 (#1002) and r3 (#1003) to become CANCELLED (parent failed)
+    atomic_write_json(
+        r1 / "run.json",
+        {
+            "run_id": r1.name,
+            "status": "FAILED",
+            "submission": {"cluster_id": 1001, "target": "pipeline.py", "tag": "age", "working_directory": str(tmp_path)},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1, "sweep_arguments": ["--task age"]},
+            "executions": [{"process_id": 0, "exit_code": 1}],
+        },
+        r1 / "repro",
+    )
+    atomic_write_json(
+        r2 / "run.json",
+        {
+            "run_id": r2.name,
+            "status": "CANCELLED (parent failed)",
+            "cancelled_reason": "Parent run failed",
+            "submission": {"cluster_id": 1002, "target": "pipeline.py", "tag": "lab", "working_directory": str(tmp_path)},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1, "sweep_arguments": ["--task lab"]},
+            "dependency": {
+                "parent_run_id": r1.name,
+                "parent_run_dir": str(r1.resolve()),
+                "parent_cluster_id": 1001,
+                "require_ok": True,
+                "dagman_cluster_id": 1002,
+                "job_cluster_id": None,
+            },
+            "executions": [],
+        },
+        r2 / "repro",
+    )
+    atomic_write_json(
+        r3 / "run.json",
+        {
+            "run_id": r3.name,
+            "status": "CANCELLED (parent failed)",
+            "cancelled_reason": "Parent run failed",
+            "submission": {"cluster_id": 1003, "target": "pipeline.py", "tag": "survival", "working_directory": str(tmp_path)},
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1, "sweep_arguments": ["--task survival"]},
+            "dependency": {
+                "parent_run_id": r2.name,
+                "parent_run_dir": str(r2.resolve()),
+                "parent_cluster_id": 1002,
+                "require_ok": True,
+                "dagman_cluster_id": 1003,
+                "job_cluster_id": None,
+            },
+            "executions": [],
+        },
+        r3 / "repro",
+    )
+
+    monkeypatch.setattr(
+        runs_cli,
+        "query_live_condor_clusters",
+        lambda: {900: {"total": 1, "running": 1, "idle": 0, "held": 0}},
+    )
+
+    next_cid = [2000]
+
+    def fake_subprocess_run(cmd, **kwargs):
+        exe = Path(cmd[0]).name
+        if exe == "condor_submit_dag":
+            dag_file = Path(cmd[-1])
+            Path(f"{dag_file}.condor.sub").write_text(
+                "executable = /usr/bin/condor_dagman\narguments = -f -l .\nqueue\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if exe == "condor_submit":
+            next_cid[0] += 1
+            cid = next_cid[0]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"1 job(s) submitted to cluster {cid}.\n", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(runs_cli.subprocess, "run", fake_subprocess_run)
+
+    # Modify source code before retrying with `-u`
+    script.write_text("print('v2_fixed')\n", encoding="utf-8")
+
+    # 1. Retry r1 in-place with `-u --after r0 --after-ok -y` -> cascades across r1 -> r2 -> r3!
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["runs", "retry", r1.name, "--in-place", "-u", "--after", r0.name, "--after-ok", "-y"],
+    )
+    runs_cli.main()
+    capsys.readouterr()
+
+    rj1 = load_run_json(r1)
+    rj2 = load_run_json(r2)
+    rj3 = load_run_json(r3)
+
+    # r1 is now WAITING on r0 (#900) with cluster 2001
+    assert rj1["status"] == "WAITING"
+    assert rj1["submission"]["cluster_id"] == 2001
+    assert rj1["dependency"]["parent_run_id"] == r0.name
+    assert rj1["dependency"]["parent_cluster_id"] == 900
+    assert rj1["dependency"]["require_ok"] is True
+
+    # r2 is now WAITING on r1 (#2001) with cluster 2002, and cancelled_reason is cleared
+    assert rj2["status"] == "WAITING"
+    assert "cancelled_reason" not in rj2
+    assert rj2["submission"]["cluster_id"] == 2002
+    assert rj2["dependency"]["parent_run_id"] == r1.name
+    assert rj2["dependency"]["parent_cluster_id"] == 2001
+
+    # r3 is now WAITING on r2 (#2002) with cluster 2003
+    assert rj3["status"] == "WAITING"
+    assert "cancelled_reason" not in rj3
+    assert rj3["submission"]["cluster_id"] == 2003
+    assert rj3["dependency"]["parent_run_id"] == r2.name
+    assert rj3["dependency"]["parent_cluster_id"] == 2002
+
+    # Code snapshot was refreshed across all 3 runs in the chain
+    for r in (r1, r2, r3):
+        assert "v2_fixed" in (r / "repro" / "code" / "pipeline.py").read_text(encoding="utf-8")
+        assert (r / "repro" / "job.dag").is_file()
+        assert "job_retry.sub" in (r / "repro" / "job.dag").read_text(encoding="utf-8")
+
+
+
 
 
 

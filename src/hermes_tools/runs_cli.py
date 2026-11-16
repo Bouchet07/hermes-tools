@@ -26,7 +26,10 @@ from rich.table import Table
 from hermes_tools.condor import (
     build_send_command_tokens,
     compute_telemetry_summary,
+    generate_dag_file,
+    generate_dagman_config,
     generate_retry_sub_file,
+    generate_wait_parent_script,
     get_all_cluster_ids,
     get_failed_or_missing_procs,
     query_condor_better_analyze,
@@ -36,6 +39,7 @@ from hermes_tools.condor import (
     read_telemetry_csv,
     reconcile_run,
     run_needs_live_reconcile,
+    sanitize_dagman_condor_sub,
     stream_job_live_telemetry,
     summarize_condor_pools,
 )
@@ -53,6 +57,7 @@ from hermes_tools.core import (
     load_run_json,
     locked_mutate_run_json,
     resolve_latest_symlink,
+    resolve_submit_python,
     set_execution_records,
     style_status,
     summarize_metrics,
@@ -2246,6 +2251,464 @@ def cmd_pull(args: argparse.Namespace, runs_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: `runs retry`
 # ---------------------------------------------------------------------------
+def _find_downstream_retry_chain(
+    runs_root: Path,
+    root_run_dir: Path,
+    root_cids: List[int],
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
+    include_completed: bool = False,
+) -> List[Tuple[Path, Dict[str, Any]]]:
+    """
+    Finds transitive downstream runs (in chronological pipeline order) that depended on
+    `root_run_dir` or `root_cids` and are inactive (e.g. CANCELLED, ABORTED, FAILED).
+    """
+    dirs = list(reversed(list_run_dirs(runs_root)))
+    if not dirs:
+        return []
+
+    loaded: List[Tuple[Path, Dict[str, Any], List[int], str, bool]] = []
+    for d in dirs:
+        if d == root_run_dir:
+            continue
+        raw_data = load_run_json(d)
+        if not raw_data:
+            continue
+        dep = raw_data.get("dependency")
+        if not isinstance(dep, dict):
+            continue
+        data = (
+            reconcile_run(d, raw_data, live_clusters)
+            if run_needs_live_reconcile(raw_data)
+            else raw_data
+        )
+        st = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
+        cids = get_all_cluster_ids(data)
+        act_cids = [c for c in cids if live_clusters is not None and c in live_clusters]
+        is_active = st.startswith(("QUEUED", "RUNNING", "HELD", "WAITING")) or bool(act_cids)
+        loaded.append((d, data, cids, st, is_active))
+
+    downstream: List[Tuple[Path, Dict[str, Any]]] = []
+    frontier_names = {root_run_dir.name}
+    frontier_cids = set(root_cids)
+    visited: set[Path] = {root_run_dir}
+
+    changed = True
+    while changed:
+        changed = False
+        for d, data, cids, st, is_active in loaded:
+            if d in visited:
+                continue
+            dep = data.get("dependency") or {}
+            p_run_id = dep.get("parent_run_id")
+            p_cid = dep.get("parent_cluster_id")
+            matches_parent = (p_run_id and str(p_run_id) in frontier_names) or (
+                p_cid is not None and int(p_cid) in frontier_cids
+            )
+            if matches_parent:
+                visited.add(d)
+                frontier_names.add(d.name)
+                frontier_cids.update(cids)
+                changed = True
+                if is_active:
+                    continue
+                if st == "COMPLETED" and not include_completed:
+                    continue
+                downstream.append((d, data))
+
+    return downstream
+
+
+def _resolve_retry_dependency(
+    runs_root: Path,
+    run_dir: Path,
+    data: Dict[str, Any],
+    after_arg: Optional[str],
+    after_ok: bool,
+    live_clusters: Optional[Dict[int, Dict[str, Any]]],
+) -> Tuple[Optional[Path], Optional[int], bool, bool, Optional[str]]:
+    """
+    Resolves `(parent_run_dir, parent_cid, submit_via_dag, require_ok, resolved_after_id)`
+    for `runs retry` when `--after` is passed or when the target run's original parent is currently active.
+    """
+    if after_arg:
+        parent_run_dir = resolve_run_dir(runs_root, after_arg, exit_on_fail=False)
+        if parent_run_dir == run_dir:
+            console.print(
+                "[bold red]✘ Error:[/bold red] A run cannot be chained after itself (--after)."
+            )
+            sys.exit(1)
+
+        if parent_run_dir and parent_run_dir.is_dir():
+            parent_data = load_run_json(parent_run_dir)
+            if not parent_data:
+                console.print(
+                    f"[bold red]✘ Error:[/bold red] Could not load run.json from parent run '{parent_run_dir.name}'."
+                )
+                sys.exit(1)
+            if run_needs_live_reconcile(parent_data):
+                parent_data = reconcile_run(parent_run_dir, parent_data, live_clusters)
+            p_cids = get_all_cluster_ids(parent_data)
+            parent_cid = p_cids[-1] if p_cids else None
+            parent_status = str(
+                parent_data.get("_live_badge") or parent_data.get("status", "UNKNOWN")
+            )
+            is_parent_active = parent_status.startswith(
+                ("QUEUED", "RUNNING", "HELD", "WAITING")
+            ) or (
+                live_clusters is not None
+                and parent_cid is not None
+                and parent_cid in live_clusters
+            )
+            if not is_parent_active:
+                if parent_status == "COMPLETED":
+                    console.print(
+                        f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already completed successfully. "
+                        f"Submitting retry directly without DAGMan delay...[/dim]"
+                    )
+                    return parent_run_dir, parent_cid, False, after_ok, parent_run_dir.name
+                if after_ok:
+                    console.print(
+                        f"[bold red]✘ Cannot submit retry:[/bold red] Parent run '{parent_run_dir.name}' has already finished "
+                        f"with status '{parent_status}'. Aborting because --after-ok was specified."
+                    )
+                    sys.exit(1)
+                console.print(
+                    f"[dim]Parent run [bold]{parent_run_dir.name}[/bold] has already finished ({parent_status}). "
+                    f"Proceeding with direct retry submission...[/dim]"
+                )
+                return parent_run_dir, parent_cid, False, after_ok, parent_run_dir.name
+            return parent_run_dir, parent_cid, True, after_ok, parent_run_dir.name
+
+        if str(after_arg).strip().isdigit():
+            raw_cid = int(str(after_arg).strip())
+            if live_clusters is not None and raw_cid in live_clusters:
+                console.print(
+                    f"[dim]Parent job [bold]#{raw_cid}[/bold] detected as active raw HTCondor cluster in condor_q.[/dim]"
+                )
+                return None, raw_cid, True, after_ok, str(raw_cid)
+            console.print(
+                f"[bold red]✘ Error:[/bold red] Cluster ID #{raw_cid} is not active in HTCondor (condor_q) "
+                f"and does not match any local run in {runs_root}."
+            )
+            sys.exit(1)
+
+        console.print(
+            f"[bold red]✘ Error:[/bold red] Parent run '{after_arg}' could not be resolved."
+        )
+        sys.exit(1)
+
+    dep = data.get("dependency")
+    if isinstance(dep, dict):
+        orig_p_dir: Optional[Path] = None
+        if dep.get("parent_run_dir"):
+            cand = Path(str(dep["parent_run_dir"]))
+            if cand.is_dir():
+                orig_p_dir = cand
+        if orig_p_dir is None and dep.get("parent_run_id"):
+            cand = runs_root / str(dep["parent_run_id"])
+            if cand.is_dir():
+                orig_p_dir = cand
+
+        if orig_p_dir is not None and orig_p_dir != run_dir:
+            orig_p_data = load_run_json(orig_p_dir)
+            if run_needs_live_reconcile(orig_p_data):
+                orig_p_data = reconcile_run(orig_p_dir, orig_p_data, live_clusters)
+            orig_p_cids = get_all_cluster_ids(orig_p_data)
+            orig_p_cid = orig_p_cids[-1] if orig_p_cids else dep.get("parent_cluster_id")
+            orig_p_st = str(
+                orig_p_data.get("_live_badge") or orig_p_data.get("status", "UNKNOWN")
+            )
+            is_orig_active = orig_p_st.startswith(
+                ("QUEUED", "RUNNING", "HELD", "WAITING")
+            ) or (
+                live_clusters is not None
+                and orig_p_cid is not None
+                and int(orig_p_cid) in live_clusters
+            )
+            if is_orig_active:
+                req_ok = bool(dep.get("require_ok", False) or after_ok)
+                console.print(
+                    f"[dim cyan]ℹ Parent run {_format_run_short(orig_p_dir, orig_p_data)} is currently active "
+                    f"({style_status(orig_p_st)}) — queueing retry to wait after #{orig_p_cid}.[/dim cyan]"
+                )
+                return (
+                    orig_p_dir,
+                    int(orig_p_cid) if orig_p_cid is not None else None,
+                    True,
+                    req_ok,
+                    orig_p_dir.name,
+                )
+
+    return None, None, False, after_ok, None
+
+
+def _retry_single_run_in_place(
+    run_dir: Path,
+    data: Dict[str, Any],
+    targets: List[Tuple[int, str]],
+    *,
+    update_code: bool,
+    submit_via_dag: bool = False,
+    parent_run_dir: Optional[Path] = None,
+    parent_cid: Optional[int] = None,
+    require_ok: bool = False,
+) -> Optional[int]:
+    """Retries a single run capsule in-place (directly via condor_submit or chained via DAGMan)."""
+    repro_dir = run_dir / "repro"
+    rj_path = run_dir / "run.json"
+    req = data.get("resources_requested", {})
+    sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
+    is_sweep = len(sweep_args) > 1
+
+    if update_code:
+        refresh_code_snapshot(run_dir, data)
+
+    script_stem = Path(data.get("submission", {}).get("target", "job")).stem
+    now = datetime.datetime.now()
+    retry_epoch = int(now.timestamp())
+    backup_tag = now.strftime("prev_%H%M%S")
+
+    for pid, _ in targets:
+        suffix = f"_{pid}" if is_sweep else ""
+        for ext in (".out", ".err"):
+            p = run_dir / f"{script_stem}{suffix}{ext}"
+            if p.is_file():
+                shutil.move(str(p), str(repro_dir / f"{p.name}.{backup_tag}"))
+        node_f = repro_dir / f"node_{pid}.json"
+        if node_f.is_file():
+            node_f.unlink()
+        telem_f = repro_dir / f"telemetry_{pid}.csv"
+        if telem_f.is_file():
+            shutil.move(str(telem_f), str(repro_dir / f"telemetry_{pid}.csv.{backup_tag}"))
+
+    condor_log = repro_dir / "condor.log"
+    if condor_log.is_file():
+        try:
+            shutil.move(str(condor_log), str(repro_dir / f"condor.log.{backup_tag}"))
+        except OSError:
+            pass
+    for stale_dag_f in repro_dir.glob("job.dag.*"):
+        try:
+            stale_dag_f.unlink()
+        except OSError:
+            pass
+
+    retry_sub_content = generate_retry_sub_file(
+        orig_sub_path=repro_dir / "job.sub",
+        run_dir=run_dir,
+        repro_dir=repro_dir,
+        script_stem=script_stem,
+        is_sweep=is_sweep,
+        targets=targets,
+        retry_epoch=retry_epoch,
+        run_data=data,
+    )
+    retry_sub_path = repro_dir / "job_retry.sub"
+    write_text_lf(retry_sub_path, retry_sub_content)
+
+    if submit_via_dag:
+        wait_script_path = repro_dir / "wait_parent.py"
+        write_text_lf(wait_script_path, generate_wait_parent_script())
+        try:
+            wait_script_path.chmod(0o755)
+        except OSError:
+            pass
+
+        dag_path = repro_dir / "job.dag"
+        submit_py = str(resolve_submit_python())
+        dagman_cfg_path: Optional[Path] = None
+        dagman_cfg = generate_dagman_config(shutil.which("condor_submit"))
+        if dagman_cfg:
+            dagman_cfg_path = repro_dir / "dagman.config"
+            write_text_lf(dagman_cfg_path, dagman_cfg)
+
+        dag_content = generate_dag_file(
+            sub_path=retry_sub_path,
+            wait_script_path=wait_script_path,
+            python_bin=submit_py,
+            child_dir=run_dir,
+            parent_dir=parent_run_dir,
+            parent_cluster_id=parent_cid,
+            require_ok=require_ok,
+            config_path=dagman_cfg_path,
+        )
+        write_text_lf(dag_path, dag_content)
+
+        dag_res = subprocess.run(
+            ["condor_submit_dag", "-f", "-no_submit", str(dag_path)],
+            cwd=run_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if dag_res.returncode != 0:
+            console.print(
+                f"[bold red]✘ condor_submit_dag failed:[/bold red]\n{(dag_res.stderr or dag_res.stdout).strip()}"
+            )
+            sys.exit(1)
+
+        condor_sub_path = Path(f"{dag_path}.condor.sub")
+        if condor_sub_path.is_file():
+            sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
+            write_text_lf(condor_sub_path, sanitize_dagman_condor_sub(sub_txt))
+
+        res = subprocess.run(
+            ["condor_submit", str(condor_sub_path)],
+            cwd=run_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if res.returncode != 0:
+            console.print(
+                f"[bold red]✘ condor_submit failed:[/bold red]\n{(res.stderr or res.stdout).strip()}"
+            )
+            sys.exit(1)
+
+        condor_out = res.stdout.strip()
+        cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+        new_cid = int(cluster_match.group(1)) if cluster_match else None
+
+        def _record_dag_retry(d: Dict[str, Any]) -> None:
+            d["status"] = "WAITING"
+            d.pop("cancelled_reason", None)
+            retried_ids = {pid for pid, _ in targets}
+            remaining = [
+                x for x in get_execution_records(d) if x.get("process_id") not in retried_ids
+            ]
+            set_execution_records(d, remaining)
+            sub_block = d.setdefault("submission", {})
+            history = sub_block.setdefault("retry_clusters", [])
+            old_cid = sub_block.get("cluster_id")
+            if old_cid is not None and old_cid not in history:
+                history.append(old_cid)
+            sub_block["cluster_id"] = new_cid
+            sub_block["condor_submit_output"] = condor_out
+            dep_block = d.setdefault("dependency", {})
+            dep_block["parent_run_id"] = parent_run_dir.name if parent_run_dir else None
+            dep_block["parent_run_dir"] = (
+                str(parent_run_dir.resolve()) if parent_run_dir else None
+            )
+            dep_block["parent_cluster_id"] = parent_cid
+            dep_block["require_ok"] = require_ok
+            dep_block["dagman_cluster_id"] = new_cid
+            dep_block["job_cluster_id"] = None
+
+        locked_mutate_run_json(rj_path, repro_dir, _record_dag_retry)
+        parent_label = (
+            f"{parent_run_dir.name} (#{parent_cid})"
+            if (parent_run_dir and parent_cid)
+            else (parent_run_dir.name if parent_run_dir else f"#{parent_cid}")
+        )
+        ok_badge = " [bold yellow][exit 0 required][/bold yellow]" if require_ok else ""
+        console.print(
+            Panel(
+                f"[bold blue]⏳ {condor_out}[/bold blue]\n"
+                f"  • Waiting After     : [bold white]{parent_label}[/bold white]{ok_badge}\n"
+                f"  • Retried Processes : [cyan]{[pid for pid, _ in targets]}[/cyan]\n"
+                f"  • Code Refreshed    : [cyan]{'Yes' if update_code else 'No (Frozen snapshot)'}[/cyan]\n"
+                f"  • Archived Old Logs : [dim]repro/*.{backup_tag}[/dim]",
+                title=f"[bold blue]🔗 Chained In-Place Recovery Queued ({run_dir.name})[/bold blue]",
+                border_style="blue",
+                expand=False,
+            )
+        )
+        return new_cid
+
+    res = subprocess.run(
+        ["condor_submit", str(retry_sub_path)],
+        cwd=run_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if res.returncode != 0:
+        console.print(
+            f"[bold red]✘ condor_submit failed:[/bold red]\n{(res.stderr or res.stdout).strip()}"
+        )
+        sys.exit(1)
+
+    condor_out = res.stdout.strip()
+    cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
+    new_cid = int(cluster_match.group(1)) if cluster_match else None
+
+    def _record_retry(d: Dict[str, Any]) -> None:
+        d["status"] = "QUEUED (RETRY)"
+        d.pop("cancelled_reason", None)
+        retried_ids = {pid for pid, _ in targets}
+        remaining = [
+            x for x in get_execution_records(d) if x.get("process_id") not in retried_ids
+        ]
+        set_execution_records(d, remaining)
+        sub_block = d.setdefault("submission", {})
+        history = sub_block.setdefault("retry_clusters", [])
+        old_cid = sub_block.get("cluster_id")
+        if old_cid is not None and old_cid not in history:
+            history.append(old_cid)
+        sub_block["cluster_id"] = new_cid
+        if isinstance(d.get("dependency"), dict):
+            d["dependency"]["job_cluster_id"] = new_cid
+
+    locked_mutate_run_json(rj_path, repro_dir, _record_retry)
+    console.print(
+        Panel(
+            f"[bold green]✔ {condor_out}[/bold green]\n"
+            f"  • Retried Processes : [cyan]{[pid for pid, _ in targets]}[/cyan]\n"
+            f"  • Code Refreshed    : [cyan]{'Yes' if update_code else 'No (Frozen snapshot)'}[/cyan]\n"
+            f"  • Archived Old Logs : [dim]repro/*.{backup_tag}[/dim]",
+            title=f"[bold green]🔄 In-Place Recovery Submitted ({run_dir.name})[/bold green]",
+            border_style="green",
+            expand=False,
+        )
+    )
+    return new_cid
+
+
+def _build_send_cmd_for_run(
+    send_bin: str,
+    run_dir: Path,
+    data: Dict[str, Any],
+    targets: List[Tuple[int, str]],
+    *,
+    update_code: bool,
+    after: Optional[str] = None,
+    after_ok: bool = False,
+    yes: bool = False,
+) -> Tuple[List[str], Path]:
+    req = data.get("resources_requested", {})
+    sub_meta = data.get("submission", {})
+    cwd = Path(sub_meta.get("working_directory", Path.cwd()))
+    sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
+    is_sweep = len(sweep_args) > 1
+    cmd = build_send_command_tokens(
+        send_bin=send_bin,
+        target=str(sub_meta.get("target")),
+        arch=str(req.get("architecture")),
+        cpus=req.get("cpus"),
+        mem_mb=req.get("memory_mb"),
+        gpus=req.get("gpus"),
+        tag=str(sub_meta["tag"]) if sub_meta.get("tag") else None,
+        no_venv=bool(sub_meta.get("no_venv")),
+        venv=str(sub_meta["venv"]) if sub_meta.get("venv") else None,
+        nodes_include=list(req.get("node_include") or []),
+        nodes_exclude=list(req.get("node_exclude") or []),
+        project_code=str(req["project_code"]) if req.get("project_code") else None,
+        scratch_files=[str(sf) for sf in (req.get("scratch_files") or [])],
+        env_items=[f"{ek}={ev}" for ek, ev in (req.get("env") or {}).items()],
+        sweep_specs=[arg_line for _, arg_line in targets] if is_sweep else None,
+        args_flag_val=targets[0][1] if (not is_sweep and targets[0][1]) else None,
+        after=after,
+        after_ok=after_ok,
+        from_run=run_dir.name if not update_code else None,
+        max_parallel=req.get("max_parallel"),
+        yes=yes,
+    )
+    return cmd, cwd
+
+
 def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to retry/continue:"
@@ -2258,8 +2721,17 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             f"[yellow]⚠ Run '{run_dir.name}' is currently {style_status(status)}. Cannot retry a waiting run. Use `runs stop {run_dir.name}` to cancel it.[/yellow]"
         )
         return
-    repro_dir = run_dir / "repro"
-    rj_path = run_dir / "run.json"
+
+    after_arg = getattr(args, "after", None)
+    after_ok_flag = bool(getattr(args, "after_ok", False))
+    chain_flag = bool(getattr(args, "chain", False))
+    single_flag = bool(getattr(args, "single", False))
+
+    parent_run_dir, parent_cid, submit_via_dag, require_ok, resolved_after_id = (
+        _resolve_retry_dependency(
+            runs_root, run_dir, data, after_arg, after_ok_flag, live_clusters
+        )
+    )
 
     req = data.get("resources_requested", {})
     sweep_args: List[str] = list(req.get("sweep_arguments") or [""])
@@ -2288,6 +2760,47 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
                     "[yellow]All processes in this run completed with exit_code 0. Use `--all` or `--new-run` to force re-run.[/yellow]"
                 )
                 return
+
+    root_cids = get_all_cluster_ids(data)
+    downstream = (
+        []
+        if single_flag
+        else _find_downstream_retry_chain(
+            runs_root, run_dir, root_cids, live_clusters, include_completed=bool(args.all)
+        )
+    )
+    retry_downstream = bool(downstream)
+    if downstream:
+        console.print(
+            f"[yellow]🔗 Found {len(downstream)} downstream chained run(s) depending on {_format_run_short(run_dir, data)}:[/yellow]"
+        )
+        for dep_dir, dep_data in downstream:
+            dep_st = str(dep_data.get("_live_badge") or dep_data.get("status", "UNKNOWN"))
+            console.print(
+                f"  • {_format_run_short(dep_dir, dep_data)} ({style_status(dep_st)})"
+            )
+
+        if not chain_flag and not args.yes and sys.stdin.isatty():
+            import questionary
+
+            c_choice = questionary.select(
+                "How would you like to retry this chain?",
+                choices=[
+                    questionary.Choice(
+                        f"1. Retry entire chain ({1 + len(downstream)} runs)",
+                        value="chain",
+                    ),
+                    questionary.Choice(
+                        f"2. Retry only this run ({run_dir.name})",
+                        value="single",
+                    ),
+                    questionary.Choice("3. Cancel", value="cancel"),
+                ],
+                style=get_prompt_style(),
+            ).ask()
+            if not c_choice or c_choice == "cancel":
+                return
+            retry_downstream = c_choice == "chain"
 
     mode = "in_place" if args.in_place else ("new_run" if args.new_run else None)
     update_code = args.update_code
@@ -2325,35 +2838,64 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
 
     if mode == "new_run":
         send_bin = shutil.which("send") or str(Path(sys.executable).parent / "send")
-        cwd = Path(data.get("submission", {}).get("working_directory", Path.cwd()))
-        sub_meta = data.get("submission", {})
-        cmd = build_send_command_tokens(
-            send_bin=send_bin,
-            target=str(sub_meta.get("target")),
-            arch=str(req.get("architecture")),
-            cpus=req.get("cpus"),
-            mem_mb=req.get("memory_mb"),
-            gpus=req.get("gpus"),
-            tag=str(sub_meta["tag"]) if sub_meta.get("tag") else None,
-            no_venv=bool(sub_meta.get("no_venv")),
-            venv=str(sub_meta["venv"]) if sub_meta.get("venv") else None,
-            nodes_include=list(req.get("node_include") or []),
-            nodes_exclude=list(req.get("node_exclude") or []),
-            project_code=str(req["project_code"]) if req.get("project_code") else None,
-            scratch_files=[str(sf) for sf in (req.get("scratch_files") or [])],
-            env_items=[f"{ek}={ev}" for ek, ev in (req.get("env") or {}).items()],
-            sweep_specs=[arg_line for _, arg_line in targets] if is_sweep else None,
-            args_flag_val=targets[0][1] if (not is_sweep and targets[0][1]) else None,
-            from_run=run_dir.name if not update_code else None,
-            max_parallel=req.get("max_parallel"),
-            yes=bool(args.yes),
+        cmd, cwd = _build_send_cmd_for_run(
+            send_bin,
+            run_dir,
+            data,
+            targets,
+            update_code=update_code,
+            after=resolved_after_id,
+            after_ok=require_ok if resolved_after_id else False,
+            yes=bool(args.yes or retry_downstream),
         )
-
         console.print(
             f"[bold cyan]▶ Relaunching via send:[/bold cyan] {' '.join(shlex.quote(c) for c in cmd)}"
         )
-        os.chdir(cwd)
-        os.execv(send_bin, cmd)
+        if not retry_downstream:
+            os.chdir(cwd)
+            os.execv(send_bin, cmd)
+            return
+
+        res_first = subprocess.run(cmd, cwd=cwd)
+        if res_first.returncode != 0:
+            sys.exit(res_first.returncode)
+        latest_after_first = resolve_latest_symlink(runs_root) or (
+            list_run_dirs(runs_root)[0] if list_run_dirs(runs_root) else None
+        )
+        prev_new_name = latest_after_first.name if latest_after_first else run_dir.name
+
+        for dep_dir, dep_data in downstream:
+            dep_req = dep_data.get("resources_requested") or {}
+            dep_sweep = list(dep_req.get("sweep_arguments") or [""])
+            dep_targets = (
+                list(enumerate(dep_sweep))
+                if args.all
+                else (get_failed_or_missing_procs(dep_data) or list(enumerate(dep_sweep)))
+            )
+            dep_ok = bool(
+                (dep_data.get("dependency") or {}).get("require_ok", False) or after_ok_flag
+            )
+            dep_cmd, dep_cwd = _build_send_cmd_for_run(
+                send_bin,
+                dep_dir,
+                dep_data,
+                dep_targets,
+                update_code=update_code,
+                after=prev_new_name,
+                after_ok=dep_ok,
+                yes=True,
+            )
+            console.print(
+                f"[bold cyan]▶ Relaunching downstream via send:[/bold cyan] {' '.join(shlex.quote(c) for c in dep_cmd)}"
+            )
+            res_dep = subprocess.run(dep_cmd, cwd=dep_cwd)
+            if res_dep.returncode != 0:
+                sys.exit(res_dep.returncode)
+            latest_now = resolve_latest_symlink(runs_root) or (
+                list_run_dirs(runs_root)[0] if list_run_dirs(runs_root) else None
+            )
+            if latest_now:
+                prev_new_name = latest_now.name
         return
 
     if live_clusters is not None and not args.force:
@@ -2365,86 +2907,42 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             )
             sys.exit(1)
 
-    if update_code:
-        refresh_code_snapshot(run_dir, data)
-
-    script_stem = Path(data.get("submission", {}).get("target", "job")).stem
-    now = datetime.datetime.now()
-    retry_epoch = int(now.timestamp())
-    backup_tag = now.strftime("prev_%H%M%S")
-
-    for pid, _ in targets:
-        suffix = f"_{pid}" if is_sweep else ""
-        for ext in (".out", ".err"):
-            p = run_dir / f"{script_stem}{suffix}{ext}"
-            if p.is_file():
-                shutil.move(str(p), str(repro_dir / f"{p.name}.{backup_tag}"))
-        node_f = repro_dir / f"node_{pid}.json"
-        if node_f.is_file():
-            node_f.unlink()
-        telem_f = repro_dir / f"telemetry_{pid}.csv"
-        if telem_f.is_file():
-            shutil.move(str(telem_f), str(repro_dir / f"telemetry_{pid}.csv.{backup_tag}"))
-
-    retry_sub_content = generate_retry_sub_file(
-        orig_sub_path=repro_dir / "job.sub",
-        run_dir=run_dir,
-        repro_dir=repro_dir,
-        script_stem=script_stem,
-        is_sweep=is_sweep,
-        targets=targets,
-        retry_epoch=retry_epoch,
-        run_data=data,
+    first_cid = _retry_single_run_in_place(
+        run_dir,
+        data,
+        targets,
+        update_code=update_code,
+        submit_via_dag=submit_via_dag,
+        parent_run_dir=parent_run_dir,
+        parent_cid=parent_cid,
+        require_ok=require_ok,
     )
-    retry_sub_path = repro_dir / "job_retry.sub"
-    write_text_lf(retry_sub_path, retry_sub_content)
 
-    res = subprocess.run(
-        ["condor_submit", str(retry_sub_path)],
-        cwd=run_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if res.returncode != 0:
-        console.print(
-            f"[bold red]✘ condor_submit failed:[/bold red]\n{(res.stderr or res.stdout).strip()}"
-        )
-        sys.exit(1)
-
-    condor_out = res.stdout.strip()
-    cluster_match = re.search(r"submitted to cluster\s+(\d+)", condor_out)
-    new_cid = int(cluster_match.group(1)) if cluster_match else None
-
-    def _record_retry(d: Dict[str, Any]) -> None:
-        d["status"] = "QUEUED (RETRY)"
-        retried_ids = {pid for pid, _ in targets}
-        remaining = [
-            x for x in get_execution_records(d) if x.get("process_id") not in retried_ids
-        ]
-        set_execution_records(d, remaining)
-        sub_block = d.setdefault("submission", {})
-        history = sub_block.setdefault("retry_clusters", [])
-        old_cid = sub_block.get("cluster_id")
-        if old_cid is not None and old_cid not in history:
-            history.append(old_cid)
-        sub_block["cluster_id"] = new_cid
-        if isinstance(d.get("dependency"), dict):
-            d["dependency"]["job_cluster_id"] = new_cid
-
-    locked_mutate_run_json(rj_path, repro_dir, _record_retry)
-    console.print(
-        Panel(
-            f"[bold green]✔ {condor_out}[/bold green]\n"
-            f"  • Retried Processes : [cyan]{[pid for pid, _ in targets]}[/cyan]\n"
-            f"  • Code Refreshed    : [cyan]{'Yes' if update_code else 'No (Frozen snapshot)'}[/cyan]\n"
-            f"  • Archived Old Logs : [dim]repro/*.{backup_tag}[/dim]",
-            title=f"[bold green]🔄 In-Place Recovery Submitted ({run_dir.name})[/bold green]",
-            border_style="green",
-            expand=False,
-        )
-    )
+    if retry_downstream:
+        prev_dir = run_dir
+        prev_cid = first_cid
+        for dep_dir, dep_data in downstream:
+            dep_req = dep_data.get("resources_requested") or {}
+            dep_sweep = list(dep_req.get("sweep_arguments") or [""])
+            dep_targets = (
+                list(enumerate(dep_sweep))
+                if args.all
+                else (get_failed_or_missing_procs(dep_data) or list(enumerate(dep_sweep)))
+            )
+            dep_ok = bool(
+                (dep_data.get("dependency") or {}).get("require_ok", False) or after_ok_flag
+            )
+            prev_cid = _retry_single_run_in_place(
+                dep_dir,
+                dep_data,
+                dep_targets,
+                update_code=update_code,
+                submit_via_dag=True,
+                parent_run_dir=prev_dir,
+                parent_cid=prev_cid,
+                require_ok=dep_ok,
+            )
+            prev_dir = dep_dir
 
 
 # ---------------------------------------------------------------------------
@@ -4206,6 +4704,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Allow in-place retry even if jobs are still active in condor_q",
+    )
+    p_ret.add_argument(
+        "--after",
+        type=str,
+        default=None,
+        help="Queue retry as a dependent job after specified run (by ID, index, 'latest', or cluster ID) completes",
+    )
+    p_ret.add_argument(
+        "--after-ok",
+        action="store_true",
+        help="When chained (via --after or downstream chain), only run if parent succeeds (exit 0)",
+    )
+    p_ret.add_argument(
+        "--chain",
+        "--cascade",
+        dest="chain",
+        action="store_true",
+        help="Automatically retry downstream chained runs that depended on this run",
+    )
+    p_ret.add_argument(
+        "--single",
+        "--no-cascade",
+        dest="single",
+        action="store_true",
+        help="Retry only the specified run without re-queueing downstream chained runs",
     )
     p_ret.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
 
