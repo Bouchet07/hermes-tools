@@ -27,6 +27,7 @@ from hermes_tools.core import (
     list_run_dirs,
     load_project_config,
     load_run_json,
+    status_spinner,
     style_status,
     update_latest_symlink,
 )
@@ -966,15 +967,16 @@ def _execute_single_pull(
     manifest: Optional[Dict[str, Any]] = None
     pre_lines: List[str] = []
     try:
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            if line.startswith(_PULL_MANIFEST_PREFIX):
-                raw_json = line[len(_PULL_MANIFEST_PREFIX) :].decode("utf-8", errors="replace")
-                manifest = json.loads(raw_json)
-                break
-            pre_lines.append(line.decode("utf-8", errors="replace").rstrip())
+        with status_spinner(f"Connecting to {host} and scanning remote runs..."):
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if line.startswith(_PULL_MANIFEST_PREFIX):
+                    raw_json = line[len(_PULL_MANIFEST_PREFIX) :].decode("utf-8", errors="replace")
+                    manifest = json.loads(raw_json)
+                    break
+                pre_lines.append(line.decode("utf-8", errors="replace").rstrip())
 
         if manifest is None:
             stderr_txt = proc.stderr.read().decode("utf-8", errors="replace").strip()

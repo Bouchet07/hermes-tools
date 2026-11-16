@@ -55,6 +55,8 @@ from hermes_tools.core import (
     locked_mutate_run_json,
     resolve_latest_symlink,
     set_execution_records,
+    status_spinner,
+    step_progress,
     style_status,
     summarize_metrics,
     tail_file_lines,
@@ -1707,42 +1709,56 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
             )
             sys.exit(1)
 
-    first_cid = _retry_single_run_in_place(
-        run_dir,
-        data,
-        targets,
-        update_code=update_code,
-        submit_via_dag=submit_via_dag,
-        parent_run_dir=parent_run_dir,
-        parent_cid=parent_cid,
-        require_ok=require_ok,
-    )
-
     if retry_downstream:
-        prev_dir = run_dir
-        prev_cid = first_cid
-        for dep_dir, dep_data in downstream:
-            dep_req = dep_data.get("resources_requested") or {}
-            dep_sweep = list(dep_req.get("sweep_arguments") or [""])
-            dep_targets = (
-                list(enumerate(dep_sweep))
-                if args.all
-                else (get_failed_or_missing_procs(dep_data) or list(enumerate(dep_sweep)))
-            )
-            dep_ok = bool(
-                (dep_data.get("dependency") or {}).get("require_ok", False) or after_ok_flag
-            )
-            prev_cid = _retry_single_run_in_place(
-                dep_dir,
-                dep_data,
-                dep_targets,
+        total_chain = 1 + len(downstream)
+        with step_progress(f"Retrying chain ({total_chain} runs)...", total_chain) as advance_chain:
+            first_cid = _retry_single_run_in_place(
+                run_dir,
+                data,
+                targets,
                 update_code=update_code,
-                submit_via_dag=True,
-                parent_run_dir=prev_dir,
-                parent_cid=prev_cid,
-                require_ok=dep_ok,
+                submit_via_dag=submit_via_dag,
+                parent_run_dir=parent_run_dir,
+                parent_cid=parent_cid,
+                require_ok=require_ok,
             )
-            prev_dir = dep_dir
+            advance_chain(f"Retried step 1/{total_chain} ({run_dir.name})...")
+            prev_dir = run_dir
+            prev_cid = first_cid
+            for step_idx, (dep_dir, dep_data) in enumerate(downstream, start=2):
+                dep_req = dep_data.get("resources_requested") or {}
+                dep_sweep = list(dep_req.get("sweep_arguments") or [""])
+                dep_targets = (
+                    list(enumerate(dep_sweep))
+                    if args.all
+                    else (get_failed_or_missing_procs(dep_data) or list(enumerate(dep_sweep)))
+                )
+                dep_ok = bool(
+                    (dep_data.get("dependency") or {}).get("require_ok", False) or after_ok_flag
+                )
+                prev_cid = _retry_single_run_in_place(
+                    dep_dir,
+                    dep_data,
+                    dep_targets,
+                    update_code=update_code,
+                    submit_via_dag=True,
+                    parent_run_dir=prev_dir,
+                    parent_cid=prev_cid,
+                    require_ok=dep_ok,
+                )
+                prev_dir = dep_dir
+                advance_chain(f"Retried step {step_idx}/{total_chain} ({dep_dir.name})...")
+    else:
+        _retry_single_run_in_place(
+            run_dir,
+            data,
+            targets,
+            update_code=update_code,
+            submit_via_dag=submit_via_dag,
+            parent_run_dir=parent_run_dir,
+            parent_cid=parent_cid,
+            require_ok=require_ok,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1875,8 +1891,10 @@ def cmd_clean(args: argparse.Namespace, runs_root: Path) -> None:
         ).ask():
             return
 
-    for d, _, _ in candidates:
-        shutil.rmtree(d, ignore_errors=True)
+    with step_progress(f"Deleting {len(candidates)} run(s)...", len(candidates)) as advance_clean:
+        for d, _, _ in candidates:
+            shutil.rmtree(d, ignore_errors=True)
+            advance_clean(f"Deleting {d.name}...")
     update_latest_symlink(runs_root)
     console.print(
         f"[bold green]✔ Deleted {len(candidates)} run(s) ({total_mb:.2f} MB freed).[/bold green]"
@@ -2365,7 +2383,8 @@ def _render_queue_analysis_panel(
 ) -> bool:
     from rich.console import Group
 
-    analysis = query_condor_better_analyze(job_target)
+    with status_spinner(f"Analyzing HTCondor slot requirements for Job {job_target}..."):
+        analysis = query_condor_better_analyze(job_target)
     if analysis is None:
         if not quiet_if_empty:
             console.print(
@@ -2683,7 +2702,8 @@ def cmd_top(args: argparse.Namespace, runs_root: Path) -> None:
             )
     else:
         try:
-            frame = query_job_live_telemetry(job_target)
+            with status_spinner(f"Probing worker node GPU & processes (Job {job_target})..."):
+                frame = query_job_live_telemetry(job_target)
         except RuntimeError as exc:
             console.print(
                 f"[bold red]✖ condor_ssh_to_job failed for Job {job_target}:[/bold red]\n[dim]{exc}[/dim]"

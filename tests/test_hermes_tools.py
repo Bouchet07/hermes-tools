@@ -3243,6 +3243,20 @@ def test_runs_retry_with_after_and_downstream_chain_cascade(
         assert "job_retry.sub" in (r / "repro" / "job.dag").read_text(encoding="utf-8")
 
 
+def test_status_spinner_and_step_progress_helpers(monkeypatch):
+    from hermes_tools import core
+
+    steps = []
+    with core.status_spinner("Checking remote cluster..."):
+        steps.append("spin")
+    with core.step_progress("Processing items...", 3) as advance:
+        for i in range(3):
+            advance(f"Step {i + 1}")
+            steps.append(i)
+    assert steps == ["spin", 0, 1, 2]
+
+
+
 
 
 

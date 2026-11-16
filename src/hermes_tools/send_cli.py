@@ -54,6 +54,7 @@ from hermes_tools.core import (
     parse_memory_to_mb,
     resolve_submit_python,
     sanitize_tag,
+    step_progress,
     update_latest_symlink,
     write_text_lf,
 )
@@ -1315,105 +1316,109 @@ def main() -> None:
         prev_cid: Optional[int] = None
         created_runs: List[Tuple[Path, Optional[int], str, str]] = []
 
-        for idx, single_arg in enumerate(sweep_list):
-            step_tag = step_tags[idx]
-            step_run_id = step_run_ids[idx]
-            step_run_dir = runs_root / step_run_id
-            step_repro_dir = step_run_dir / "repro"
+        with step_progress(
+            f"Submitting {len(sweep_list)} chained runs...", len(sweep_list)
+        ) as advance_chain:
+            for idx, single_arg in enumerate(sweep_list):
+                step_tag = step_tags[idx]
+                step_run_id = step_run_ids[idx]
+                step_run_dir = runs_root / step_run_id
+                step_repro_dir = step_run_dir / "repro"
 
-            if idx == 0:
-                step_parent_dir = parent_run_dir
-                step_parent_cid = parent_cid
-                step_submit_via_dag = submit_via_dag
-                step_resolved_after = resolved_after_id
-            else:
-                step_parent_dir = prev_run_dir
-                step_parent_cid = prev_cid
-                step_submit_via_dag = True
-                step_resolved_after = (
-                    prev_run_dir.name
-                    if prev_run_dir is not None
-                    else (str(prev_cid) if prev_cid is not None else None)
-                )
-
-            step_tokens = build_send_command_tokens(
-                send_bin="send",
-                target=rel_target,
-                arch=arch,
-                cpus=cpus,
-                mem_mb=mem_mb,
-                gpus=gpus,
-                tag=step_tag or None,
-                no_tag=no_tag_flag if not step_tag else False,
-                no_venv=no_venv_flag,
-                venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
-                nodes_include=nodes_include,
-                nodes_exclude=nodes_exclude,
-                project_code=str(project_code) if project_code else None,
-                scratch_files=scratch_files,
-                env_items=list(args.env),
-                args_flag_val=single_arg or None,
-                after=step_resolved_after,
-                after_ok=bool(args.after_ok) if step_resolved_after else False,
-                from_run=source_run_dir.name if source_run_dir else None,
-            )
-            step_equivalent_cli = " ".join(
-                [step_tokens[0]] + [shlex.quote(t) for t in step_tokens[1:]]
-            )
-            step_has_dep = step_submit_via_dag or (args.dry_run and (idx > 0 or bool(args.after)))
-
-            sub_path, _, dag_path, _, step_status = _materialize_run_capsule(
-                run_id=step_run_id,
-                run_dir=step_run_dir,
-                repro_dir=step_repro_dir,
-                now=now,
-                submit_epoch=submit_epoch,
-                cwd=cwd,
-                target_path=target_path,
-                rel_target=rel_target,
-                exec_type=exec_type,
-                venv_path=venv_path,
-                no_venv_flag=no_venv_flag,
-                arch=arch,
-                cpus=cpus,
-                mem_mb=mem_mb,
-                gpus=gpus,
-                sweep_args=[single_arg],
-                max_parallel=None,
-                nodes_include=nodes_include,
-                nodes_exclude=nodes_exclude,
-                project_code=str(project_code) if project_code else None,
-                scratch_files=scratch_files,
-                env_vars=env_vars,
-                tag=step_tag or None,
-                equivalent_cli=step_equivalent_cli,
-                git_info=git_info,
-                source_run_dir=source_run_dir,
-                clone_from_dir=first_run_dir if idx > 0 else None,
-                has_dep=step_has_dep,
-                submit_via_dag=step_submit_via_dag,
-                dry_run=bool(args.dry_run),
-                parent_dir=step_parent_dir,
-                parent_cid=step_parent_cid,
-                resolved_after_id=step_resolved_after,
-                after_raw=str(args.after) if args.after else None,
-                require_ok=bool(args.after_ok),
-                chain_index=idx,
-                chain_total=len(sweep_list),
-            )
-            if idx == 0:
-                first_run_dir = step_run_dir
-
-            submitted_cid: Optional[int] = None
-            if not args.dry_run:
-                if step_submit_via_dag and dag_path is not None:
-                    submitted_cid, _ = _submit_dag_run(cwd, dag_path, step_run_dir, step_repro_dir)
+                if idx == 0:
+                    step_parent_dir = parent_run_dir
+                    step_parent_cid = parent_cid
+                    step_submit_via_dag = submit_via_dag
+                    step_resolved_after = resolved_after_id
                 else:
-                    submitted_cid, _ = _submit_direct_run(cwd, sub_path, step_run_dir, step_repro_dir)
+                    step_parent_dir = prev_run_dir
+                    step_parent_cid = prev_cid
+                    step_submit_via_dag = True
+                    step_resolved_after = (
+                        prev_run_dir.name
+                        if prev_run_dir is not None
+                        else (str(prev_cid) if prev_cid is not None else None)
+                    )
 
-            prev_run_dir = step_run_dir
-            prev_cid = submitted_cid
-            created_runs.append((step_run_dir, submitted_cid, step_status, step_tag))
+                step_tokens = build_send_command_tokens(
+                    send_bin="send",
+                    target=rel_target,
+                    arch=arch,
+                    cpus=cpus,
+                    mem_mb=mem_mb,
+                    gpus=gpus,
+                    tag=step_tag or None,
+                    no_tag=no_tag_flag if not step_tag else False,
+                    no_venv=no_venv_flag,
+                    venv=venv_path.as_posix() if (explicit_venv_used and venv_path) else None,
+                    nodes_include=nodes_include,
+                    nodes_exclude=nodes_exclude,
+                    project_code=str(project_code) if project_code else None,
+                    scratch_files=scratch_files,
+                    env_items=list(args.env),
+                    args_flag_val=single_arg or None,
+                    after=step_resolved_after,
+                    after_ok=bool(args.after_ok) if step_resolved_after else False,
+                    from_run=source_run_dir.name if source_run_dir else None,
+                )
+                step_equivalent_cli = " ".join(
+                    [step_tokens[0]] + [shlex.quote(t) for t in step_tokens[1:]]
+                )
+                step_has_dep = step_submit_via_dag or (args.dry_run and (idx > 0 or bool(args.after)))
+
+                sub_path, _, dag_path, _, step_status = _materialize_run_capsule(
+                    run_id=step_run_id,
+                    run_dir=step_run_dir,
+                    repro_dir=step_repro_dir,
+                    now=now,
+                    submit_epoch=submit_epoch,
+                    cwd=cwd,
+                    target_path=target_path,
+                    rel_target=rel_target,
+                    exec_type=exec_type,
+                    venv_path=venv_path,
+                    no_venv_flag=no_venv_flag,
+                    arch=arch,
+                    cpus=cpus,
+                    mem_mb=mem_mb,
+                    gpus=gpus,
+                    sweep_args=[single_arg],
+                    max_parallel=None,
+                    nodes_include=nodes_include,
+                    nodes_exclude=nodes_exclude,
+                    project_code=str(project_code) if project_code else None,
+                    scratch_files=scratch_files,
+                    env_vars=env_vars,
+                    tag=step_tag or None,
+                    equivalent_cli=step_equivalent_cli,
+                    git_info=git_info,
+                    source_run_dir=source_run_dir,
+                    clone_from_dir=first_run_dir if idx > 0 else None,
+                    has_dep=step_has_dep,
+                    submit_via_dag=step_submit_via_dag,
+                    dry_run=bool(args.dry_run),
+                    parent_dir=step_parent_dir,
+                    parent_cid=step_parent_cid,
+                    resolved_after_id=step_resolved_after,
+                    after_raw=str(args.after) if args.after else None,
+                    require_ok=bool(args.after_ok),
+                    chain_index=idx,
+                    chain_total=len(sweep_list),
+                )
+                if idx == 0:
+                    first_run_dir = step_run_dir
+
+                submitted_cid: Optional[int] = None
+                if not args.dry_run:
+                    if step_submit_via_dag and dag_path is not None:
+                        submitted_cid, _ = _submit_dag_run(cwd, dag_path, step_run_dir, step_repro_dir)
+                    else:
+                        submitted_cid, _ = _submit_direct_run(cwd, sub_path, step_run_dir, step_repro_dir)
+
+                prev_run_dir = step_run_dir
+                prev_cid = submitted_cid
+                created_runs.append((step_run_dir, submitted_cid, step_status, step_tag))
+                advance_chain(f"Submitted {step_tag or step_run_id}...")
 
         update_latest_symlink(runs_root, created_runs[-1][0])
         chain_lines = []

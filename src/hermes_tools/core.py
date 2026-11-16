@@ -4,6 +4,7 @@ core.py — Shared UI constants, atomic JSON locking, project config, and path u
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import getpass
 import itertools
 import json
@@ -14,7 +15,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 try:
     import fcntl
@@ -34,6 +35,55 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 console = Console(legacy_windows=False)
+
+
+@contextmanager
+def status_spinner(message: str) -> Iterator[None]:
+    """Displays a transient Rich spinner when connected to an interactive terminal."""
+    if console.is_terminal:
+        with console.status(f"[bold cyan]{message}[/bold cyan]", spinner="dots"):
+            yield
+    else:
+        yield
+
+
+@contextmanager
+def step_progress(description: str, total: int) -> Iterator[Callable[[Optional[str]], None]]:
+    """
+    Displays a transient multi-step Rich progress bar when connected to an interactive
+    terminal and `total > 1`, yielding an `advance(new_description=None)` callback.
+    """
+    if console.is_terminal and total > 1:
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            tid = progress.add_task(description, total=total)
+
+            def _advance(new_desc: Optional[str] = None) -> None:
+                if new_desc:
+                    progress.update(tid, advance=1, description=new_desc)
+                else:
+                    progress.update(tid, advance=1)
+
+            yield _advance
+    else:
+        yield lambda _desc=None: None
+
 
 _PROMPT_STYLE_CACHE: Optional[Any] = None
 

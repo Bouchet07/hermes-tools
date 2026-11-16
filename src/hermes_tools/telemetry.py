@@ -19,9 +19,10 @@ from rich.table import Table
 from hermes_tools.core import (
     console,
     discover_project_venv,
-     format_duration,
+    format_duration,
     format_run_short,
     resolve_submit_python,
+    status_spinner,
     style_status,
 )
 
@@ -1025,14 +1026,15 @@ axes[-1].set_xlabel("Elapsed Time (minutes)")
 fig.tight_layout(rect=[0, 0, 1, 0.96])
 fig.savefig(out_path, dpi=200)
 """
-    res = subprocess.run(
-        [py_exe, "-c", plot_script, str(csv_path), str(out_path), title, "1" if is_gpu else "0"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-    )
+    with status_spinner(f"Rendering high-res telemetry figure ({out_path.name})..."):
+        res = subprocess.run(
+            [py_exe, "-c", plot_script, str(csv_path), str(out_path), title, "1" if is_gpu else "0"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
     if res.returncode != 0:
         console.print(f"[bold red]✘ Matplotlib export failed:[/bold red] {(res.stderr or res.stdout).strip()}")
         return False
