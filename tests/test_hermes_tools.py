@@ -2911,6 +2911,179 @@ def test_runs_ls_table_never_clips_right_border(
         assert "139.70 GB" in rendered
 
 
+def test_runs_pull_filtering_incremental_and_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Verifies runs pull default exclusions (code & weights), incremental sync, and --weights/--code/--include flags."""
+    import hermes_tools.runs_cli as runs_cli
+    from hermes_tools.core import resolve_latest_symlink, update_latest_symlink
+
+    remote_proj = tmp_path / "remote_cluster" / "my_ecg_proj"
+    remote_runs = remote_proj / "runs"
+    r1 = remote_runs / "2026-11-15_10-00-00_train_GPU3090_baseline"
+    r2 = remote_runs / "2026-11-16_11-00-00_train_A100_improved"
+    for r in (r1, r2):
+        (r / "repro" / "code").mkdir(parents=True)
+
+    atomic_write_json(
+        r1 / "run.json",
+        {
+            "run_id": r1.name,
+            "status": "COMPLETED",
+            "pinned": True,
+            "submission": {
+                "cluster_id": 1001,
+                "target": "train.py",
+                "tag": "baseline",
+                "submitted_at": "2026-11-15T10:00:00",
+            },
+            "resources_requested": {"architecture": "GPU3090", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0, "hostname": "nv3090-01"}],
+        },
+        r1 / "repro",
+    )
+    (r1 / "train.out").write_text("epoch 1 loss 0.5\n", encoding="utf-8")
+    (r1 / "metrics.csv").write_text("epoch,loss\n1,0.5\n", encoding="utf-8")
+    (r1 / "repro" / "telemetry_0.csv").write_text("elapsed_s,gpu_util_pct\n5.0,95.0\n", encoding="utf-8")
+    (r1 / "repro" / "code" / "train.py").write_text("print('train')\n", encoding="utf-8")
+    (r1 / "model_best.pt").write_bytes(b"PT_WEIGHTS_1" * 100)
+
+    atomic_write_json(
+        r2 / "run.json",
+        {
+            "run_id": r2.name,
+            "status": "COMPLETED",
+            "submission": {
+                "cluster_id": 1002,
+                "target": "train.py",
+                "tag": "improved",
+                "submitted_at": "2026-11-16T11:00:00",
+            },
+            "resources_requested": {"architecture": "A100", "sweep_count": 1},
+            "executions": [{"process_id": 0, "exit_code": 0, "hostname": "nva100-02"}],
+        },
+        r2 / "repro",
+    )
+    (r2 / "train.out").write_text("epoch 1 loss 0.2\n", encoding="utf-8")
+    (r2 / "predictions.parquet").write_bytes(b"PARQUET_DATA_OK")
+    (r2 / "checkpoint.safetensors").write_bytes(b"SAFE_WEIGHTS_2" * 100)
+    (r2 / "repro" / "code" / "train.py").write_text("print('train v2')\n", encoding="utf-8")
+    update_latest_symlink(remote_runs, r2)
+
+    local_proj = tmp_path / "local_laptop" / "my_ecg_proj"
+    local_proj.mkdir(parents=True)
+    (local_proj / ".hermes.toml").write_text(
+        f'remote_host = "local"\nremote_dir = "{remote_proj.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(local_proj)
+    local_runs = local_proj / "runs"
+
+    # 1. Dry-run preview does not write local files
+    monkeypatch.setattr(sys, "argv", ["runs", "pull", "--dry-run"])
+    runs_cli.main()
+    out_dry = capsys.readouterr().out
+    assert "Dry run:" in out_dry
+    assert not local_runs.exists()
+
+    # 2. Default `runs pull` downloads outputs, logs, run.json, telemetry, and skips code + weights
+    monkeypatch.setattr(sys, "argv", ["runs", "pull"])
+    runs_cli.main()
+    out_pull1 = capsys.readouterr().out
+    assert "Pulled 2 run(s)" in out_pull1
+    assert "Skipped 2 checkpoint/weight file(s)" in out_pull1
+
+    assert (local_runs / r1.name / "run.json").is_file()
+    assert (local_runs / r1.name / "metrics.csv").read_text(encoding="utf-8") == "epoch,loss\n1,0.5\n"
+    assert (local_runs / r1.name / "repro" / "telemetry_0.csv").is_file()
+    assert not (local_runs / r1.name / "model_best.pt").exists()
+    assert not (local_runs / r1.name / "repro" / "code").exists()
+
+    assert (local_runs / r2.name / "predictions.parquet").read_bytes() == b"PARQUET_DATA_OK"
+    assert not (local_runs / r2.name / "checkpoint.safetensors").exists()
+    assert runs_cli.resolve_run_dir(local_runs, "latest") == (local_runs / r2.name)
+
+    # 3. Second `runs pull` is a 0-transfer incremental no-op
+    monkeypatch.setattr(sys, "argv", ["runs", "pull"])
+    runs_cli.main()
+    out_pull2 = capsys.readouterr().out
+    assert "already up-to-date locally" in out_pull2
+
+    # 4. `runs pull latest --weights` pulls ONLY the missing weight file for latest (r2)
+    monkeypatch.setattr(sys, "argv", ["runs", "pull", "latest", "--weights"])
+    runs_cli.main()
+    out_pull3 = capsys.readouterr().out
+    assert "Pulled 1 run(s)" in out_pull3
+    assert "(1 files," in out_pull3
+    assert (local_runs / r2.name / "checkpoint.safetensors").is_file()
+    assert not (local_runs / r1.name / "model_best.pt").exists()
+
+    # 5. `runs pull --pinned --code` pulls code snapshot for pinned run (r1)
+    monkeypatch.setattr(sys, "argv", ["runs", "pull", "--pinned", "--code"])
+    runs_cli.main()
+    capsys.readouterr()
+    assert (local_runs / r1.name / "repro" / "code" / "train.py").is_file()
+    assert not (local_runs / r2.name / "repro" / "code" / "train.py").exists()
+
+    # 6. `--include '*.pt'` pulls model_best.pt for r1 even without `--weights`
+    monkeypatch.setattr(sys, "argv", ["runs", "pull", "baseline", "--include", "*.pt"])
+    runs_cli.main()
+    capsys.readouterr()
+    assert (local_runs / r1.name / "model_best.pt").is_file()
+
+
+def test_runs_pull_ssh_motd_resilience_and_remote_spec_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Verifies _parse_remote_spec and resilience to SSH login banners before HERMES_PULL_MANIFEST."""
+    import subprocess as _sp
+    import hermes_tools.runs_cli as runs_cli
+
+    assert runs_cli._parse_remote_spec("hermes2:/mnt/cephfs/proj") == ("hermes2", "/mnt/cephfs/proj")
+    assert runs_cli._parse_remote_spec("user@hermes2:~/proj") == ("user@hermes2", "~/proj")
+    assert runs_cli._parse_remote_spec("~/proj/runs") == (None, "~/proj/runs")
+    assert runs_cli._parse_remote_spec("hermes2") == ("hermes2", None)
+
+    remote_runs = tmp_path / "remote" / "runs"
+    r1 = remote_runs / "2026-11-16_12-00-00_eval_AMD"
+    (r1 / "repro").mkdir(parents=True)
+    atomic_write_json(
+        r1 / "run.json",
+        {"run_id": r1.name, "status": "COMPLETED", "submission": {"target": "eval.py"}},
+        r1 / "repro",
+    )
+    (r1 / "summary.json").write_text('{"acc": 0.99}\n', encoding="utf-8")
+
+    local_dir = tmp_path / "local"
+    local_dir.mkdir()
+    monkeypatch.chdir(local_dir)
+
+    orig_popen = _sp.Popen
+
+    def mock_ssh_popen(cmd, **kwargs):
+        # Simulate an SSH session that prints a login MOTD banner before starting python3
+        wrapper = (
+            "import sys; "
+            "sys.stdout.buffer.write(b'Welcome to Hermes 2 Cluster!\\nLast login: Mon Nov 16\\n'); "
+            "sys.stdout.buffer.flush(); "
+            + f"exec({runs_cli._REMOTE_PULL_SCRIPT!r})"
+        )
+        return orig_popen([sys.executable, "-u", "-c", wrapper], **kwargs)
+
+    monkeypatch.setattr(runs_cli, "shutil", runs_cli.shutil)
+    monkeypatch.setattr(runs_cli.shutil, "which", lambda name: "/usr/bin/ssh" if name == "ssh" else None)
+    monkeypatch.setattr(runs_cli.subprocess, "Popen", mock_ssh_popen)
+
+    monkeypatch.setattr(
+        sys, "argv", ["runs", "fetch", "-r", f"hermes2:{remote_runs.as_posix()}"]
+    )
+    runs_cli.main()
+    out = capsys.readouterr().out
+    assert "Pulled 1 run(s)" in out
+    assert (local_dir / "runs" / r1.name / "summary.json").read_text(encoding="utf-8") == '{"acc": 0.99}\n'
+
+
+
 
 
 

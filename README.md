@@ -29,7 +29,7 @@ Definitive HTCondor job submission (`send`), code provenance, live telemetry, an
    - [`runs ls` & `runs watch`](#61-runs-ls--runs-watch)
    - [`runs inspect` (`info`, `show`)](#62-runs-inspect-info-show)
    - [`runs logs` (`tail`)](#63-runs-logs-tail)
-   - [`runs sync`](#64-runs-sync)
+   - [`runs sync` & `runs pull` (`fetch`, `download`)](#64-runs-sync--runs-pull-fetch-download)
    - [`runs retry` (`resume`, `continue`)](#65-runs-retry-resume-continue)
    - [`runs diff`](#66-runs-diff)
    - [`runs stop` (`kill`, `rm`)](#67-runs-stop-kill-rm)
@@ -225,6 +225,8 @@ no_venv = false
 node = []
 exclude = ["her07-100"]
 scratch = []
+remote_host = "hermes2"
+remote_dir = "~/projects/my-repo"
 
 [tool.hermes.env]
 CUDA_HOME = "/mnt/cephfs/home/bio/dbouchet/cuda-12.1"
@@ -391,13 +393,35 @@ runs logs latest -f -n 100     # Wait if QUEUED, stream live output, and auto-ex
 > - When you run `runs logs <run> -e` on a sweep without specifying `-p <proc>`, `runs` automatically selects the first process with a non-zero exit code (or the first non-empty `.err` file).
 > - `runs logs -f` (and `send -f`) waits cleanly if the job is still `QUEUED` and exits automatically as soon as the job reaches a terminal state (`COMPLETED`, `FAILED`, `ABORTED`).
 
-### 6.4 `runs sync`
+### 6.4 `runs sync` & `runs pull` (`fetch`, `download`)
 
-Hot-patches a queued run's `repro/code/` snapshot, `repro/uncommitted.patch`, `repro/env.txt`, and `run.json["git"]` from your current working tree (removing any deleted files from `repro/code/` and recording `initial_commit` + `synced_at`):
+**`runs sync`** (on `hermes2`) hot-patches a queued run's `repro/code/` snapshot, `repro/uncommitted.patch`, `repro/env.txt`, and `run.json["git"]` from your current working tree (removing any deleted files from `repro/code/` and recording `initial_commit` + `synced_at`):
 
 ```bash
 runs sync latest
 ```
+
+**`runs pull`** (aliases: `runs fetch`, `runs download`, run on your **local laptop/desktop**) streams run capsules and outputs from `hermes2` to your local `runs/` folder over a single compressed SSH connection for local Jupyter notebook analysis and offline inspection (`runs ls`, `runs inspect`, `runs logs`, `runs plot`):
+
+```bash
+runs pull                            # Incremental pull of recent runs (skips repro/code/ and heavy .pt/.ckpt weights)
+runs pull latest                     # Pull only the latest run
+runs pull 1 2                        # Pull runs #1 and #2
+runs pull -t baseline                # Pull runs matching tag/substring 'baseline'
+runs pull -s COMPLETED --pinned      # Pull only completed pinned runs
+runs pull latest --weights           # Include model checkpoints (*.pt, *.pth, *.ckpt, *.safetensors, etc.)
+runs pull latest --code              # Include repro/code/ source snapshot
+runs pull latest --full              # Include both weights and repro/code/ snapshot
+runs pull --include '*.pt'           # Include specific glob pattern(s)
+runs pull --exclude '*.npz'          # Exclude specific glob pattern(s)
+runs pull -r hermes2:~/my-proj       # Specify remote host and path explicitly
+runs pull --watch -i 15              # Continuously sync active runs every 15s until they finish
+runs pull --dry-run                  # Preview runs, file counts, and transfer sizes without downloading
+```
+
+> **Smart Auto-Discovery & Incremental Sync**:
+> - If `remote_dir` is not set in `.hermes.toml` / `pyproject.toml`, `runs pull` automatically searches your home directory on `hermes2` for a project matching your local repository name or Git remote URL (and remembers the remote working directory from pulled `run.json` provenance).
+> - Only new or modified files are transferred; unchanged runs and files are skipped automatically (use `-f` / `--force` to re-download everything).
 
 ### 6.5 `runs retry` (`resume`, `continue`)
 
