@@ -40,7 +40,7 @@ console = Console(legacy_windows=False)
 @contextmanager
 def status_spinner(message: str) -> Iterator[None]:
     """Displays a transient Rich spinner when connected to an interactive terminal."""
-    if console.is_terminal:
+    if console.is_terminal and getattr(console, "_live", None) is None:
         with console.status(f"[bold cyan]{message}[/bold cyan]", spinner="dots"):
             yield
     else:
@@ -53,7 +53,7 @@ def step_progress(description: str, total: int) -> Iterator[Callable[[Optional[s
     Displays a transient multi-step Rich progress bar when connected to an interactive
     terminal and `total > 1`, yielding an `advance(new_description=None)` callback.
     """
-    if console.is_terminal and total > 1:
+    if console.is_terminal and total > 1 and getattr(console, "_live", None) is None:
         from rich.progress import (
             BarColumn,
             MofNCompleteColumn,

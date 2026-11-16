@@ -54,6 +54,7 @@ from hermes_tools.core import (
     parse_memory_to_mb,
     resolve_submit_python,
     sanitize_tag,
+    status_spinner,
     step_progress,
     update_latest_symlink,
     write_text_lf,
@@ -1112,11 +1113,13 @@ def main() -> None:
     if args.after:
         from hermes_tools.runs_cli import resolve_after_parent
 
+        with status_spinner("Checking HTCondor queue for parent run..."):
+            after_live_clusters = query_live_condor_clusters()
         parent_run_dir, parent_cid, submit_via_dag, resolved_after_id = resolve_after_parent(
             runs_root,
             args.after,
             bool(args.after_ok),
-            query_live_condor_clusters(),
+            after_live_clusters,
             dry_run=bool(args.dry_run),
         )
 
@@ -1222,7 +1225,8 @@ def main() -> None:
         git_info = dict(source_data.get("git") or {})
         git_info["cloned_from_run"] = source_run_dir.name
     else:
-        git_info = get_git_info(cwd)
+        with status_spinner("Inspecting Git status & working tree..."):
+            git_info = get_git_info(cwd)
 
     dep_info: Optional[str] = None
     if parent_run_dir is not None:
@@ -1446,43 +1450,49 @@ def main() -> None:
     # 7. Materialize Run Directory & Repro Capsule (Cached/detached env freeze)
     is_sweep = len(sweep_list) > 1
     has_dep = submit_via_dag or bool(args.dry_run and args.after)
-    sub_path, sub_content, dag_path, dag_content, _ = _materialize_run_capsule(
-        run_id=run_id,
-        run_dir=run_dir,
-        repro_dir=repro_dir,
-        now=now,
-        submit_epoch=submit_epoch,
-        cwd=cwd,
-        target_path=target_path,
-        rel_target=rel_target,
-        exec_type=exec_type,
-        venv_path=venv_path,
-        no_venv_flag=no_venv_flag,
-        arch=arch,
-        cpus=cpus,
-        mem_mb=mem_mb,
-        gpus=gpus,
-        sweep_args=sweep_list,
-        max_parallel=max_parallel,
-        nodes_include=nodes_include,
-        nodes_exclude=nodes_exclude,
-        project_code=str(project_code) if project_code else None,
-        scratch_files=scratch_files,
-        env_vars=env_vars,
-        tag=tag or None,
-        equivalent_cli=equivalent_cli,
-        git_info=git_info,
-        source_run_dir=source_run_dir,
-        clone_from_dir=None,
-        has_dep=has_dep,
-        submit_via_dag=submit_via_dag,
-        dry_run=bool(args.dry_run),
-        parent_dir=parent_run_dir,
-        parent_cid=parent_cid,
-        resolved_after_id=resolved_after_id,
-        after_raw=str(args.after) if args.after else None,
-        require_ok=bool(args.after_ok),
+    capsule_msg = (
+        f"Snapshotting code & generating dry-run capsule (runs/{run_id})..."
+        if args.dry_run
+        else f"[1/2] Snapshotting code & materializing capsule (runs/{run_id})..."
     )
+    with status_spinner(capsule_msg):
+        sub_path, sub_content, dag_path, dag_content, _ = _materialize_run_capsule(
+            run_id=run_id,
+            run_dir=run_dir,
+            repro_dir=repro_dir,
+            now=now,
+            submit_epoch=submit_epoch,
+            cwd=cwd,
+            target_path=target_path,
+            rel_target=rel_target,
+            exec_type=exec_type,
+            venv_path=venv_path,
+            no_venv_flag=no_venv_flag,
+            arch=arch,
+            cpus=cpus,
+            mem_mb=mem_mb,
+            gpus=gpus,
+            sweep_args=sweep_list,
+            max_parallel=max_parallel,
+            nodes_include=nodes_include,
+            nodes_exclude=nodes_exclude,
+            project_code=str(project_code) if project_code else None,
+            scratch_files=scratch_files,
+            env_vars=env_vars,
+            tag=tag or None,
+            equivalent_cli=equivalent_cli,
+            git_info=git_info,
+            source_run_dir=source_run_dir,
+            clone_from_dir=None,
+            has_dep=has_dep,
+            submit_via_dag=submit_via_dag,
+            dry_run=bool(args.dry_run),
+            parent_dir=parent_run_dir,
+            parent_cid=parent_cid,
+            resolved_after_id=resolved_after_id,
+            after_raw=str(args.after) if args.after else None,
+            require_ok=bool(args.after_ok),
+        )
 
     if args.dry_run:
         from rich.syntax import Syntax
@@ -1500,7 +1510,8 @@ def main() -> None:
 
     # 8. Submit to HTCondor
     if submit_via_dag and dag_path is not None:
-        dagman_cluster_id, condor_out = _submit_dag_run(cwd, dag_path, run_dir, repro_dir)
+        with status_spinner("[2/2] Submitting workflow to HTCondor DAGMan (condor_submit_dag)..."):
+            dagman_cluster_id, condor_out = _submit_dag_run(cwd, dag_path, run_dir, repro_dir)
         update_latest_symlink(runs_root, run_dir)
 
         parent_label = (
@@ -1524,7 +1535,8 @@ def main() -> None:
             )
         )
     else:
-        cluster_id, condor_out = _submit_direct_run(cwd, sub_path, run_dir, repro_dir)
+        with status_spinner("[2/2] Submitting job to HTCondor queue (condor_submit)..."):
+            cluster_id, condor_out = _submit_direct_run(cwd, sub_path, run_dir, repro_dir)
         update_latest_symlink(runs_root, run_dir)
 
         condor_q_cmd = f"condor_q {cluster_id}" if cluster_id else "condor_q"

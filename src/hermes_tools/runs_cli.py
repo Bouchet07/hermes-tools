@@ -989,8 +989,9 @@ def cmd_stop(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to stop (condor_rm):"
     )
-    live_clusters = query_live_condor_clusters()
-    data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
+    with status_spinner("Checking HTCondor queue & reconciling run state..."):
+        live_clusters = query_live_condor_clusters()
+        data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
     status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
     cids = get_all_cluster_ids(data)
 
@@ -1280,7 +1281,8 @@ def _retry_single_run_in_place(
     is_sweep = len(sweep_args) > 1
 
     if update_code:
-        refresh_code_snapshot(run_dir, data)
+        with status_spinner(f"Refreshing code snapshot from working tree ({run_dir.name})..."):
+            refresh_code_snapshot(run_dir, data)
 
     script_stem = Path(data.get("submission", {}).get("target", "job")).stem
     now = datetime.datetime.now()
@@ -1336,33 +1338,34 @@ def _retry_single_run_in_place(
             condor_submit_exe=shutil.which("condor_submit"),
         )
 
-        dag_res = subprocess.run(
-            ["condor_submit_dag", "-f", "-no_submit", str(dag_path)],
-            cwd=run_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if dag_res.returncode != 0:
-            console.print(
-                f"[bold red]✘ condor_submit_dag failed:[/bold red]\n{(dag_res.stderr or dag_res.stdout).strip()}"
+        with status_spinner(f"Submitting chained retry to HTCondor DAGMan ({run_dir.name})..."):
+            dag_res = subprocess.run(
+                ["condor_submit_dag", "-f", "-no_submit", str(dag_path)],
+                cwd=run_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            sys.exit(1)
+            if dag_res.returncode != 0:
+                console.print(
+                    f"[bold red]✘ condor_submit_dag failed:[/bold red]\n{(dag_res.stderr or dag_res.stdout).strip()}"
+                )
+                sys.exit(1)
 
-        condor_sub_path = Path(f"{dag_path}.condor.sub")
-        if condor_sub_path.is_file():
-            sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
-            write_text_lf(condor_sub_path, sanitize_dagman_condor_sub(sub_txt))
+            condor_sub_path = Path(f"{dag_path}.condor.sub")
+            if condor_sub_path.is_file():
+                sub_txt = condor_sub_path.read_text(encoding="utf-8", errors="replace")
+                write_text_lf(condor_sub_path, sanitize_dagman_condor_sub(sub_txt))
 
-        res = subprocess.run(
-            ["condor_submit", str(condor_sub_path)],
-            cwd=run_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+            res = subprocess.run(
+                ["condor_submit", str(condor_sub_path)],
+                cwd=run_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
         if res.returncode != 0:
             console.print(
                 f"[bold red]✘ condor_submit failed:[/bold red]\n{(res.stderr or res.stdout).strip()}"
@@ -1419,14 +1422,15 @@ def _retry_single_run_in_place(
         )
         return new_cid
 
-    res = subprocess.run(
-        ["condor_submit", str(retry_sub_path)],
-        cwd=run_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    with status_spinner(f"Submitting retry to HTCondor queue ({run_dir.name})..."):
+        res = subprocess.run(
+            ["condor_submit", str(retry_sub_path)],
+            cwd=run_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     if res.returncode != 0:
         console.print(
             f"[bold red]✘ condor_submit failed:[/bold red]\n{(res.stderr or res.stdout).strip()}"
@@ -1515,8 +1519,9 @@ def cmd_retry(args: argparse.Namespace, runs_root: Path) -> None:
     run_dir = resolve_run_dir(
         runs_root, args.run, prompt_title="Select run to retry/continue:"
     )
-    live_clusters = query_live_condor_clusters()
-    data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
+    with status_spinner("Checking HTCondor queue & reconciling run state..."):
+        live_clusters = query_live_condor_clusters()
+        data = reconcile_run(run_dir, load_run_json(run_dir), live_clusters)
     status = str(data.get("_live_badge") or data.get("status", "UNKNOWN"))
     if status.startswith("WAITING"):
         console.print(
