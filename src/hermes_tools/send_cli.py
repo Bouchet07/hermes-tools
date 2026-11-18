@@ -60,6 +60,7 @@ from hermes_tools.core import (
     update_latest_symlink,
     write_text_lf,
 )
+from hermes_tools.rich_help import RichArgumentParser
 from hermes_tools.snapshot import (
     clone_code_snapshot,
     create_code_snapshot,
@@ -69,126 +70,149 @@ from hermes_tools.snapshot import (
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = RichArgumentParser(
         prog="send",
         description="Definitive HTCondor job launcher & provenance manager for Hermes 2 (I3A).",
-        formatter_class=argparse.RawTextHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  send train.py                                      # Launch interactive TUI wizard\n"
-            "  send train.py -a GPU3090 -- --epochs 100 --lr 1e-4 # Direct RTX 3090 submission\n"
-            "  send train.py -a A100 -g 2 -m 120G                 # Dual A100 with 120 GB RAM\n"
-            "  send sim.py -a AMD -c 16 -m 32G -t baseline        # 16-core AMD CPU job with tag\n"
-            "  send train.py -a GPU3090 -s '--fold {0..4}'        # 5-job parallel array sweep"
-        ),
+        passthrough_hint="[-- SCRIPT_ARGS...]",
+        examples=[
+            ("send train.py", "Launch interactive TUI wizard"),
+            ("send train.py -a GPU3090 -- --epochs 100 --lr 1e-4", "Direct RTX 3090 submission"),
+            ("send train.py -a A100 -g 2 -m 120G -y", "Dual A100, 120 GB RAM, skip prompt"),
+            ("send sim.py -a AMD -c 16 -m 32G -t baseline", "16-core AMD CPU job with tag"),
+            ("send train.py -a GPU3090 -s '--fold {0..4}' -j 2", "5-job sweep, max 2 concurrent"),
+            ("send run_task.sh -a GPU3090 -s '--task {age,lab}' --chain --after-ok -y", "Sequential DAGMan chain"),
+        ],
     )
     parser.add_argument(
-        "target", nargs="?", help="Path to Python script (.py), Bash script (.sh), or binary"
+        "target",
+        nargs="?",
+        metavar="path",
+        help="Path to Python script (.py), Bash script (.sh), or binary",
     )
-    parser.add_argument(
-        "-a", "--arch", choices=list(ARCH_SPECS.keys()), help="Target Hermes 2 +Architecture pool"
+
+    g_hw = parser.add_argument_group("Compute & Hardware")
+    g_hw.add_argument(
+        "-a",
+        "--arch",
+        choices=list(ARCH_SPECS.keys()),
+        metavar="pool",
+        help="Target Hermes 2 +Architecture pool",
     )
-    parser.add_argument(
+    g_hw.add_argument(
         "-c", "--cpus", type=int, help="Number of CPU cores (ignored on GPU3090/A100)"
     )
-    parser.add_argument(
+    g_hw.add_argument(
         "-m",
         "--mem",
         type=str,
-        help="RAM request, e.g., '8G', '32GB', '4096M' (ignored on GPU3090)",
+        metavar="size",
+        help="RAM request, e.g. '8G', '32GB', '4096M' (ignored on GPU3090)",
     )
-    parser.add_argument(
+    g_hw.add_argument(
         "-g", "--gpus", type=int, choices=[1, 2, 3, 4], help="Number of GPUs (for A100: 1-4)"
     )
-    parser.add_argument("--args", type=str, default="", help="Arguments to pass to your script")
-    parser.add_argument(
+    g_hw.add_argument(
+        "--node", action="append", default=[], metavar="host", help="Target specific node(s), e.g. nv3090-01"
+    )
+    g_hw.add_argument(
+        "--exclude", action="append", default=[], metavar="host", help="Exclude specific node(s), e.g. her07-100"
+    )
+    g_hw.add_argument(
+        "--project", type=str, metavar="code", help="I3A +Proyecto accounting code (e.g. '100-100')"
+    )
+
+    g_sweep = parser.add_argument_group("Arguments, Sweeps & Chaining")
+    g_sweep.add_argument("--args", type=str, default="", help="Base arguments passed to your script (literal)")
+    g_sweep.add_argument(
         "-s",
         "--sweep",
         action="append",
         default=[],
-        help="Queue parallel parameter sweep (supports '{0..4}', '{00..09}', '{a,b}', ';' or repeatable -s)",
+        metavar="spec",
+        help="Parallel sweep ('{0..4}', '{00..09}', '{a,b}', ';' or repeatable -s)",
     )
-    parser.add_argument(
-        "--sweep-file", type=str, help="File containing one argument string per line for sweep"
+    g_sweep.add_argument(
+        "--sweep-file", type=str, metavar="path", help="File with one argument string per line for sweep"
     )
-    parser.add_argument(
+    g_sweep.add_argument(
         "-j",
         "--max-parallel",
         type=int,
         default=None,
-        help="Limit concurrent running sweep jobs (e.g. -j 1 or -j 2; emits max_idle = K)",
+        metavar="N",
+        help="Limit concurrent running sweep jobs (emits max_idle = N)",
     )
-    parser.add_argument(
+    g_sweep.add_argument(
         "--chain",
         "--seq",
         action="store_true",
-        help="Split sweep into separate sequential runs chained via --after (one run per sweep item)",
+        help="Split sweep into sequential runs chained via --after (one run per item)",
     )
-    parser.add_argument(
+    g_sweep.add_argument(
+        "--after",
+        type=str,
+        metavar="run",
+        help="Queue as a dependent job after specified run (ID, #index, 'latest', or cluster ID)",
+    )
+    g_sweep.add_argument(
+        "--after-ok",
+        action="store_true",
+        help="With --after/--chain, only run if parent exits 0; cancel otherwise",
+    )
+
+    g_env = parser.add_argument_group("Environment & Provenance")
+    g_env.add_argument(
         "-t",
         "--tag",
         action="append",
         default=[],
-        help="Optional tag(s) for run directory (repeatable or '{a,b,c}' / 'a,b,c' for --chain)",
+        metavar="tag",
+        help="Tag(s) for run folder (repeatable or '{a,b,c}' / 'a,b,c' for --chain)",
     )
-    parser.add_argument(
+    g_env.add_argument(
         "--no-tag",
         action="store_true",
         help="Do not auto-derive tags from sweep arguments when using --chain",
     )
-    parser.add_argument(
-        "--venv", type=str, help="Explicit path to virtual environment (auto-detected by default)"
+    g_env.add_argument(
+        "--venv", type=str, metavar="path", help="Explicit virtual environment or Conda path (auto-detected by default)"
     )
-    parser.add_argument(
+    g_env.add_argument(
         "--no-venv", action="store_true", help="Run without activating a Python virtual environment"
     )
-    parser.add_argument(
-        "--node", action="append", default=[], help="Target specific node(s), e.g., nv3090-01"
-    )
-    parser.add_argument(
-        "--exclude", action="append", default=[], help="Exclude specific node(s), e.g., her07-100"
-    )
-    parser.add_argument(
-        "--project", type=str, help="I3A +Proyecto accounting code (e.g., '100-100')"
-    )
-    parser.add_argument(
-        "--scratch",
-        nargs="+",
-        default=[],
-        help="Enable RAMDisk scratch mode and transfer specified input files",
-    )
-    parser.add_argument(
+    g_env.add_argument(
         "-e",
         "--env",
         action="append",
         default=[],
-        help="Export custom environment variable(s) inside job.sh, e.g. -e WANDB_MODE=offline",
+        metavar="K=V",
+        help="Export custom environment variable inside job.sh, e.g. -e WANDB_MODE=offline",
     )
-    parser.add_argument(
-        "--after",
-        type=str,
-        help="Queue run as a dependent job after specified run (by ID, index, or cluster ID) completes",
+    g_env.add_argument(
+        "--scratch",
+        nargs="+",
+        default=[],
+        metavar="file",
+        help="Enable HTCondor scratch transfer for the specified input files",
     )
-    parser.add_argument(
-        "--after-ok",
-        action="store_true",
-        help="When used with --after, only run if parent succeeds (exit 0); cancel if parent fails",
-    )
-    parser.add_argument(
+    g_env.add_argument(
         "--from-run",
         type=str,
+        metavar="run",
         help="Clone frozen repro/code/ snapshot and provenance from an existing run",
     )
-    parser.add_argument(
+
+    g_exec = parser.add_argument_group("Execution & Output")
+    g_exec.add_argument(
         "-f",
         "--follow",
         action="store_true",
-        help="Wait for job to start and follow live stdout until completion",
+        help="Wait for job to start and stream live stdout until completion",
     )
-    parser.add_argument(
+    g_exec.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation prompt and submit immediately"
     )
-    parser.add_argument(
+    g_exec.add_argument(
         "--dry-run",
         action="store_true",
         help="Generate run folder and scripts without submitting",

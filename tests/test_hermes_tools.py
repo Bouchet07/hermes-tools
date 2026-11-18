@@ -3273,6 +3273,40 @@ def test_status_spinner_and_step_progress_helpers(monkeypatch):
     assert steps == ["spin", 0, 1, 2]
 
 
+def test_rich_help_formatting_for_send_and_runs(capsys: pytest.CaptureFixture) -> None:
+    """Verifies RichArgumentParser renders grouped panels for send, runs, subcommands, and errors."""
+    from hermes_tools.runs_cli import build_parser as build_runs_parser
+    from hermes_tools.send_cli import build_arg_parser as build_send_parser
+
+    send_parser = build_send_parser()
+    send_help = send_parser.format_help()
+    assert "Usage: send" in send_help
+    assert "Compute & Hardware" in send_help
+    assert "Arguments, Sweeps & Chaining" in send_help
+    assert "Environment & Provenance" in send_help
+    assert "Execution & Output" in send_help
+    assert "Examples" in send_help
+    assert "-h, --help" in send_help
+
+    runs_parser = build_runs_parser()
+    runs_help = runs_parser.format_help()
+    assert "Usage: runs [COMMAND] [OPTIONS]" in runs_help
+    assert "Monitor & Inspect" in runs_help
+    assert "Diagnostics & Telemetry" in runs_help
+    assert "Recovery & Lifecycle" in runs_help
+    assert "inspect (info, show)" in runs_help
+    # No raw argparse {ls,watch,inspect,...} alias dump
+    assert "{ls,watch,inspect" not in runs_help
+
+    with pytest.raises(SystemExit) as exc_info:
+        send_parser.parse_args(["--nonexistent-flag"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "Error" in err
+    assert "--nonexistent-flag" in err
+
+
+
 
 
 

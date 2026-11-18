@@ -39,6 +39,7 @@ from hermes_tools.condor import (
     stream_job_live_telemetry,
     summarize_condor_pools,
 )
+from hermes_tools.rich_help import RichArgumentParser
 from hermes_tools.core import (
     console,
     dir_size_mb,
@@ -2896,9 +2897,24 @@ def cmd_path(args: argparse.Namespace, runs_root: Path) -> None:
 # CLI Argument Parser & Entrypoint
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = RichArgumentParser(
         prog="runs",
         description="Hermes 2 HTCondor Run Manager, Telemetry Inspector & Recovery CLI.",
+        command_groups=[
+            ("Monitor & Inspect", ["ls", "watch", "inspect", "logs", "diff", "path"]),
+            ("Diagnostics & Telemetry", ["why", "top", "plot", "ssh", "nodes"]),
+            ("Recovery & Lifecycle", ["retry", "sync", "pull", "stop", "pin", "unpin", "clean"]),
+        ],
+        examples=[
+            ("runs", "List recent runs (defaults to `runs ls`)"),
+            ("runs watch -s RUNNING", "Live-watch active runs in the queue"),
+            ("runs logs latest -f", "Stream live stdout of the latest run"),
+            ("runs why", "Diagnose why your latest queued job is waiting"),
+            ("runs gpu -w", "Live GPU utilization & VRAM on worker node"),
+            ("runs retry latest --in-place -u -y", "Update code snapshot and retry failed procs"),
+            ("runs nodes -a GPU3090 -f", "Check free RTX 3090 nodes across Hermes 2"),
+        ],
+        footer_hint="Run 'runs <command> --help' for command-specific options.",
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -3029,48 +3045,58 @@ def build_parser() -> argparse.ArgumentParser:
     p_log.add_argument("-n", "--lines", type=int, default=60, help="Number of tail lines to display")
 
     p_ret = sub.add_parser(
-        "retry", aliases=["resume", "continue"], help="Retry failed runs or partial sweeps"
+        "retry",
+        aliases=["resume", "continue"],
+        help="Retry failed runs or partial sweeps",
+        examples=[
+            ("runs retry latest --in-place -u -y", "Update code snapshot and retry failed procs in-place"),
+            ("runs retry latest --new-run -y", "Relaunch as a brand-new run from frozen snapshot"),
+            ("runs retry 3 --after 1 --after-ok -y", "Queue retry of run #3 after run #1 exits 0"),
+        ],
     )
     p_ret.add_argument("run", nargs="?", help="Run ID, index (#), or 'latest'")
-    p_ret.add_argument("--in-place", action="store_true", help="Resume inside the same run directory")
-    p_ret.add_argument(
+    g_ret_mode = p_ret.add_argument_group("Recovery Mode")
+    g_ret_mode.add_argument("--in-place", action="store_true", help="Resume inside the same run directory")
+    g_ret_mode.add_argument(
         "--new-run", action="store_true", help="Launch a brand-new run directory via `send`"
     )
-    p_ret.add_argument(
+    g_ret_mode.add_argument(
         "-u",
         "--update-code",
         action="store_true",
         help="Refresh repro/code/ snapshot from working tree before retrying",
     )
-    p_ret.add_argument(
+    g_ret_mode.add_argument(
         "--all",
         action="store_true",
         help="Re-run all sweep processes (even those with exit_code 0)",
     )
-    p_ret.add_argument(
+    g_ret_mode.add_argument(
         "--force",
         action="store_true",
         help="Allow in-place retry even if jobs are still active in condor_q",
     )
-    p_ret.add_argument(
+    g_ret_chain = p_ret.add_argument_group("Dependencies & Chaining")
+    g_ret_chain.add_argument(
         "--after",
         type=str,
         default=None,
-        help="Queue retry as a dependent job after specified run (by ID, index, 'latest', or cluster ID) completes",
+        metavar="run",
+        help="Queue retry after specified run (ID, #index, 'latest', or cluster ID) completes",
     )
-    p_ret.add_argument(
+    g_ret_chain.add_argument(
         "--after-ok",
         action="store_true",
-        help="When chained (via --after or downstream chain), only run if parent succeeds (exit 0)",
+        help="When chained (via --after or downstream chain), only run if parent exits 0",
     )
-    p_ret.add_argument(
+    g_ret_chain.add_argument(
         "--chain",
         "--cascade",
         dest="chain",
         action="store_true",
         help="Automatically retry downstream chained runs that depended on this run",
     )
-    p_ret.add_argument(
+    g_ret_chain.add_argument(
         "--single",
         "--no-cascade",
         dest="single",
@@ -3088,112 +3114,127 @@ def build_parser() -> argparse.ArgumentParser:
         "pull",
         aliases=["fetch", "download"],
         help="Download or sync remote cluster runs to local machine for Jupyter/offline analysis",
+        examples=[
+            ("runs pull", "Incremental sync of recent runs (skips code & heavy weights)"),
+            ("runs pull latest --weights", "Pull latest run including checkpoints (*.pt, *.ckpt)"),
+            ("runs pull -s COMPLETED --pinned", "Pull only completed pinned runs"),
+            ("runs pull --watch -i 15", "Continuously sync active runs every 15s"),
+        ],
     )
     p_pull.add_argument(
         "run",
         nargs="*",
         help="Optional run ID(s), index (#), cluster ID, tag substring, or 'latest' (default: recent runs)",
     )
-    p_pull.add_argument(
+    g_pull_rem = p_pull.add_argument_group("Remote Target")
+    g_pull_rem.add_argument(
         "-r",
         "--remote",
         type=str,
+        metavar="spec",
         help="Remote '[user@]host[:/path/to/project]' or '/remote/path' (overrides config)",
     )
-    p_pull.add_argument(
+    g_pull_rem.add_argument(
         "-H",
         "--host",
         type=str,
+        metavar="host",
         help="Remote SSH host (default: 'hermes' or remote_host in .hermes.toml)",
     )
-    p_pull.add_argument(
+    g_pull_rem.add_argument(
         "-d",
         "--remote-dir",
         type=str,
+        metavar="path",
         help="Remote project or runs/ directory path (auto-discovered on remote if omitted)",
     )
-    p_pull.add_argument(
+    g_pull_flt = p_pull.add_argument_group("Selection & Filters")
+    g_pull_flt.add_argument(
         "-n",
         "--limit",
         type=int,
         default=25,
-        help="Max recent runs to check when no run query is specified (default: 25)",
+        help="Max recent runs to check when no run query is specified",
     )
-    p_pull.add_argument(
+    g_pull_flt.add_argument(
         "-a",
         "--all",
         action="store_true",
         help="Pull all matching remote runs without the -n 25 limit",
     )
-    p_pull.add_argument(
+    g_pull_flt.add_argument(
         "-s",
         "--status",
         type=str,
         help="Filter remote runs by status (e.g. COMPLETED, RUNNING, FAILED)",
     )
-    p_pull.add_argument(
+    g_pull_flt.add_argument(
         "-t",
         "--tag",
         type=str,
         help="Filter remote runs by tag or run ID substring",
     )
-    p_pull.add_argument(
+    g_pull_flt.add_argument(
         "-p",
         "--pinned",
         action="store_true",
         help="Pull only pinned remote runs",
     )
-    p_pull.add_argument(
+    g_pull_cnt = p_pull.add_argument_group("Content & Filters")
+    g_pull_cnt.add_argument(
         "-w",
         "--weights",
         action="store_true",
-        help="Include model weight/checkpoint/archive files (*.pt, *.ckpt, *.safetensors, etc.)",
+        help="Include model weights/checkpoints (*.pt, *.ckpt, *.safetensors, etc.)",
     )
-    p_pull.add_argument(
+    g_pull_cnt.add_argument(
         "-c",
         "--code",
         action="store_true",
         help="Include repro/code/ source snapshots (skipped by default)",
     )
-    p_pull.add_argument(
+    g_pull_cnt.add_argument(
         "--full",
         action="store_true",
         help="Include both model weights (--weights) and code snapshots (--code)",
     )
-    p_pull.add_argument(
+    g_pull_cnt.add_argument(
         "--include",
         action="append",
         default=[],
-        help="Glob pattern(s) of files to always include (repeatable, e.g. --include '*.pt')",
+        metavar="glob",
+        help="Glob pattern(s) of files to always include (e.g. --include '*.pt')",
     )
-    p_pull.add_argument(
+    g_pull_cnt.add_argument(
         "--exclude",
         action="append",
         default=[],
-        help="Glob pattern(s) of files to exclude (repeatable, e.g. --exclude '*.npz')",
+        metavar="glob",
+        help="Glob pattern(s) of files to exclude (e.g. --exclude '*.npz')",
     )
-    p_pull.add_argument(
+    g_pull_exec = p_pull.add_argument_group("Sync Behavior")
+    g_pull_exec.add_argument(
         "-f",
         "--force",
         action="store_true",
         help="Re-download all matching files even if already up-to-date locally",
     )
-    p_pull.add_argument(
+    g_pull_exec.add_argument(
         "--watch",
         action="store_true",
         help="Continuously sync active remote runs until they complete",
     )
-    p_pull.add_argument(
+    g_pull_exec.add_argument(
         "-i",
         "--interval",
         type=int,
         default=15,
-        help="Refresh interval in seconds for --watch (default: 15)",
+        help="Refresh interval in seconds for --watch",
     )
-    p_pull.add_argument(
+    g_pull_exec.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview which remote runs and files would be downloaded without transferring data",
+        help="Preview remote runs and files without transferring data",
     )
 
     p_stop = sub.add_parser("stop", aliases=["kill", "rm"], help="Abort active HTCondor job (condor_rm)")
