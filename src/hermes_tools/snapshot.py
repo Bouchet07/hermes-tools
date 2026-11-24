@@ -562,7 +562,87 @@ def _read_diffable_lines(path: Optional[Path]) -> List[str]:
         return []
 
 
-def diff_directories(dir_a: Path, dir_b: Path) -> str:
+_CACHE_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist"}
+_CACHE_SUFFIXES = (".pyc", ".pyo", ".so", ".o", ".a", ".dll", ".dylib", ".DS_Store")
+
+
+def _is_cache_entry(rel: str) -> bool:
+    parts = rel.split("/")
+    if any(p in _CACHE_PARTS or p.endswith(".egg-info") for p in parts):
+        return True
+    return rel.endswith(_CACHE_SUFFIXES)
+
+
+def _matches_any_pattern(rel: str, patterns: Optional[List[str]]) -> bool:
+    if not patterns:
+        return False
+    import fnmatch
+
+    return any(fnmatch.fnmatch(rel, pat) or pat in rel for pat in patterns)
+
+
+def _should_include_entry(
+    rel: str,
+    *,
+    include_cache: bool,
+    path_filters: Optional[List[str]],
+    exclude_filters: Optional[List[str]],
+) -> bool:
+    if not include_cache and _is_cache_entry(rel):
+        return False
+    if path_filters and not _matches_any_pattern(rel, path_filters):
+        return False
+    if exclude_filters and _matches_any_pattern(rel, exclude_filters):
+        return False
+    return True
+
+
+def diff_directory_stats(
+    dir_a: Path,
+    dir_b: Path,
+    *,
+    include_cache: bool = False,
+    path_filters: Optional[List[str]] = None,
+    exclude_filters: Optional[List[str]] = None,
+) -> List[tuple[str, int, int]]:
+    """Returns `(rel_path, added_lines, removed_lines)` for changed entries between two snapshots."""
+    import difflib
+
+    map_a = _collect_snapshot_entries(dir_a)
+    map_b = _collect_snapshot_entries(dir_b)
+    all_rel = sorted(map_a.keys() | map_b.keys())
+    stats: List[tuple[str, int, int]] = []
+
+    for rel in all_rel:
+        if not _should_include_entry(
+            rel, include_cache=include_cache, path_filters=path_filters, exclude_filters=exclude_filters
+        ):
+            continue
+        lines_a = _read_diffable_lines(map_a.get(rel))
+        lines_b = _read_diffable_lines(map_b.get(rel))
+        if lines_a == lines_b:
+            continue
+        added = 0
+        removed = 0
+        for line in difflib.unified_diff(lines_a, lines_b, n=0):
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        stats.append((rel, added, removed))
+    return stats
+
+
+def diff_directories(
+    dir_a: Path,
+    dir_b: Path,
+    *,
+    include_cache: bool = False,
+    path_filters: Optional[List[str]] = None,
+    exclude_filters: Optional[List[str]] = None,
+) -> str:
     """Computes a unified diff across all text files and symlinks in two snapshot directories."""
     import difflib
 
@@ -572,6 +652,10 @@ def diff_directories(dir_a: Path, dir_b: Path) -> str:
     chunks: List[str] = []
 
     for rel in all_rel:
+        if not _should_include_entry(
+            rel, include_cache=include_cache, path_filters=path_filters, exclude_filters=exclude_filters
+        ):
+            continue
         lines_a = _read_diffable_lines(map_a.get(rel))
         lines_b = _read_diffable_lines(map_b.get(rel))
         if lines_a == lines_b:

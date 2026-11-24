@@ -454,10 +454,22 @@ runs retry latest --force           # Allow retry even if cluster still appears 
 
 ### 6.6 `runs diff`
 
-Compares two runs side-by-side (status, target, architecture, arguments, git commit, peak RAM, wall time) and displays a syntax-highlighted unified diff between their `repro/code/` snapshots:
+Compares two runs side-by-side (status, target, architecture, arguments, git commit, peak RAM, wall time), prints a `+N / -M` changed-files summary, and displays a syntax-highlighted unified diff between their `repro/code/` snapshots (ignoring `__pycache__`, `*.pyc`, `*.egg-info`, `build/`, `dist/`, and compiled binaries by default):
 
 ```bash
-runs diff 1 2
+runs diff 1 2                                 # Summary + diff (capped at 4000 chars)
+runs diff 1 2 --stat                          # Changed-files summary (+N / -M) only
+runs diff 1 2 --full                          # Full diff without 4000-char truncation
+runs diff 1 2 -p sleep_apnea                  # Filter diff to matching paths (glob/substring)
+runs diff 1 2 -x "configs/only_*" -x "*.png"  # Exclude matching paths
+runs diff 1 2 --include-cache                 # Include __pycache__ / *.egg-info / build files
+```
+
+You can also configure project-wide default exclusions in `.hermes.toml`:
+
+```toml
+[diff]
+ignore = ["*.png", "configs/only_*.yaml"]
 ```
 
 ### 6.7 `runs stop` (`kill`, `rm`)

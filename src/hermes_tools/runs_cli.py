@@ -52,6 +52,7 @@ from hermes_tools.core import (
     get_username,
     get_watch_row_limit,
     list_run_dirs,
+    load_project_config,
     load_run_json,
     locked_mutate_run_json,
     resolve_latest_symlink,
@@ -72,6 +73,7 @@ from hermes_tools.pull import (  # noqa: F401
 )
 from hermes_tools.snapshot import (
     diff_directories as _diff_directories,
+    diff_directory_stats as _diff_directory_stats,
     refresh_code_snapshot,
 )
 from hermes_tools.telemetry import (
@@ -2053,21 +2055,73 @@ def cmd_diff(args: argparse.Namespace, runs_root: Path) -> None:
 
     code_a, code_b = dir_a / "repro" / "code", dir_b / "repro" / "code"
     if code_a.is_dir() and code_b.is_dir():
-        diff_text = _diff_directories(code_a, code_b).strip()
+        include_cache = bool(getattr(args, "include_cache", False))
+        path_filters = list(getattr(args, "path", None) or [])
+        proj_cfg = load_project_config(Path.cwd())
+        cfg_ignores = (proj_cfg.get("diff") or {}).get("ignore") or []
+        exclude_filters = [str(x) for x in cfg_ignores if x] if isinstance(cfg_ignores, list) else []
+        exclude_filters.extend(str(x) for x in (getattr(args, "exclude", None) or []) if x)
+        stat_only = bool(getattr(args, "stat", False))
+        full_diff = bool(getattr(args, "full", False))
+
+        stats = _diff_directory_stats(
+            code_a,
+            code_b,
+            include_cache=include_cache,
+            path_filters=path_filters or None,
+            exclude_filters=exclude_filters or None,
+        )
+        if not stats:
+            msg = (
+                "No matching changes in `repro/code/`."
+                if (path_filters or exclude_filters)
+                else "Code snapshots (`repro/code/`) are byte-for-byte identical."
+            )
+            console.print(f"[bold green]✔ {msg}[/bold green]")
+            return
+
+        stat_table = Table(
+            title=f"Changed Files ({len(stats)})",
+            box=box.SIMPLE,
+            show_header=True,
+            header_style="bold yellow",
+        )
+        stat_table.add_column("File", style="white")
+        stat_table.add_column("+", justify="right", style="green")
+        stat_table.add_column("-", justify="right", style="red")
+        max_stat_rows = len(stats) if (stat_only or full_diff) else 30
+        for rel, added, removed in stats[:max_stat_rows]:
+            stat_table.add_row(rel, f"+{added}", f"-{removed}")
+        if len(stats) > max_stat_rows:
+            stat_table.add_row(f"[dim]... and {len(stats) - max_stat_rows} more (pass --stat or --full)[/dim]", "", "")
+        console.print(stat_table)
+
+        if stat_only:
+            return
+
+        diff_text = _diff_directories(
+            code_a,
+            code_b,
+            include_cache=include_cache,
+            path_filters=path_filters or None,
+            exclude_filters=exclude_filters or None,
+        ).strip()
         if diff_text:
             from rich.syntax import Syntax
 
+            limit = None if full_diff else 4000
+            shown = diff_text if limit is None else diff_text[:limit]
             console.print(
                 Panel(
-                    Syntax(diff_text[:4000], "diff", theme="monokai"),
+                    Syntax(shown, "diff", theme="monokai"),
                     title="[bold yellow]Code Snapshot Diff (repro/code/)[/bold yellow]",
                     border_style="yellow",
                 )
             )
-        else:
-            console.print(
-                "[bold green]✔ Code snapshots (`repro/code/`) are byte-for-byte identical.[/bold green]"
-            )
+            if limit is not None and len(diff_text) > limit:
+                console.print(
+                    f"[yellow]... truncated {len(diff_text) - limit:,} chars — pass --full to see all, or -p/--path / -x/--exclude to filter.[/yellow]"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -3283,6 +3337,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff = sub.add_parser("diff", help="Compare provenance and code snapshots between two runs")
     p_diff.add_argument("run_a", nargs="?", help="First run ID or index")
     p_diff.add_argument("run_b", nargs="?", help="Second run ID or index")
+    p_diff.add_argument("--full", action="store_true", help="Show full code snapshot diff without 4000-char truncation")
+    p_diff.add_argument("--stat", action="store_true", help="Show only the changed-files summary (+N / -M)")
+    p_diff.add_argument("-p", "--path", action="append", default=[], help="Filter diff to matching file paths (glob or substring)")
+    p_diff.add_argument("-x", "--exclude", action="append", default=[], help="Exclude matching file paths (glob or substring; merges with [diff].ignore in .hermes.toml)")
+    p_diff.add_argument("--include-cache", action="store_true", help="Include __pycache__, *.pyc, *.egg-info, build/dist artifacts")
 
     p_nodes = sub.add_parser(
         "nodes",

@@ -520,6 +520,43 @@ def test_tail_file_lines_o1_seek_and_diff_symlinks(tmp_path: Path) -> None:
     assert "[binary file:" in diff_out
 
 
+def test_diff_directory_filters_and_stats(tmp_path: Path) -> None:
+    from hermes_tools.snapshot import diff_directories, diff_directory_stats
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    (dir_a / "__pycache__").mkdir(parents=True)
+    (dir_b / "__pycache__").mkdir(parents=True)
+    (dir_b / "pkg.egg-info").mkdir(parents=True)
+    (dir_a / "configs").mkdir(parents=True)
+    (dir_b / "configs").mkdir(parents=True)
+
+    (dir_a / "__pycache__" / "mod.cpython-311.pyc").write_bytes(b"\x00a")
+    (dir_b / "__pycache__" / "mod.cpython-311.pyc").write_bytes(b"\x00bbb")
+    (dir_b / "pkg.egg-info" / "PKG-INFO").write_text("Name: pkg\n", encoding="utf-8")
+    (dir_a / "train.py").write_text("x = 1\n", encoding="utf-8")
+    (dir_b / "train.py").write_text("x = 2\n", encoding="utf-8")
+    (dir_a / "configs" / "only_test.yaml").write_text("a: 1\n", encoding="utf-8")
+    (dir_b / "configs" / "only_test.yaml").write_text("a: 2\n", encoding="utf-8")
+
+    # Cache and *.egg-info ignored by default
+    stats = diff_directory_stats(dir_a, dir_b)
+    assert [rel for rel, _, _ in stats] == ["configs/only_test.yaml", "train.py"]
+
+    # Include cache surfaces __pycache__ and *.egg-info
+    stats_all = diff_directory_stats(dir_a, dir_b, include_cache=True)
+    rels_all = {rel for rel, _, _ in stats_all}
+    assert "__pycache__/mod.cpython-311.pyc" in rels_all
+    assert "pkg.egg-info/PKG-INFO" in rels_all
+
+    # Path & exclude filters
+    diff_filtered = diff_directories(dir_a, dir_b, path_filters=["configs/*"], exclude_filters=["*only_*"])
+    assert diff_filtered == ""
+    diff_train = diff_directories(dir_a, dir_b, exclude_filters=["configs/*"])
+    assert "train.py" in diff_train
+    assert "only_test.yaml" not in diff_train
+
+
 def test_hold_reason_surfacing_and_batch_stop_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import argparse
     import hermes_tools.runs_cli as runs_cli
